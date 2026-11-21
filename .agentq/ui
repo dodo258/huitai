@@ -1,0 +1,27 @@
+#!/bin/sh
+# 界面门：用假数据在 PTY 里跑真的 ai（tests/ui_shot.rs），alacritty_terminal 解释输出后写成 HTML，
+# 再用无头 Chrome 转成 PNG 写进 $AGENTQ_ARTIFACTS。全程不开窗口、不读本机真实对话。
+# 退出码 0 算过；125 算这次跑不了（没有 cargo 或 Chrome）。
+set -u
+# 调度器拉起的进程 PATH 可能不含 rustup 装的 cargo
+PATH="$HOME/.cargo/bin:/usr/sbin:/usr/bin:/bin:$PATH"
+command -v cargo >/dev/null 2>&1 || { echo "没有 cargo"; exit 125; }
+CHROME=${CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
+[ -x "$CHROME" ] || { echo "没有 Chrome：$CHROME"; exit 125; }
+
+OUT=${AGENTQ_ARTIFACTS:-target/ui-shots}
+mkdir -p "$OUT"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+SHOT_DIR="$work" cargo test --test ui_shot -- --ignored --nocapture || exit 1
+
+for html in "$work"/*.html; do
+	name=$(basename "$html" .html)
+	size=$(cat "$work/$name.size")
+	"$CHROME" --headless=new --disable-gpu --hide-scrollbars --no-first-run \
+		--user-data-dir="$work/chrome" --force-device-scale-factor=2 \
+		--window-size="$size" --screenshot="$OUT/$name.png" "file://$html" >/dev/null 2>&1
+	[ -s "$OUT/$name.png" ] || { echo "截图失败：$name"; exit 1; }
+	echo "截图：$OUT/$name.png"
+done

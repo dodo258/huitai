@@ -1,0 +1,6 @@
+this is not json
+{"parentUuid":null,"type":"user","message":{"role":"user","content":"坏行中间的第一句"},"uuid":"u1","timestamp":"2026-11-02T10:00:00Z","cwd":"/Users/demo/projects/shop","gitBranch":"dev"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"半截
+[1,2,3]
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"坏行之后的回复"}]},"uuid":"a2","timestamp":"2026-11-02T10:00:09Z"}
+{"type":"user","message":{"role":"user","content":

@@ -1,0 +1,11 @@
+{"type":"session","version":3,"id":"aaaaaaaa-0000-4000-8000-000000000001","timestamp":"2026-11-20T10:00:00.000Z","cwd":"/Users/demo/projects/blog"}
+{"type":"model_change","id":"e1","parentId":null,"timestamp":"2026-11-20T10:00:00.100Z","provider":"demo","modelId":"demo-model"}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-11-20T10:00:01.000Z","message":{"role":"system","content":"system prompt"}}
+{"type":"message","id":"e3","parentId":"e2","timestamp":"2026-11-20T10:01:00.000Z","message":{"role":"user","content":[{"type":"text","text":"给博客加一个 RSS"}],"timestamp":1795168860000}}
+{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-11-20T10:01:30.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"..."},{"type":"toolCall","id":"c1","name":"read","arguments":{}}],"timestamp":1795168890000}}
+{"type":"message","id":"e5","parentId":"e4","timestamp":"2026-11-20T10:01:31.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"file body"}],"timestamp":1795168891000}}
+{"type":"session_info","id":"e6","parentId":"e5","timestamp":"2026-11-20T10:02:00.000Z","name":"RSS 初稿"}
+{"type":"message","id":"e7","parentId":"e6","timestamp":"2026-11-20T10:04:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"RSS 已加好，在 /feed.xml。"}],"timestamp":1795168980000}}
+{"type":"message","id":"e8","parentId":"e7","timestamp":"2026-11-20T10:04:30.000Z","message":{"role":"user","content":[{"type":"text","text":"再加上 Atom"}],"timestamp":1795169070000}}
+{"type":"message","id":"e9","parentId":"e8","timestamp":"2026-11-20T10:05:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Atom 也加好了。"}],"timestamp":1795169100000}}
+{"type":"session_info","id":"e10","parentId":"e9","timestamp":"2026-11-20T10:05:10.000Z","name":"博客订阅源"}

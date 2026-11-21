@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"家目录里随手问一句"},"uuid":"u1","timestamp":"2026-11-04T10:00:00Z","cwd":"/Users/demo"}
+{"type":"summary","summary":"随手问","leafUuid":"u1"}

@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":"先在 a 里看看"},"timestamp":"2026-11-04T08:00:00Z","cwd":"/Users/demo/a","sessionId":"88888888-8888-4888-8888-888888888888"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a 里没有，去 b 看。"}]},"timestamp":"2026-11-04T08:00:05Z","cwd":"/Users/demo/a"}
+{"type":"user","message":{"role":"user","content":"在 b 里接着改"},"timestamp":"2026-11-04T08:01:00Z","cwd":"/Users/demo/projects/b"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"改好了。"}]},"timestamp":"2026-11-04T08:01:05Z","cwd":"/Users/demo/projects/b"}

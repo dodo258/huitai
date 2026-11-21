@@ -1,0 +1,6 @@
+{"type":"user","timestamp":"2026-11-20T01:00:00.000Z","message":{"role":"user","content":"（脱敏样例）你好"}}
+{"type":"assistant","timestamp":"2026-11-20T01:00:05.000Z","requestId":"req_a","sessionId":"s1","cwd":"/Users/me/proj","message":{"id":"msg_a","role":"assistant","model":"claude-test","content":[{"type":"text","text":"（脱敏样例）"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":30,"cache_read_input_tokens":40}}}
+{"type":"assistant","timestamp":"2026-11-20T01:00:06.000Z","requestId":"req_a","sessionId":"s1","cwd":"/Users/me/proj","message":{"id":"msg_a","role":"assistant","model":"claude-test","content":[{"type":"text","text":"（脱敏样例）"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":30,"cache_read_input_tokens":40}}}
+{"type":"assistant","timestamp":"2026-11-19T23:59:00.000Z","requestId":"req_b","sessionId":"s1","cwd":"/Users/me/proj","message":{"id":"msg_b","role":"assistant","model":"claude-test","content":[{"type":"text","text":"（脱敏样例）"}],"usage":{"input_tokens":1000,"output_tokens":0}}}
+{"type":"assistant","usage": 坏行
+{"type":"assistant","timestamp":"2026-11-20T02:00:00.000Z","requestId":"req_c","sessionId":"s1","cwd":"/Users/me/proj","message":{"id":"msg_c","role":"assistant","model":"claude-test","content":[{"type":"text","text":"（脱敏样例）"}],"usage":{"input_tokens":1,"output_tokens":2}}}

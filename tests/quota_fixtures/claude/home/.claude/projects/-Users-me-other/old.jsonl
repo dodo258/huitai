@@ -1,0 +1,1 @@
+{"type":"assistant","timestamp":"2026-11-20T05:00:00.000Z","requestId":"req_f","sessionId":"s1","cwd":"/Users/me/proj","message":{"id":"msg_f","role":"assistant","model":"claude-test","content":[{"type":"text","text":"（脱敏样例）"}],"usage":{"input_tokens":99999,"output_tokens":0}}}

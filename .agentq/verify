@@ -1,0 +1,7 @@
+#!/bin/sh
+# 引擎测试门：一条命令跑全部检查。退出码 0 算过；125 算这次跑不了（没装 cargo）。
+set -u
+# 调度器拉起的进程 PATH 可能不含 rustup 装的 cargo
+PATH="$HOME/.cargo/bin:/usr/sbin:/usr/bin:/bin:$PATH"
+command -v cargo >/dev/null 2>&1 || { echo "没有 cargo"; exit 125; }
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test

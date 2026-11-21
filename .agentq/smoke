@@ -1,0 +1,16 @@
+#!/bin/sh
+# 成品门：release 构建，检查产物在、能启动。退出码 0 算过；125 算这次跑不了（没装 cargo）。
+set -u
+# 调度器拉起的进程 PATH 可能不含 rustup 装的 cargo
+PATH="$HOME/.cargo/bin:/usr/sbin:/usr/bin:/bin:$PATH"
+command -v cargo >/dev/null 2>&1 || { echo "没有 cargo"; exit 125; }
+
+ARTIFACT='target/release/ai'
+cargo build --release || exit 1
+[ -x "$ARTIFACT" ] || { echo "没有构建产物 $ARTIFACT"; exit 1; }
+out=$("$ARTIFACT" --version) || { echo "启动失败：$ARTIFACT --version"; exit 1; }
+echo "$out"
+case "$out" in
+  "ai "*) ;;
+  *) echo "版本输出不对：$out"; exit 1 ;;
+esac

@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"x","timestamp":"2026-11-20T01:00:00.000Z","cwd":"/Users/me/proj"}
+{"type":"model_change","id":"a","parentId":null,"timestamp":"2026-11-20T01:00:01.000Z","provider":"test","modelId":"test-model"}
+{"type":"message","id":":02.000Z","parentId":null,"timestamp":"2026-11-20T01:00:02.000Z","message":{"role":"user","content":"（脱敏样例）","timestamp":0}}
+{"type":"message","id":":03.000Z","parentId":null,"timestamp":"2026-11-20T01:00:03.000Z","message":{"role":"assistant","content":"（脱敏样例）","timestamp":0,"provider":"test","model":"test-model","usage":{"input":2898,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2899,"cost":{"total":0}}}}
+{"type":"message","id":":00.000Z","parentId":null,"timestamp":"2026-11-19T22:00:00.000Z","message":{"role":"assistant","content":"（脱敏样例）","timestamp":0,"provider":"test","model":"test-model","usage":{"input":4999,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":5000,"cost":{"total":0}}}}
+{"type":"message","id":"t","timestamp":"2026-11-20T01:00:04.000Z","message":{"role":"toolResult","content":"（脱敏样例）","usage":{"totalTokens":7}}}
+{"type":"message","message":{"role":"assistant","usage": 坏行
+{"type":"message","id":":05.000Z","parentId":null,"timestamp":"2026-11-20T01:00:05.000Z","message":{"role":"assistant","content":"（脱敏样例）","timestamp":0,"provider":"test","model":"test-model","usage":{"input":100,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":101,"cost":{"total":0}}}}

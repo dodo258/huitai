@@ -1,0 +1,77 @@
+{
+  "_说明": "额度取数规则。每家按顺序试渠道，前一个取不到或格式不认识就换下一个。厂商改格式时只改这里。路径用 JSON Pointer（RFC 6901）。",
+  "claude": [
+    {
+      "kind": "statusline",
+      "cache_file": "claude-statusline.json",
+      "max_age_minutes": 10,
+      "windows": [
+        { "percent": "/rate_limits/five_hour/used_percentage", "resets_at": "/rate_limits/five_hour/resets_at", "minutes": 300 },
+        { "percent": "/rate_limits/seven_day/used_percentage", "resets_at": "/rate_limits/seven_day/resets_at", "minutes": 10080 }
+      ]
+    },
+    {
+      "kind": "usage_api",
+      "url": "https://api.anthropic.com/api/oauth/usage",
+      "headers": ["anthropic-beta: oauth-2025-04-20"],
+      "keychain_service": "Claude Code-credentials",
+      "token": "/claudeAiOauth/accessToken",
+      "expires_at_ms": "/claudeAiOauth/expiresAt",
+      "timeout_secs": 5,
+      "cache_file": "claude-usage.json",
+      "cache_minutes": 5,
+      "windows": [
+        { "percent": "/five_hour/utilization", "resets_at": "/five_hour/resets_at", "minutes": 300 },
+        { "percent": "/seven_day/utilization", "resets_at": "/seven_day/resets_at", "minutes": 10080 }
+      ]
+    },
+    {
+      "kind": "tokens_today",
+      "dir": ".claude/projects",
+      "line_contains": "\"usage\"",
+      "matches": { "/type": "assistant" },
+      "timestamp": "/timestamp",
+      "dedupe": ["/message/id", "/requestId"],
+      "count": [
+        "/message/usage/input_tokens",
+        "/message/usage/output_tokens",
+        "/message/usage/cache_creation_input_tokens",
+        "/message/usage/cache_read_input_tokens"
+      ]
+    }
+  ],
+  "codex": [
+    {
+      "kind": "rollout",
+      "dir": ".codex/sessions",
+      "line_contains": "\"token_count\"",
+      "matches": { "/type": "event_msg", "/payload/type": "token_count" },
+      "timestamp": "/timestamp",
+      "max_files": 20,
+      "tail_bytes": 262144,
+      "windows": [
+        { "percent": "/payload/rate_limits/primary/used_percent", "resets_at": "/payload/rate_limits/primary/resets_at", "minutes": "/payload/rate_limits/primary/window_minutes" },
+        { "percent": "/payload/rate_limits/secondary/used_percent", "resets_at": "/payload/rate_limits/secondary/resets_at", "minutes": "/payload/rate_limits/secondary/window_minutes" }
+      ]
+    },
+    {
+      "kind": "tokens_today",
+      "dir": ".codex/sessions",
+      "line_contains": "\"token_count\"",
+      "matches": { "/type": "event_msg", "/payload/type": "token_count" },
+      "timestamp": "/timestamp",
+      "cumulative": true,
+      "count": ["/payload/info/total_token_usage/total_tokens"]
+    }
+  ],
+  "pi": [
+    {
+      "kind": "tokens_today",
+      "dir": ".pi/agent/sessions",
+      "line_contains": "\"usage\"",
+      "matches": { "/type": "message", "/message/role": "assistant" },
+      "timestamp": "/timestamp",
+      "count": ["/message/usage/totalTokens"]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"aaaaaaaa-0000-4000-8000-000000000003","timestamp":"2026-11-20T12:00:00.000Z","cwd":"/Users/demo/projects/blog"}
+not json at all
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-11-20T12:01:00.000Z","message":{"role":"user","content":[{"type":"text","text":"坏行后面的问题"}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-11-20T12:01:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"半截
+{"type":"message","id":"e3","parentId":"e1","timestamp":"2026-11-20T12:02:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"坏行后面的回答"}]}}

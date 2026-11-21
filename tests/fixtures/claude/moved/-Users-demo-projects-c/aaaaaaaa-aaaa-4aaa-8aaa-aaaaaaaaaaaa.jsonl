@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"目录名对不上"},"timestamp":"2026-11-04T10:00:00Z","cwd":"/Users/demo/x"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"好。"}]},"timestamp":"2026-11-04T10:00:05Z","cwd":"/Users/demo/y"}

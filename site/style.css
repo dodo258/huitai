@@ -1,0 +1,367 @@
+/* 会话台官网。颜色直接取自终端界面 src/ui/theme.rs，角色一色一义：
+   赤陶（Claude 强调色）只给能按、能点的东西：印章、按键、链接、复制按钮；
+   状态色只出现在截图下面的状态灯图例里；其余全是灰阶。
+   深色是默认，系统是浅色时换成 theme.rs 的 LIGHT（中性灰，不用奶油色）。 */
+
+:root {
+	color-scheme: dark light;
+
+	--base: #17181c;     /* 页面底，列表区底色 */
+	--bar: #1d1e23;      /* 顶栏、底栏、命令块；也是印章上的字色 */
+	--preview: #131417;  /* 截图外框底 */
+	--line: #24262c;     /* 分隔线、悬停底（界面里的选中行底色） */
+	--text: #b9b7ae;     /* 正文 */
+	--title: #f2efe7;    /* 标题 */
+	--muted: #8a887f;    /* 说明文字（theme.rs 的 #7c7a72 提亮一档，网页小字要读得清） */
+	--accent: #d97757;   /* Claude 赤陶：能按、能点的 */
+	--stamp: #d97757;    /* 印章底色，和界面里的印章同色 */
+	--running: #78c98f;
+	--waiting: #e8b85a;
+	--done: #5ec4d6;
+	--stopped: #6b6962;
+	--elsewhere: #5c9a6c; /* 别处开着：比「在跑」柔一档的绿 */
+
+	--sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+	--mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+
+	--fs-stamp: clamp(36px, 6vw, 64px);
+	--fs-tag: clamp(22px, 2.6vw, 32px);
+	--fs-h2: clamp(22px, 2.4vw, 28px);
+	--fs-row: 20px;
+	--fs-body: 16px;
+	--fs-small: 14px;
+	--fs-mono: 14px;
+
+	--s1: 4px;
+	--s2: 8px;
+	--s3: 12px;
+	--s4: 16px;
+	--s5: 24px;
+	--s6: 32px;
+	--s7: 48px;
+	--s8: 64px;
+	--s9: 96px;
+
+	--r-key: 3px;   /* 按键、印章：终端里的方块，只倒一点角 */
+	--r-box: 8px;   /* 命令块、截图外框 */
+
+	--wrap: 1188px; /* 截图 2376px 宽的一半，2 倍屏刚好一比一 */
+	--gutter: 24px;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		--base: #f4f4f2;
+		--bar: #e9e9e6;
+		--preview: #fbfbfa;
+		--line: #dfded9;
+		--text: #3a3935;
+		--title: #141518;
+		--muted: #6f6d66;
+		--accent: #a84f32; /* theme.rs 的 #c0603f 压一档：浅底上链接、按键字要够 4.5:1 */
+		--stamp: #c0603f;  /* 印章是标志，保持和界面截图里一样 */
+		--running: #2e8f4c;
+		--waiting: #a8740f;
+		--done: #16808f;
+		--stopped: #9d9b94;
+		--elsewhere: #5e9a6f;
+	}
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+	margin: 0;
+	background: var(--base);
+	color: var(--text);
+	font: var(--fs-body)/1.7 var(--sans);
+	-webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+code, kbd { font-family: var(--mono); font-size: 0.92em; }
+code { color: var(--title); }
+
+kbd {
+	display: inline-block;
+	min-width: 1.6em;
+	padding: 0 var(--s1);
+	border: 1px solid var(--line);
+	border-radius: var(--r-key);
+	color: var(--accent);
+	font-weight: 600;
+	line-height: 1.5;
+	text-align: center;
+	white-space: nowrap;
+}
+
+.wrap {
+	max-width: calc(var(--wrap) + 2 * var(--gutter));
+	margin: 0 auto;
+	padding: 0 var(--gutter);
+}
+
+/* 印章：界面左上角那块反白「会话台」。全站只有它大胆。 */
+.stamp {
+	display: inline-block;
+	padding: 0 0.35em 0 0.6em;
+	border-radius: var(--r-key);
+	background: var(--stamp);
+	color: var(--bar);
+	font-weight: 700;
+	letter-spacing: 0.25em;
+	line-height: 1.3;
+}
+
+/* 顶栏：和界面的顶栏同色同高 */
+.top {
+	background: var(--bar);
+}
+.top .wrap {
+	display: flex;
+	align-items: center;
+	gap: var(--s4);
+	height: 48px;
+}
+.top .stamp { font-size: 15px; }
+.top .name { font-family: var(--mono); color: var(--title); font-size: var(--fs-mono); }
+.top nav {
+	margin-left: auto;
+	display: flex;
+	gap: var(--s5);
+	font-size: var(--fs-small);
+}
+.top nav a { color: var(--text); text-decoration: none; }
+.top nav a:hover { color: var(--title); }
+
+/* 首屏 */
+.hero { padding: var(--s8) 0 var(--s7); }
+.hero h1 {
+	margin: 0 0 var(--s6);
+	display: flex;
+	align-items: baseline;
+	gap: var(--s4);
+	font-size: var(--fs-stamp);
+	line-height: 1;
+}
+.hero h1 code {
+	color: var(--title);
+	font-size: 0.62em;
+	font-weight: 500;
+}
+.tag {
+	margin: 0 0 var(--s4);
+	max-width: 36em;
+	color: var(--title);
+	font-size: var(--fs-tag);
+	font-weight: 600;
+	line-height: 1.4;
+	letter-spacing: -0.01em;
+}
+.tag code { font-size: 0.9em; color: var(--accent); }
+.lead { margin: 0 0 var(--s6); max-width: 40em; }
+
+/* 安装命令 */
+.cmd {
+	display: flex;
+	align-items: center;
+	gap: var(--s3);
+	max-width: 860px;
+	padding: var(--s3) var(--s3) var(--s3) var(--s4);
+	border-radius: var(--r-box);
+	background: var(--bar);
+	font-family: var(--mono);
+	font-size: var(--fs-mono);
+}
+.cmd + .cmd { margin-top: var(--s3); }
+.cmd code {
+	flex: 1;
+	min-width: 0;
+	overflow-wrap: anywhere;
+	line-height: 1.6;
+	font-size: 1em;
+}
+.cmd code::before { content: "$ "; color: var(--muted); }
+.copy {
+	flex: none;
+	padding: var(--s1) var(--s3);
+	border: 1px solid var(--line);
+	border-radius: var(--r-key);
+	background: transparent;
+	color: var(--accent);
+	font: 600 13px/1.5 var(--sans);
+	cursor: pointer;
+}
+.copy:hover { background: var(--line); }
+.note {
+	margin: var(--s3) 0 0;
+	max-width: 860px;
+	color: var(--muted);
+	font-size: var(--fs-small);
+}
+.note a { color: var(--text); }
+
+/* 截图 */
+.shot { padding-bottom: var(--s9); }
+.shot a { display: block; }
+.shot img {
+	display: block;
+	width: 100%;
+	height: auto;
+	border: 1px solid var(--line);
+	border-radius: var(--r-box);
+	background: var(--preview);
+}
+.legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--s2) var(--s5);
+	margin: var(--s3) 0 0;
+	padding: 0;
+	list-style: none;
+	color: var(--muted);
+	font-size: var(--fs-small);
+}
+.legend li:first-child { margin-right: auto; }
+.legend b { font-family: var(--mono); font-weight: 400; margin-right: var(--s1); }
+.legend .running { color: var(--running); }
+.legend .waiting { color: var(--waiting); }
+.legend .done { color: var(--done); }
+.legend .stopped { color: var(--stopped); }
+.legend .elsewhere { color: var(--elsewhere); }
+
+/* 节 */
+section.part { padding-bottom: var(--s9); }
+h2 {
+	margin: 0 0 var(--s5);
+	color: var(--title);
+	font-size: var(--fs-h2);
+	font-weight: 600;
+	line-height: 1.35;
+}
+.intro { margin: calc(-1 * var(--s3)) 0 var(--s5); max-width: 40em; }
+
+/* 三件事：像界面里的列表行，一行一件，细线分开 */
+.rows { margin: 0; border-top: 1px solid var(--line); }
+.rows > div {
+	display: grid;
+	grid-template-columns: 200px minmax(0, 1fr) 260px;
+	gap: var(--s5);
+	padding: var(--s5) 0;
+	border-bottom: 1px solid var(--line);
+}
+.rows dt {
+	color: var(--title);
+	font-size: var(--fs-row);
+	font-weight: 600;
+	line-height: 1.5;
+}
+.rows dd { margin: 0; max-width: 36em; }
+.rows .keys {
+	color: var(--muted);
+	font-size: var(--fs-small);
+	line-height: 2;
+}
+.rows .keys span { display: inline-block; margin-right: var(--s4); white-space: nowrap; }
+
+/* 不改你的按键 */
+.pass {
+	display: grid;
+	grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+	gap: var(--s7);
+	align-items: start;
+}
+.pass p { margin: 0 0 var(--s4); max-width: 30em; }
+.same { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+.same li {
+	display: flex;
+	justify-content: space-between;
+	gap: var(--s4);
+	padding: var(--s3) 0;
+	border-bottom: 1px solid var(--line);
+}
+.same li span:last-child { color: var(--muted); font-size: var(--fs-small); text-align: right; }
+
+/* 隐私 */
+.privacy .rows > div { grid-template-columns: 200px minmax(0, 1fr); }
+.privacy ol { margin: var(--s2) 0 0; padding-left: 1.4em; }
+.privacy ol li + li { margin-top: var(--s2); }
+
+/* 常用的键：1px 细线网格 */
+.keys-grid {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 1px;
+	margin: 0;
+	border: 1px solid var(--line);
+	background: var(--line);
+}
+.keys-grid > div {
+	display: flex;
+	align-items: baseline;
+	gap: var(--s3);
+	padding: var(--s3) var(--s4);
+	background: var(--base);
+}
+.keys-grid dt { flex: none; width: 5em; }
+.keys-grid dd { margin: 0; }
+.keys-more { margin: var(--s4) 0 0; color: var(--muted); font-size: var(--fs-small); }
+
+/* 和 Rex 比：像界面里的表格，一行一项，细线分开；两列同样的字色，比得公道 */
+.compare { border-top: 1px solid var(--line); }
+.compare > div {
+	display: grid;
+	grid-template-columns: 200px minmax(0, 1fr) minmax(0, 1fr);
+	gap: var(--s5);
+	padding: var(--s4) 0;
+	border-bottom: 1px solid var(--line);
+}
+.compare .head { color: var(--title); font-weight: 600; padding: var(--s3) 0; }
+.compare .k { color: var(--title); font-weight: 600; }
+.compare p { margin: 0; }
+.compare .none { color: var(--stopped); }
+.pick { margin: var(--s5) 0 var(--s3); max-width: 40em; }
+
+/* 底栏：和界面的底栏一样，左边常用项，右边路径 */
+.foot { background: var(--bar); font-size: var(--fs-small); }
+.foot .wrap {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--s2) var(--s5);
+	min-height: 48px;
+	padding-top: var(--s2);
+	padding-bottom: var(--s2);
+}
+.foot a { color: var(--text); }
+.foot .path { margin-left: auto; font-family: var(--mono); color: var(--muted); }
+
+@media (max-width: 900px) {
+	.rows > div,
+	.privacy .rows > div { grid-template-columns: minmax(0, 1fr); gap: var(--s2); }
+	.pass { grid-template-columns: minmax(0, 1fr); gap: var(--s5); }
+	.keys-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+	.compare > div { grid-template-columns: minmax(0, 1fr); gap: var(--s1); }
+	.compare .head { display: none; }
+	.compare p::before { content: attr(data-who) "："; color: var(--muted); }
+	.compare p:lang(en)::before { content: attr(data-who) ": "; }
+}
+
+@media (max-width: 600px) {
+	:root { --gutter: 16px; }
+	.hero { padding: var(--s7) 0 var(--s6); }
+	.hero h1 { margin-bottom: var(--s5); }
+	section.part, .shot { padding-bottom: var(--s8); }
+	.cmd { flex-direction: column; align-items: stretch; }
+	.copy { align-self: flex-end; }
+	.keys-grid { grid-template-columns: minmax(0, 1fr); }
+	.top nav { gap: var(--s4); }
+	.foot .path { margin-left: 0; }
+	.legend li:first-child { flex-basis: 100%; }
+	.tag br { display: none; }
+}

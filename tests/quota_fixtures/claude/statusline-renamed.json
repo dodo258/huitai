@@ -1,0 +1,22 @@
+{
+  "cwd": "/Users/me/proj",
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "transcript_path": "/Users/me/.claude/projects/-Users-me-proj/00000000.jsonl",
+  "model": {
+    "id": "claude-test",
+    "display_name": "Test"
+  },
+  "workspace": {
+    "current_dir": "/Users/me/proj",
+    "project_dir": "/Users/me/proj"
+  },
+  "version": "2.1.329",
+  "cost": {
+    "total_cost_usd": 0.01
+  },
+  "rate_limits": {
+    "session": {
+      "pct": 23.5
+    }
+  }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "huitai"
+version = "0.1.0"
+edition = "2024"
+description = "会话台：按厂商、按项目列出本机 AI 对话，在新标签页接着聊"
+publish = false
+
+[[bin]]
+name = "ai"
+path = "src/main.rs"
+
+[dependencies]
+alacritty_terminal = { version = "0.26", default-features = false }
+clap = { version = "4.6", features = ["derive"] }
+notify = "8.2"
+rusqlite = { version = "0.43", features = ["bundled"] }
+libc = "0.2.191"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

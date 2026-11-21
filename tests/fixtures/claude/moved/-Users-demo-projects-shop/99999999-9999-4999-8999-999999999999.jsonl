@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":"做待办：结算页"},"timestamp":"2026-11-04T09:00:00Z","cwd":"/Users/demo/projects/shop","sessionId":"99999999-9999-4999-8999-999999999999"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"开工作树。"}]},"timestamp":"2026-11-04T09:00:05Z","cwd":"/Users/demo/projects/shop"}
+{"type":"user","message":{"role":"user","content":"继续"},"timestamp":"2026-11-04T09:01:00Z","cwd":"/Users/demo/projects/shop/.claude/worktrees/1121-x"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"在工作树里改完了。"}]},"timestamp":"2026-11-04T09:01:05Z","cwd":"/Users/demo/projects/shop/.claude/worktrees/1121-x"}

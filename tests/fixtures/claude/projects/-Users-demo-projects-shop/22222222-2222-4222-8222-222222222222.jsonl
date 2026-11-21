@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"缺字段的会话：没有 cwd、分支和标题"},"uuid":"u1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"收到。"}]},"uuid":"a1"}
