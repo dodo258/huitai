@@ -37,7 +37,7 @@ use crate::opener::{
     self, InlineOpener, KakuOpener, LoginItem, Opener, Outcome, Tabs, Terminal as Term,
 };
 use crate::quota;
-use crate::sources::{self, Command, Source, Trash};
+use crate::sources::{self, Command, Source, Transcript, Trash};
 
 use super::app::{App, Effect, Preview};
 use super::text::{project_label, resume_line, truncate};
@@ -74,6 +74,8 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 enum Msg {
     Index(Update),
     Preview(SessionId, Preview),
+    /// 整段对话读到了：哪条、读的时候它的最后时间、全文。
+    Transcript(SessionId, SystemTime, Result<Transcript, String>),
     /// 实时预览取到的新画面；`None` 表示这条取不到了（已退出、守护进程不在）。
     Live(SessionId, Option<ScreenSnapshot>),
     Quota(Vendor, QuotaReading),
@@ -160,6 +162,7 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
     let (_background, updates) = index.start();
     forward(updates, tx.clone(), Msg::Index);
     let previews = preview_worker(ctx.clone(), tx.clone());
+    let transcripts = transcript_worker(ctx.clone(), tx.clone());
     let live = live_worker(ctx.data_dir.clone(), tx.clone());
     let quotas = quota_worker(tx.clone());
     procs_worker(tx.clone());
@@ -197,6 +200,7 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
         away,
         last_selected: None,
         previews,
+        transcripts,
         live,
         live_sent: None,
         quotas,
@@ -697,6 +701,8 @@ struct Loop {
     /// 上一轮选中的对话，选中换了才告诉守护进程「看过了」。
     last_selected: Option<SessionId>,
     previews: Sender<Entry>,
+    /// 读整段对话的线程。
+    transcripts: Sender<Entry>,
     live: Sender<Option<SessionId>>,
     /// 上次告诉实时预览线程的目标。
     live_sent: Option<SessionId>,
@@ -755,6 +761,9 @@ impl Loop {
             }
             if let Some(e) = self.app.take_preview_request() {
                 let _ = self.previews.send(e);
+            }
+            if let Some(e) = self.app.take_transcript_request() {
+                let _ = self.transcripts.send(e);
             }
             self.set_live(self.app.live_target());
             self.mark_seen();
@@ -1078,6 +1087,7 @@ impl Loop {
             }
             Msg::Index(Update::Problem(_)) => {}
             Msg::Preview(id, p) => self.app.set_preview(id, p),
+            Msg::Transcript(id, at, t) => self.app.set_transcript(&id, at, t),
             Msg::Live(id, snap) => {
                 // 目标已经换了的旧画面丢掉。
                 if self.live_sent.as_ref() == Some(&id) {
@@ -1288,6 +1298,32 @@ fn preview_worker(ctx: Ctx, tx: Sender<Msg>) -> Sender<Entry> {
                 messages,
             };
             if tx.send(Msg::Preview(s.id.clone(), p)).is_err() {
+                return;
+            }
+        }
+    });
+    req
+}
+
+/// 读整段对话：和预览一样只读最新要的那条。大文件只读最后 32MB，几百毫秒，不挡界面。
+fn transcript_worker(ctx: Ctx, tx: Sender<Msg>) -> Sender<Entry> {
+    let (req, rx) = mpsc::channel::<Entry>();
+    thread::spawn(move || {
+        let sources = ctx.sources();
+        while let Ok(mut e) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                e = newer;
+            }
+            let s = &e.session;
+            let t = sources
+                .as_ref()
+                .map_err(|err| io::Error::new(err.kind(), err.to_string()))
+                .and_then(|src| source_for(src, s.vendor)?.load_transcript(s))
+                .map_err(|err| err.to_string());
+            if tx
+                .send(Msg::Transcript(s.id.clone(), s.last_active, t))
+                .is_err()
+            {
                 return;
             }
         }

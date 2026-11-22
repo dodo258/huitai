@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use huitai::core::{Session, Vendor};
 use huitai::index::Index;
 use huitai::sources::{
-    ClaudeSource, Command, Counted, PreviewMessage, Progress, Scan, Source, Trash, TrashEntry,
+    ClaudeSource, Command, Counted, PreviewMessage, Progress, Scan, Source, Transcript, Trash,
+    TrashEntry,
 };
 use serde_json::json;
 
@@ -175,6 +176,9 @@ impl<S: Source> Source for Counting<S> {
     fn load_preview(&self, s: &Session, n: usize) -> io::Result<Vec<PreviewMessage>> {
         *self.calls.previews.lock().unwrap() += 1;
         self.inner.load_preview(s, n)
+    }
+    fn load_transcript(&self, s: &Session) -> io::Result<Transcript> {
+        self.inner.load_transcript(s)
     }
     fn count_messages(&self, s: &Session) -> io::Result<usize> {
         self.inner.count_messages(s)

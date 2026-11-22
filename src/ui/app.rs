@@ -1,6 +1,7 @@
 //! 界面状态机：键鼠 → 改状态，需要动外部（开标签页、改标注、搜索、读预览……）的事以 [`Effect`] 交给运行层。
 //! 这里不做任何 IO，测试可以直接喂数据、按键、渲染。
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -13,10 +14,11 @@ use ratatui::layout::{Position, Rect};
 use crate::core::{Config, QuotaReading, SessionId, SessionState, Vendor};
 use crate::host::ScreenSnapshot;
 use crate::index::{Edit, Entry, ProjectEdit, ProjectNote};
-use crate::sources::PreviewMessage;
+use crate::sources::{PreviewMessage, Transcript};
 
 use super::keys::{self, Action, Selected, action_for, typed_text};
 use super::newdir::{self, DirPicker};
+use super::reader::{Outcome, Reader};
 use super::rows::{self, Folds, Group, GroupKey, Row};
 use super::text::{project_label, tilde};
 
@@ -153,6 +155,16 @@ pub struct Search {
     pub hits: Vec<Entry>,
     pub selected: usize,
     pub offset: usize,
+}
+
+/// `s` 打开的「等你回复」汇总：三家自己的对话（不算自动运行的）里等你回复的排前、在跑的排后，
+/// 各自最近聊过的在前（[`App::board_entries`]）。列表每次现算，状态一变就跟着变；选中的那条按 id 跟着走。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Board {
+    /// 上次选中的位置：选中的那条不在了（比如结束了）就停在这个位置上。
+    pub selected: usize,
+    pub offset: usize,
+    id: Option<SessionId>,
 }
 
 /// 一家的列表。
@@ -307,6 +319,10 @@ pub struct App {
     /// `g` 的结果：哪个目录、输出。
     pub git: Option<(PathBuf, Result<String, String>)>,
     pub search: Option<Search>,
+    /// 开着的整段对话（只读滚动视图），盖住列表和预览。
+    pub reader: Option<Reader>,
+    /// 「等你回复」汇总开着（和搜索互斥）。
+    pub board: Option<Board>,
     pub prompt: Option<Prompt>,
     pub overlay: Overlay,
     pub status: Option<String>,
@@ -373,6 +389,8 @@ impl App {
             live: None,
             git: None,
             search: None,
+            reader: None,
+            board: None,
             prompt: None,
             overlay: Overlay::None,
             status: None,
@@ -615,7 +633,11 @@ impl App {
         }
         self.interrupted = ids;
         self.regroup(None);
-        if self.interrupted_shown || self.search.is_some() || self.prompt.is_some() {
+        if self.interrupted_shown
+            || self.search.is_some()
+            || self.board.is_some()
+            || self.prompt.is_some()
+        {
             return;
         }
         let Some(v) = Vendor::ALL.into_iter().find(|v| {
@@ -677,9 +699,38 @@ impl App {
         Some(e)
     }
 
-    /// 现在该实时预览哪条：选中的对话有托管进程在跑（不是「已停」），且预览区没被帮助页、设置页挡住。
+    /// 开着整段对话、它还没有（或有过时的）全文时返回要读的对话，一个时间只要一次。
+    /// 对话的最后时间取最新列表里的：对话还在写，读进来的全文跟着更新。
+    pub fn take_transcript_request(&mut self) -> Option<Entry> {
+        let r = self.reader.as_ref()?;
+        let s = &r.entry.session;
+        let at = self
+            .list_of(s.vendor)
+            .entries
+            .iter()
+            .find(|e| e.session.id == s.id)
+            .map_or(s.last_active, |e| e.session.last_active);
+        self.reader.as_mut()?.take_request(at)
+    }
+
+    /// 读到了 `id` 在 `at` 时的全文；整段对话已经关了或换了一条就丢掉。
+    pub fn set_transcript(
+        &mut self,
+        id: &SessionId,
+        at: SystemTime,
+        data: Result<Transcript, String>,
+    ) {
+        if let Some(r) = &mut self.reader
+            && r.entry.session.id == *id
+        {
+            r.set(at, data);
+        }
+    }
+
+    /// 现在该实时预览哪条：选中的对话有托管进程在跑（不是「已停」），且预览区没被帮助页、设置页、整段对话挡住。
     pub fn live_target(&self) -> Option<SessionId> {
-        if matches!(self.overlay, Overlay::Help | Overlay::Settings { .. }) {
+        if self.reader.is_some() || matches!(self.overlay, Overlay::Help | Overlay::Settings { .. })
+        {
             return None;
         }
         let id = &self.selected_entry()?.session.id;
@@ -781,7 +832,21 @@ impl App {
 
     /// `!`：从选中处往下找下一条等你回复的自己的对话，这家找完接着找下一家（Tab 的顺序），绕一圈回来。
     /// 在别家就换过去，在收起的组里就展开它。
+    /// 汇总开着时只在汇总里往下找（绕一圈回来），不离开汇总。
     fn next_waiting(&mut self) -> Vec<Effect> {
+        if self.board.is_some() {
+            let entries = self.board_entries();
+            let at = self.board_index(&entries).unwrap_or(0);
+            let n = entries.len();
+            let next = (1..=n)
+                .map(|k| (at + k) % n)
+                .find(|&i| waits(self.state_of(&entries[i].session.id)));
+            match next {
+                Some(i) => self.select(i),
+                None => self.status = Some("没有等你回复的对话".to_owned()),
+            }
+            return Vec::new();
+        }
         self.next_where(
             |app, e| !e.session.automatic && waits(app.state_of(&e.session.id)),
             "没有等你回复的对话",
@@ -801,6 +866,7 @@ impl App {
         // 搜索时单击顶栏状态：先退出搜索回到列表再跳（搜索结果的行号和列表对不上）。
         // `!` 键在搜索框里是输入的字，到不了这里。
         self.search = None;
+        self.board = None;
         let here = slot(self.vendor);
         // 位置按（第几家，第几组，组里第几条）排；组标题排在它第一条前面。
         let current = match self.selected_row() {
@@ -853,6 +919,50 @@ impl App {
         effects
     }
 
+    // ---- 「等你回复」汇总 ----
+
+    /// 汇总里列的对话：三家自己的、托管着没停的（和顶栏「在跑 / 等你」数的是同一批），
+    /// 等你回复（含刚做完）的在前、在跑的在后，各自最近聊过的在前。
+    pub fn board_entries(&self) -> Vec<&Entry> {
+        let mut out: Vec<&Entry> = self
+            .lists
+            .iter()
+            .flat_map(|l| &l.entries)
+            .filter(|e| {
+                !e.session.automatic && self.state_of(&e.session.id) != SessionState::Stopped
+            })
+            .collect();
+        out.sort_by_key(|e| {
+            (
+                !waits(self.state_of(&e.session.id)),
+                Reverse(e.session.last_active),
+            )
+        });
+        out
+    }
+
+    /// 汇总里选中第几条（汇总没开为 `None`）：选中的那条还在就是它现在的位置，不在了停在原来的位置上。
+    pub fn board_index(&self, entries: &[&Entry]) -> Option<usize> {
+        let b = self.board.as_ref()?;
+        let at =
+            b.id.as_ref()
+                .and_then(|id| entries.iter().position(|e| e.session.id == *id));
+        Some(
+            at.unwrap_or(b.selected)
+                .min(entries.len().saturating_sub(1)),
+        )
+    }
+
+    /// s：打开 / 关上汇总。打开时停在第一条（等得最近的那条等你回复）上。
+    fn toggle_board(&mut self) {
+        if self.board.take().is_some() {
+            return;
+        }
+        self.search = None;
+        self.board = Some(Board::default());
+        self.select(0);
+    }
+
     // ---- 选中 ----
 
     fn in_hits(&self) -> bool {
@@ -860,6 +970,12 @@ impl App {
     }
 
     pub fn selected_entry(&self) -> Option<&Entry> {
+        if self.board.is_some() {
+            let entries = self.board_entries();
+            return self
+                .board_index(&entries)
+                .and_then(|i| entries.get(i).copied());
+        }
         if let Some(s) = self.search.as_ref().filter(|_| self.in_hits()) {
             return s.hits.get(s.selected);
         }
@@ -871,7 +987,7 @@ impl App {
     }
 
     pub fn selected_group(&self) -> Option<&Group> {
-        if self.in_hits() {
+        if self.in_hits() || self.board.is_some() {
             return None;
         }
         let l = self.list();
@@ -913,6 +1029,9 @@ impl App {
     }
 
     fn list_len(&self) -> usize {
+        if self.board.is_some() {
+            return self.board_entries().len();
+        }
         match &self.search {
             Some(s) if self.in_hits() => s.hits.len(),
             _ => self.list().rows.len(),
@@ -926,7 +1045,13 @@ impl App {
         }
         let i = i.min(len - 1);
         let before = self.selected_entry().map(|e| e.session.id.clone());
-        if self.in_hits() {
+        if self.board.is_some() {
+            let id = self.board_entries().get(i).map(|e| e.session.id.clone());
+            if let Some(b) = &mut self.board {
+                b.selected = i;
+                b.id = id;
+            }
+        } else if self.in_hits() {
             if let Some(s) = &mut self.search {
                 s.selected = i;
             }
@@ -940,6 +1065,9 @@ impl App {
     }
 
     fn selected_index(&self) -> usize {
+        if self.board.is_some() {
+            return self.board_index(&self.board_entries()).unwrap_or(0);
+        }
         match &self.search {
             Some(s) if self.in_hits() => s.selected,
             _ => self.list().selected,
@@ -955,7 +1083,9 @@ impl App {
         self.areas.list.height.max(2) as isize - 1
     }
 
+    /// Tab 换家：汇总开着就先关上，回到那家的列表。
     fn switch_vendor(&mut self, forward: bool) -> Vec<Effect> {
+        self.board = None;
         let n = self.shown.len().max(1);
         let i = self
             .shown
@@ -1017,14 +1147,35 @@ impl App {
             }
             Overlay::None => {}
         }
+        if let Some(r) = &mut self.reader {
+            return match r.key(key) {
+                Outcome::Stay => Vec::new(),
+                Outcome::Close => {
+                    self.reader = None;
+                    Vec::new()
+                }
+                Outcome::Open { here } => {
+                    let e = (*r.entry).clone();
+                    self.open_entry(e, here)
+                }
+                Outcome::Quit => {
+                    self.quit = true;
+                    Vec::new()
+                }
+            };
+        }
         if self.search.is_some() {
             return self.search_key(key);
+        }
+        if key.code == KeyCode::Esc && self.board.take().is_some() {
+            return Vec::new();
         }
         if let Some(a) = action_for(key) {
             return self.act(a);
         }
         // 中文输入法没切成英文时打出的字：直接当搜索词。
         if let Some(c) = typed_text(key) {
+            self.board = None;
             self.search = Some(Search::default());
             return self.edit_query(|q| q.push(c));
         }
@@ -1076,23 +1227,33 @@ impl App {
             Action::Collapse => return self.collapse(),
             Action::Expand => return self.expand(),
             Action::ToggleBackground => return self.toggle_background(),
-            Action::Search => self.search = Some(Search::default()),
-            Action::Jump(n) => return self.jump(n),
+            Action::Search => {
+                self.board = None;
+                self.search = Some(Search::default());
+            }
+            // 汇总里按数字：回到列表跳到那个项目。
+            Action::Jump(n) => {
+                self.board = None;
+                return self.jump(n);
+            }
             Action::NextWaiting => return self.next_waiting(),
+            Action::Board => self.toggle_board(),
             Action::CopyResume => match self.selected_entry() {
                 Some(e) => return vec![Effect::CopyResume(Box::new(e.clone()))],
                 None => self.status = Some("先选一条对话".to_owned()),
             },
+            Action::Read => self.open_reader(),
             Action::Open => return self.open(false),
             Action::OpenHere => return self.open(true),
+            // 选中一条对话时用它那家（汇总里可能是别家的）。
             Action::New => {
                 let cwd = self
                     .selected_dir()
                     .unwrap_or_else(|| self.launch_dir.clone());
-                return vec![Effect::New {
-                    vendor: self.vendor,
-                    cwd,
-                }];
+                let vendor = self
+                    .selected_entry()
+                    .map_or(self.vendor, |e| e.session.vendor);
+                return vec![Effect::New { vendor, cwd }];
             }
             Action::NewElsewhere => {
                 let dirs =
@@ -1227,14 +1388,22 @@ impl App {
         Vec::new()
     }
 
+    /// 选中的对话打开整段对话；从搜索结果打开时带上搜索词（高亮、n 跳）。
+    fn open_reader(&mut self) {
+        let Some(e) = self.selected_entry() else {
+            self.status = Some("先选一条对话".to_owned());
+            return;
+        };
+        let query = match &self.search {
+            Some(s) if self.in_hits() => s.query.as_str(),
+            _ => "",
+        };
+        self.reader = Some(Reader::new(e.clone(), query));
+    }
+
     fn open(&mut self, here: bool) -> Vec<Effect> {
         if let Some(e) = self.selected_entry() {
-            let entry = Box::new(e.clone());
-            if self.elsewhere(e) {
-                self.prompt = Some(Prompt::ConfirmOpen { entry, here });
-                return Vec::new();
-            }
-            return vec![Effect::Open { entry, here }];
+            return self.open_entry(e.clone(), here);
         }
         // 组标题上按回车：收起着就进去（展开并选中第一条），展开着就收起。
         let Some(Row::Header(g)) = self.selected_row() else {
@@ -1255,6 +1424,17 @@ impl App {
         effects
     }
 
+    /// 打开这条对话；它正在别处运行就先问一句。
+    fn open_entry(&mut self, e: Entry, here: bool) -> Vec<Effect> {
+        let ask = self.elsewhere(&e);
+        let entry = Box::new(e);
+        if ask {
+            self.prompt = Some(Prompt::ConfirmOpen { entry, here });
+            return Vec::new();
+        }
+        vec![Effect::Open { entry, here }]
+    }
+
     /// 选中的是组标题就收起/展开它。
     fn toggle_selected_group(&mut self) -> Vec<Effect> {
         match self.selected_row() {
@@ -1268,7 +1448,7 @@ impl App {
 
     /// 列表（不是搜索结果）里选中的那一行。
     fn selected_row(&self) -> Option<Row> {
-        if self.in_hits() {
+        if self.in_hits() || self.board.is_some() {
             return None;
         }
         let l = self.list();
@@ -1303,8 +1483,12 @@ impl App {
         }
     }
 
+    /// `→`：组标题上展开（展开着就进第一条），对话上看整段对话。
     fn expand(&mut self) -> Vec<Effect> {
         let Some(Row::Header(g)) = self.selected_row() else {
+            if self.selected_entry().is_some() {
+                self.open_reader();
+            }
             return Vec::new();
         };
         if self.folds.is_collapsed(&self.list().groups[g].key) {
@@ -1341,6 +1525,7 @@ impl App {
             }
             KeyCode::Up => self.move_by(-1),
             KeyCode::Down => self.move_by(1),
+            KeyCode::Right => self.open_reader(),
             KeyCode::PageUp => self.move_by(-self.page()),
             KeyCode::PageDown => self.move_by(self.page()),
             KeyCode::Tab => return self.switch_vendor(true),
@@ -1536,6 +1721,18 @@ impl App {
 
     pub fn mouse(&mut self, ev: MouseEvent, now: Instant) -> Vec<Effect> {
         let pos = Position::new(ev.column, ev.row);
+        // 整段对话开着：滚轮翻它，点击不穿透到下面的列表。确认提示、菜单这些照常。
+        if self.prompt.is_none()
+            && self.overlay == Overlay::None
+            && let Some(r) = &mut self.reader
+        {
+            match ev.kind {
+                MouseEventKind::ScrollDown => r.scroll(WHEEL_STEP as isize),
+                MouseEventKind::ScrollUp => r.scroll(-(WHEEL_STEP as isize)),
+                _ => {}
+            }
+            return Vec::new();
+        }
         match ev.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let down = ev.kind == MouseEventKind::ScrollDown;
@@ -1565,14 +1762,16 @@ impl App {
         if !self.areas.list.contains(pos) {
             return None;
         }
-        let offset = match &self.search {
-            Some(s) if self.in_hits() => s.offset,
+        let offset = match (&self.board, &self.search) {
+            (Some(b), _) => b.offset,
+            (None, Some(s)) if self.in_hits() => s.offset,
             _ => self.list().offset,
         };
         let y = usize::from(pos.y - self.areas.list.y);
         // 第一行被钉住的组标题盖着时，点到的是那个组标题。
         if y == 0
             && !self.in_hits()
+            && self.board.is_none()
             && self.areas.list.height >= 2
             && let Some(h) = self.list().sticky()
         {
@@ -1657,6 +1856,7 @@ impl App {
         }
         if let Some((v, _)) = self.areas.tabs.iter().find(|(_, r)| r.contains(pos)) {
             let v = *v;
+            self.board = None;
             return self.set_vendor(v);
         }
         let Some(i) = self.row_at(pos) else {

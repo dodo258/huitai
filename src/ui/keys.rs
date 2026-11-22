@@ -22,6 +22,10 @@ pub enum Action {
     Jump(u8),
     /// 跳到下一条等你回复的对话（三家轮着找）。
     NextWaiting,
+    /// 看整段对话（只读滚动视图）。
+    Read,
+    /// 打开 / 关上「等你回复」汇总：三家等你回复和在跑的列在一起。
+    Board,
     /// 新标签页打开（已开着就切过去）。
     Open,
     /// 当前窗口打开。
@@ -85,6 +89,7 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Enter if alt => Action::OpenHere,
         KeyCode::Enter => Action::Open,
         KeyCode::Char('w') => Action::OpenHere,
+        KeyCode::Char('v') => Action::Read,
         KeyCode::Tab => Action::NextVendor,
         KeyCode::BackTab => Action::PrevVendor,
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
@@ -99,6 +104,7 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('b') => Action::ToggleBackground,
         KeyCode::Char(c @ '1'..='9') => Action::Jump(c as u8 - b'0'),
         KeyCode::Char('!') => Action::NextWaiting,
+        KeyCode::Char('s') => Action::Board,
         KeyCode::Char('n') => Action::New,
         // m 是新建项目；N 是 v0.1.0 的老键，留着兼容，界面上不再提示。
         KeyCode::Char('m' | 'N') => Action::NewElsewhere,
@@ -168,8 +174,13 @@ pub fn bar(sel: Selected) -> Vec<KeyHelp> {
             k("e", "改名"),
         ],
         Selected::Group { expanded, .. } => vec![k("⏎", toggle(expanded))],
-        Selected::Running => vec![k("⏎", "回到它"), k("x", "结束")],
-        Selected::Stopped => vec![k("⏎", "接着聊"), k("e", "改名"), k("d", "删除")],
+        Selected::Running => vec![k("⏎", "回到它"), k("v", "看全文"), k("x", "结束")],
+        Selected::Stopped => vec![
+            k("⏎", "接着聊"),
+            k("v", "看全文"),
+            k("e", "改名"),
+            k("d", "删除"),
+        ],
     };
     keys.push(k("?", "全部按键"));
     keys
@@ -213,6 +224,7 @@ pub fn menu(sel: Selected) -> Vec<MenuItem> {
         Selected::Running => vec![
             m(A::Open, "⏎", "回到它"),
             m(A::OpenHere, "w", "在当前窗口接上"),
+            m(A::Read, "v", "看整段对话"),
             m(A::Kill, "x", "结束"),
             m(A::CopyResume, "c", "复制恢复命令"),
             m(A::Rename, "e", "改名"),
@@ -223,6 +235,7 @@ pub fn menu(sel: Selected) -> Vec<MenuItem> {
         Selected::Stopped => vec![
             m(A::Open, "⏎", "接着聊"),
             m(A::OpenHere, "w", "在当前窗口打开"),
+            m(A::Read, "v", "看整段对话"),
             m(A::CopyResume, "c", "复制恢复命令"),
             m(A::Rename, "e", "改名"),
             m(A::Pin, "p", "置顶 / 取消"),
@@ -245,7 +258,9 @@ pub const HELP: &[(&str, &[KeyHelp])] = &[
             k("b", "显示 / 隐藏后台对话"),
             k("/", "搜标题和正文"),
             k("1-9", "跳到第几个项目"),
+            k("v  →", "看整段对话（t 展开工具）"),
             k("!", "下一条等你回复的（跨家）"),
+            k("s", "三家等你回复和在跑的"),
         ],
     ),
     (

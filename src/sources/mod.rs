@@ -14,6 +14,7 @@ pub mod live;
 pub mod pi;
 mod sqlite;
 mod time;
+mod transcript;
 mod trash;
 mod window;
 
@@ -26,6 +27,7 @@ use crate::core::{Session, Vendor, VendorDirs};
 pub use claude::ClaudeSource;
 pub use codex::CodexSource;
 pub use pi::PiSource;
+pub use transcript::{Part, TRANSCRIPT_MAX_BYTES, Transcript};
 pub use trash::{Trash, TrashEntry, TrashedFile};
 
 /// 一家厂商的会话来源。
@@ -42,6 +44,10 @@ pub trait Source: Send + Sync {
 
     /// 最后 `n` 条消息（用户和 AI 的文字，按时间先后）。
     fn load_preview(&self, session: &Session, n: usize) -> io::Result<Vec<PreviewMessage>>;
+
+    /// 整段对话（只读滚动视图用）：消息、工具调用和返回按时间先后，每块截短；
+    /// 文件太大只读最后 [`TRANSCRIPT_MAX_BYTES`]（[`Transcript::truncated`]）。
+    fn load_transcript(&self, session: &Session) -> io::Result<Transcript>;
 
     /// 精确的用户发言条数（会读完整个文件，按需调用）。
     fn count_messages(&self, session: &Session) -> io::Result<usize>;

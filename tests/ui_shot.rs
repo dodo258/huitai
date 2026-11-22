@@ -275,6 +275,46 @@ fn times(f: &Fake) -> Vec<String> {
     (0..n).map(|i| rfc3339(end - (n - 1 - i) * 120)).collect()
 }
 
+/// 一段工具调用：AI 说一句、跑命令、看返回、读文件、看返回（Claude 会话行）。
+fn tool_lines(id: &str, ts: &str, cwd: &str) -> Vec<String> {
+    let line = |kind: &str, content: serde_json::Value| {
+        serde_json::json!({
+            "type": kind,
+            "message": {"role": kind, "content": content},
+            "timestamp": ts,
+            "cwd": cwd,
+            "sessionId": id,
+            "entrypoint": "cli",
+        })
+        .to_string()
+    };
+    vec![
+        line(
+            "assistant",
+            serde_json::json!([
+                {"type": "text", "text": "先看看首屏请求了哪些接口、各花了多久。"},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "npm run trace -- /checkout"}},
+            ]),
+        ),
+        line(
+            "user",
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "t1",
+                "content": "GET /api/address   1.8s  同步\nGET /api/cart      0.4s\nGET /api/coupons   0.6s"}]),
+        ),
+        line(
+            "assistant",
+            serde_json::json!([
+                {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "src/pages/checkout/load.ts"}},
+            ]),
+        ),
+        line(
+            "user",
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "t2",
+                "content": "const address = await fetchAddress()\nconst cart = await fetchCart()\nconst coupons = await fetchCoupons()"}]),
+        ),
+    ]
+}
+
 fn fake_home(home: &Path) {
     let claude = CLAUDE.iter().map(|f| (f, "cli"));
     let claude = claude.chain(CLAUDE_AUTO.iter().map(|f| (f, "sdk-cli")));
@@ -295,6 +335,10 @@ fn fake_home(home: &Path) {
                 ts[j * 2],
                 json(&cwd_s)
             ));
+            // 「结算页首屏加载慢」中间有两次工具调用：整段对话里折成一行、t 展开（截图 18、19）。
+            if f.title.starts_with("结算页首屏") {
+                lines.extend(tool_lines(&id, &ts[j * 2], &cwd_s));
+            }
             lines.push(format!(
                 r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":{}}}]}},"uuid":"a{j}","timestamp":"{}","cwd":{},"sessionId":"{id}","gitBranch":"main","entrypoint":"{entrypoint}"}}"#,
                 json(a),
@@ -1009,11 +1053,23 @@ fn real_terminal_screenshots() {
     run.press(b"\x1b");
     // 底栏随选中项换提示：项目组标题、停着的对话（在跑的那种见 7-live）。
     run.send(b"1k");
-    run.wait_for("⏎ 收起   n 新对话   e 改名");
+    run.wait_for("⏎ 收起   n 新对话   m 新项目   e 改名");
     run.save(&out, "13-bar-group");
     run.send(b"jj");
-    run.wait_for("⏎ 接着聊   e 改名   d 删除");
+    run.wait_for("⏎ 接着聊   v 看全文   e 改名   d 删除");
     run.save(&out, "14-bar-stopped");
+    // 整段对话：下一条「结算页首屏加载慢」中间有工具调用，先截折叠的，t 展开再截一张，Esc 回列表。
+    run.send(b"j");
+    run.wait_for("结算页首屏要 3 秒");
+    run.send(b"v");
+    run.wait_for("对话全文");
+    run.wait_for("工具 ×2");
+    run.save(&out, "18-reader");
+    run.send(b"t");
+    run.wait_for("npm run trace");
+    run.save(&out, "19-reader-tools");
+    run.press(b"\x1b");
+    run.wait_for("⏎ 接着聊   v 看全文");
     // 右键菜单：在「结算页首屏加载慢」那一行上右键（SGR 鼠标序列，坐标从 1 起）。
     let y = run
         .text()
@@ -1081,6 +1137,12 @@ fn real_terminal_screenshots() {
     run.send(b"!");
     run.wait_for("· ◆ 等你回复");
     run.save(&out, "12-jump-waiting");
+    // s：三家等你回复和在跑的列在一起（等你的在前）。
+    run.send(b"s");
+    run.wait_for("等你回复和在跑的 · 三家");
+    run.wait_for("等你 1 · 在跑 3");
+    run.save(&out, "16-board");
+    run.send(b"\x1b");
     run.quit();
     drop(daemon);
     drop(desktop);

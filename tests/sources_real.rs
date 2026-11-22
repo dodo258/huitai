@@ -47,3 +47,38 @@ fn scan_real_dirs() {
     }
     println!("三家合计 {:.0} ms", all.elapsed().as_secs_f64() * 1000.0);
 }
+
+/// 整段对话：每家挑最大的那条读全文，打印文件大小、块数、耗时（不打印内容）。
+#[test]
+#[ignore = "读本机真实会话目录，手动跑"]
+fn transcript_of_largest_real_session() {
+    let home = PathBuf::from(std::env::var_os("HOME").expect("需要 HOME"));
+    let trash = Trash::new(std::env::temp_dir().join("huitai-real-transcript-trash"));
+    for src in default_sources(&home, trash) {
+        let scan = src.scan();
+        let size = |s: &huitai::core::Session| std::fs::metadata(&s.path).map_or(0, |m| m.len());
+        // 最大的文件、最近一条、最近一条没有会话文件的（Codex 只在正文库里的）。
+        let largest = scan.sessions.iter().max_by_key(|s| size(s));
+        let latest = scan.sessions.iter().max_by_key(|s| s.last_active);
+        let db_only = scan
+            .sessions
+            .iter()
+            .filter(|s| !s.path.is_file())
+            .max_by_key(|s| s.last_active);
+        for s in largest.into_iter().chain(latest).chain(db_only) {
+            let t = Instant::now();
+            let r = src.load_transcript(s);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            match r {
+                Ok(tr) => println!(
+                    "{:?} {:.1}MB：{} 块，只读了尾部 {}，{ms:.0}ms",
+                    src.vendor(),
+                    size(s) as f64 / 1048576.0,
+                    tr.parts.len(),
+                    tr.truncated
+                ),
+                Err(e) => println!("{:?} 读不了：{e}", src.vendor()),
+            }
+        }
+    }
+}

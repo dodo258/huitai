@@ -156,14 +156,17 @@ fn bottom_bar_follows_selection() {
     select_id(&mut app, "c-shop-1");
     assert_eq!(app.selected_kind(), Selected::Running);
     let bar = bottom(&mut app);
-    assert!(bar.contains("⏎ 回到它   x 结束   ? 全部按键"), "{bar}");
+    assert!(
+        bar.contains("⏎ 回到它   v 看全文   x 结束   ? 全部按键"),
+        "{bar}"
+    );
 
     // 停着的对话。
     select_id(&mut app, "c-shop-3");
     assert_eq!(app.selected_kind(), Selected::Stopped);
     let bar = bottom(&mut app);
     assert!(
-        bar.contains("⏎ 接着聊   e 改名   d 删除   ? 全部按键"),
+        bar.contains("⏎ 接着聊   v 看全文   e 改名   d 删除   ? 全部按键"),
         "{bar}"
     );
 

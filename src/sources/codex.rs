@@ -17,7 +17,10 @@ use super::jsonl::{self, str_field};
 use super::sqlite::{self, Row};
 use super::time::{from_millis, parse_rfc3339};
 use super::window::Window;
-use super::{Command, Counted, PreviewMessage, Progress, Role, Scan, Source, Trash, TrashEntry};
+use super::{
+    Command, Counted, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript, Trash,
+    TrashEntry, transcript,
+};
 use crate::core::{Session, SessionId, Vendor};
 
 pub struct CodexSource {
@@ -162,6 +165,34 @@ impl Source for CodexSource {
             .collect();
         out.reverse();
         Ok(out)
+    }
+
+    /// rollout 文件还在就读文件，否则从正文库读最后 [`HISTORY_ITEMS`] 项。
+    fn load_transcript(&self, session: &Session) -> io::Result<Transcript> {
+        if session.path.is_file() {
+            return transcript::read(&session.path, parts);
+        }
+        let (Some(db), Some(id)) = (self.history_db(), sqlite::safe_id(session.id.as_str())) else {
+            return Ok(Transcript::default());
+        };
+        let types = HISTORY_TYPES.map(|t| format!("'{t}'")).join(", ");
+        let sql = format!(
+            "select item_json, created_at_ms from thread_items where thread_id = '{id}' \
+             and item_type in ({types}) order by rollout_ordinal desc limit {}",
+            HISTORY_ITEMS + 1
+        );
+        let mut rows = sqlite::query(&db, &sql)?;
+        let truncated = rows.len() > HISTORY_ITEMS;
+        rows.truncate(HISTORY_ITEMS);
+        rows.reverse();
+        Ok(Transcript {
+            parts: rows
+                .iter()
+                .flat_map(history_parts)
+                .map(transcript::clip)
+                .collect(),
+            truncated,
+        })
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
@@ -424,6 +455,110 @@ pub(crate) fn message(v: &Value) -> Option<PreviewMessage> {
         text,
         at: str_field(v, "timestamp").and_then(parse_rfc3339),
     })
+}
+
+/// rollout 里的工具调用和返回都在 `response_item` 行（新旧格式都有）；新格式 `item_completed` 里的
+/// `CommandExecution` 是 `exec` 工具内部跑的命令，和外面那次调用重复，不算。
+fn parts(v: &Value) -> Vec<Part> {
+    if let Some(m) = message(v) {
+        return vec![Part::Message(m)];
+    }
+    if str_field(v, "type") != Some("response_item") {
+        return Vec::new();
+    }
+    let Some(p) = v.get("payload") else {
+        return Vec::new();
+    };
+    let null = &Value::Null;
+    let field = |k: &str| p.get(k).unwrap_or(null);
+    let name = || str_field(p, "name").unwrap_or("工具").to_owned();
+    let part = match str_field(p, "type") {
+        Some("function_call") => Part::ToolCall {
+            name: name(),
+            input: transcript::input_summary(field("arguments")),
+        },
+        Some("custom_tool_call") => Part::ToolCall {
+            name: name(),
+            input: transcript::input_summary(field("input")),
+        },
+        Some("local_shell_call") => Part::ToolCall {
+            name: "shell".to_owned(),
+            input: transcript::input_summary(p.pointer("/action").unwrap_or(null)),
+        },
+        Some("web_search_call") => Part::ToolCall {
+            name: "web_search".to_owned(),
+            input: transcript::input_summary(p.pointer("/action").unwrap_or(null)),
+        },
+        Some("function_call_output" | "custom_tool_call_output" | "local_shell_call_output") => {
+            Part::ToolResult {
+                text: transcript::output_text(field("output")),
+            }
+        }
+        _ => return Vec::new(),
+    };
+    vec![part]
+}
+
+/// 正文库里整段对话读这几类：消息，和几种工具项。
+const HISTORY_TYPES: [&str; 6] = [
+    "userMessage",
+    "agentMessage",
+    "commandExecution",
+    "mcpToolCall",
+    "fileChange",
+    "webSearch",
+];
+/// 正文库里整段对话最多读最后这么多项（sqlite3 一次查询的输出有上限）。
+const HISTORY_ITEMS: usize = 3000;
+
+/// 正文库里整段对话的一项：消息（同 [`history_message`]），或工具调用（带返回的再跟一块返回）。
+fn history_parts(row: &Row) -> Vec<Part> {
+    if let Some(m) = history_message(row) {
+        return vec![Part::Message(m)];
+    }
+    let Some(item) = row
+        .get("item_json")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    else {
+        return Vec::new();
+    };
+    let null = &Value::Null;
+    let field = |k: &str| item.get(k).unwrap_or(null);
+    let (name, input, output) = match str_field(&item, "type") {
+        Some("commandExecution") => (
+            "shell".to_owned(),
+            transcript::input_summary(&serde_json::json!({ "command": field("command") })),
+            transcript::output_text(field("aggregatedOutput")),
+        ),
+        Some("mcpToolCall") => (
+            str_field(&item, "tool").unwrap_or("工具").to_owned(),
+            transcript::input_summary(field("arguments")),
+            String::new(),
+        ),
+        Some("fileChange") => (
+            "改文件".to_owned(),
+            field("changes")
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| str_field(c, "path"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            String::new(),
+        ),
+        Some("webSearch") => (
+            "web_search".to_owned(),
+            transcript::input_summary(field("query")),
+            String::new(),
+        ),
+        _ => return Vec::new(),
+    };
+    let mut out = vec![Part::ToolCall { name, input }];
+    if !output.trim().is_empty() {
+        out.push(Part::ToolResult { text: output });
+    }
+    out
 }
 
 /// 正文库 `thread_items` 里的一条。

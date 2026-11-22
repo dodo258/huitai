@@ -96,10 +96,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
     let buf = frame.buffer_mut();
     let accent = theme.accent(app.vendor);
     top_bar(buf, a.top, app, theme);
-    list(buf, a.list_head, a.list, app, theme, accent);
-    if let (Some(h), Some(p)) = (a.preview_head, a.preview) {
-        preview_head(buf, h, app, theme);
-        preview(buf, p, app, theme, accent);
+    let now = app.now;
+    if let Some(r) = &mut app.reader {
+        // 整段对话盖住列表和预览两栏（表头带当它的标题带）；列表点不到。
+        let body = Rect {
+            y: area.y + 1,
+            height: area.height.saturating_sub(2),
+            ..area
+        };
+        r.draw(buf, body, now, theme);
+        app.areas.list = Rect::default();
+        app.areas.preview = Rect::default();
+    } else {
+        list(buf, a.list_head, a.list, app, theme, accent);
+        if let (Some(h), Some(p)) = (a.preview_head, a.preview) {
+            preview_head(buf, h, app, theme);
+            preview(buf, p, app, theme, accent);
+        }
     }
     bottom_bar(buf, a.bottom, app, theme, accent);
     if let Some(Prompt::NewDir { picker, .. }) = &app.prompt {
@@ -125,6 +138,17 @@ fn keep_visible(app: &mut App, height: u16) {
             *off = sel + 1 - h;
         }
     };
+    if app.board.is_some() {
+        let entries = app.board_entries();
+        let (len, sel) = (entries.len(), app.board_index(&entries).unwrap_or(0));
+        if let Some(b) = &mut app.board {
+            // 记下这一帧选中的位置：选中的那条下一刻不在了，就停在用户最后看到它的地方。
+            b.selected = sel;
+            b.offset = b.offset.min(len.saturating_sub(h));
+            fix(sel, &mut b.offset);
+        }
+        return;
+    }
     match &mut app.search {
         Some(s) if !s.query.is_empty() => fix(s.selected, &mut s.offset),
         _ => {
@@ -143,7 +167,7 @@ fn keep_visible(app: &mut App, height: u16) {
 
 // ---- 基础 ----
 
-fn fill(buf: &mut Buffer, area: Rect, bg: Color) {
+pub(super) fn fill(buf: &mut Buffer, area: Rect, bg: Color) {
     buf.set_style(area, Style::default().bg(bg));
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
@@ -159,7 +183,12 @@ fn line_width(spans: &[Span]) -> usize {
 }
 
 /// 在一行里左边放 `left`、右边贴边放 `right`；放不下时先截左边。
-fn row(buf: &mut Buffer, area: Rect, left: Vec<Span<'static>>, right: Vec<Span<'static>>) {
+pub(super) fn row(
+    buf: &mut Buffer,
+    area: Rect,
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+) {
     let w = usize::from(area.width);
     let rw = line_width(&right).min(w);
     let left = clip(left, w.saturating_sub(rw));
@@ -176,7 +205,7 @@ fn row(buf: &mut Buffer, area: Rect, left: Vec<Span<'static>>, right: Vec<Span<'
 }
 
 /// 截掉超出 `max` 格的部分（最后一段带省略号）。
-fn clip(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+pub(super) fn clip(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut used = 0;
     for s in spans {
@@ -205,15 +234,15 @@ impl RenderInto for Line<'_> {
     }
 }
 
-fn fg(c: Color) -> Style {
+pub(super) fn fg(c: Color) -> Style {
     Style::default().fg(c)
 }
 
-fn bold(c: Color) -> Style {
+pub(super) fn bold(c: Color) -> Style {
     fg(c).add_modifier(Modifier::BOLD)
 }
 
-fn sp(text: impl Into<String>, style: Style) -> Span<'static> {
+pub(super) fn sp(text: impl Into<String>, style: Style) -> Span<'static> {
     Span::styled(text.into(), style)
 }
 
@@ -547,6 +576,10 @@ fn list(buf: &mut Buffer, head: Rect, area: Rect, app: &App, t: &Theme, accent: 
         height: 1,
         ..area
     };
+    if let Some(b) = &app.board {
+        board(buf, head, area, app, b.offset, t, accent);
+        return;
+    }
     if let Some(s) = app.search.as_ref().filter(|s| !s.query.is_empty()) {
         if s.hits.is_empty() {
             list_head(buf, head, "搜索结果", &Table::new(&[], 0), t);
@@ -583,7 +616,18 @@ fn list(buf: &mut Buffer, head: Rect, area: Rect, app: &App, t: &Theme, accent: 
             .take(usize::from(area.height))
         {
             let r = line((i - s.offset) as u16);
-            item(buf, r, app, e, true, i == s.selected, &table, c, t, accent);
+            item(
+                buf,
+                r,
+                app,
+                e,
+                Tag::Project,
+                i == s.selected,
+                &table,
+                c,
+                t,
+                accent,
+            );
         }
         return;
     }
@@ -635,13 +679,17 @@ fn list(buf: &mut Buffer, head: Rect, area: Rect, app: &App, t: &Theme, accent: 
         match *r {
             Row::Header(g) => header(buf, rect, app, g, selected, &table, c, t, accent),
             Row::Item { group, entry } => {
-                let mixed = l.groups[group].mixed();
+                let tag = if l.groups[group].mixed() {
+                    Tag::Project
+                } else {
+                    Tag::None
+                };
                 item(
                     buf,
                     rect,
                     app,
                     &l.entries[entry],
-                    mixed,
+                    tag,
                     selected,
                     &table,
                     c,
@@ -659,11 +707,77 @@ fn list(buf: &mut Buffer, head: Rect, area: Rect, app: &App, t: &Theme, accent: 
     }
 }
 
+/// 「等你回复」汇总（`s`）：三家的对话混在一行行里，每行标题前是那家的标记，后面是项目名。
+fn board(
+    buf: &mut Buffer,
+    head: Rect,
+    area: Rect,
+    app: &App,
+    offset: usize,
+    t: &Theme,
+    accent: Color,
+) {
+    const LABEL: &str = "等你回复和在跑的 · 三家";
+    let line = |i: u16| Rect {
+        y: area.y + i,
+        height: 1,
+        ..area
+    };
+    let entries = app.board_entries();
+    if entries.is_empty() {
+        list_head(buf, head, LABEL, &Table::new(&[], 0), t);
+        row(
+            buf,
+            line(1),
+            vec![sp("  没有等你回复或在跑的对话", fg(t.muted))],
+            vec![],
+        );
+        row(
+            buf,
+            line(2),
+            vec![sp(
+                "  会话台托管的对话停下来要你回复时，会列在这里",
+                fg(t.faint),
+            )],
+            vec![],
+        );
+        return;
+    }
+    let selected = app.board_index(&entries).unwrap_or(0);
+    let cells: Vec<Cells> = entries
+        .iter()
+        .map(|e| item_cells(app, e, t, accent))
+        .collect();
+    let table = Table::new(&cells, usize::from(area.width));
+    list_head(buf, head, LABEL, &table, t);
+    for (i, (e, c)) in entries
+        .iter()
+        .zip(cells)
+        .enumerate()
+        .skip(offset)
+        .take(usize::from(area.height))
+    {
+        let r = line((i - offset) as u16);
+        item(
+            buf,
+            r,
+            app,
+            e,
+            Tag::VendorAndProject,
+            i == selected,
+            &table,
+            c,
+            t,
+            accent,
+        );
+    }
+}
+
 /// 「⏎ 确定 · 留空恢复原名 · Esc 取消」这类按键说明：按键用强调色加粗（和底栏、帮助一样，看得出能按），
 /// 说明用次要色；不以按键开头的一段（「留空恢复原名」）整段用暗色。
 fn key_hints(text: &str, t: &Theme, accent: Color) -> Vec<Span<'static>> {
     let is_key = |k: &str| {
-        matches!(k, "⏎" | "Esc" | "Tab" | "⇧Tab" | "↑↓")
+        matches!(k, "⏎" | "Esc" | "Tab" | "⇧Tab" | "↑↓" | "→" | "!")
             || (k.len() == 1 && k.bytes().all(|b| b.is_ascii_alphabetic()))
     };
     let mut out = Vec::new();
@@ -975,13 +1089,23 @@ fn background_counts(app: &App, g: &Group) -> (usize, usize) {
     (g.background.len(), running)
 }
 
+/// 对话那一行除了标题还标什么。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    None,
+    /// 标题后面补项目名（混着几个项目的组、搜索结果）。
+    Project,
+    /// 标题前面再加那家的标记（汇总里三家混在一起）。
+    VendorAndProject,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn item(
     buf: &mut Buffer,
     area: Rect,
     app: &App,
     e: &Entry,
-    show_project: bool,
+    tag: Tag,
     selected: bool,
     table: &Table,
     cells: Cells,
@@ -993,13 +1117,16 @@ fn item(
     let (glyph, _, glyph_color) = light(app, e, t, t.faint);
     let title_style = if selected { bold(t.title) } else { fg(t.text) };
     // 混着几个项目的组（置顶、搜索结果……）在标题后面补项目名；标题先让位，项目名尽量留全。
-    let project = show_project.then(|| truncate(&app.project_label(&e.session.cwd), 14));
+    let project = (tag != Tag::None).then(|| truncate(&app.project_label(&e.session.cwd), 14));
     let project_w = project.as_ref().map_or(0, |p| width(p) + 2);
-    let title_room = room.saturating_sub(2 + project_w);
-    let mut left = vec![
-        sp(format!("{glyph} "), fg(glyph_color)),
-        sp(truncate(e.title(), title_room), title_style),
-    ];
+    let mark_w = if tag == Tag::VendorAndProject { 2 } else { 0 };
+    let title_room = room.saturating_sub(2 + mark_w + project_w);
+    let mut left = vec![sp(format!("{glyph} "), fg(glyph_color))];
+    if tag == Tag::VendorAndProject {
+        let v = e.session.vendor;
+        left.push(sp(format!("{} ", v.mark()), fg(t.accent(v))));
+    }
+    left.push(sp(truncate(e.title(), title_room), title_style));
     if let Some(p) = project {
         left.push(sp(format!("  {p}"), fg(t.faint)));
     }
@@ -1090,7 +1217,10 @@ fn preview(buf: &mut Buffer, area: Rect, app: &App, t: &Theme, accent: Color) {
     if app.attached.contains(&e.session.id) {
         lines.push(Line::from(
             vec![
-                sp(format!("{} 已在标签页打开", app.vendor.mark()), fg(accent)),
+                sp(
+                    format!("{} 已在标签页打开", e.session.vendor.mark()),
+                    fg(accent),
+                ),
                 sp(" · ", fg(t.faint)),
             ]
             .into_iter()
@@ -1127,7 +1257,7 @@ fn preview(buf: &mut Buffer, area: Rect, app: &App, t: &Theme, accent: Color) {
     put_lines(buf, inner, lines);
 }
 
-fn put_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static>>) {
+pub(super) fn put_lines(buf: &mut Buffer, area: Rect, lines: Vec<Line<'static>>) {
     for (i, l) in lines.into_iter().take(usize::from(area.height)).enumerate() {
         let r = Rect {
             y: area.y + i as u16,
@@ -1433,6 +1563,28 @@ fn bottom_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme, accent: Co
         row(buf, inner, left, key_hints(right, t, accent));
         return;
     }
+    if let Some(r) = &app.reader {
+        r.bottom(buf, inner, app.status.as_deref(), t);
+        return;
+    }
+    if app.board.is_some() {
+        let entries = app.board_entries();
+        let waiting = entries
+            .iter()
+            .filter(|e| app.state_of(&e.session.id) != SessionState::Running)
+            .count();
+        let running = entries.len() - waiting;
+        let left = vec![
+            sp("s ", bold(accent)),
+            sp(format!("等你 {waiting} · 在跑 {running}"), fg(t.title)),
+        ];
+        let right = match &app.status {
+            Some(s) => vec![sp(s.clone(), fg(t.text))],
+            None => key_hints("⏎ 打开 · ! 下一条等你 · Esc 返回", t, accent),
+        };
+        row(buf, inner, left, right);
+        return;
+    }
     if let Some(s) = &app.search {
         let left = vec![
             sp("/ ", bold(accent)),
@@ -1445,7 +1597,7 @@ fn bottom_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme, accent: Co
             format!("{} 条", s.hits.len())
         };
         let mut right = vec![sp(format!("{count} · "), fg(t.faint))];
-        right.extend(key_hints("⏎ 打开 · Esc 返回", t, accent));
+        right.extend(key_hints("⏎ 打开 · → 看全文 · Esc 返回", t, accent));
         row(buf, inner, left, right);
         return;
     }

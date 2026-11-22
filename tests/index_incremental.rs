@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use huitai::core::{Session, SessionId, Vendor};
 use huitai::index::Index;
-use huitai::sources::{Command, PreviewMessage, Scan, Source, TrashEntry};
+use huitai::sources::{Command, PreviewMessage, Scan, Source, Transcript, TrashEntry};
 use index_common::{Env, assistant_line, ids, temp_dir, title_line};
 
 #[test]
@@ -200,6 +200,9 @@ impl Source for Whole {
     }
     fn load_preview(&self, _: &Session, _: usize) -> io::Result<Vec<PreviewMessage>> {
         Ok(Vec::new())
+    }
+    fn load_transcript(&self, _: &Session) -> io::Result<Transcript> {
+        Ok(Transcript::default())
     }
     fn count_messages(&self, s: &Session) -> io::Result<usize> {
         Ok(s.message_count)

@@ -9,7 +9,10 @@ use serde_json::Value;
 use super::jsonl::{self, str_field};
 use super::time::{from_millis, parse_rfc3339};
 use super::window::Window;
-use super::{Command, Counted, PreviewMessage, Progress, Role, Scan, Source, Trash, TrashEntry};
+use super::{
+    Command, Counted, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript, Trash,
+    TrashEntry, transcript,
+};
 use crate::core::{Session, SessionId, Vendor};
 
 pub struct PiSource {
@@ -38,6 +41,10 @@ impl Source for PiSource {
 
     fn load_preview(&self, session: &Session, n: usize) -> io::Result<Vec<PreviewMessage>> {
         jsonl::last_messages(&session.path, n, message)
+    }
+
+    fn load_transcript(&self, session: &Session) -> io::Result<Transcript> {
+        transcript::read(&session.path, parts)
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
@@ -190,6 +197,37 @@ pub(crate) fn message(v: &Value) -> Option<PreviewMessage> {
         .and_then(from_millis)
         .or_else(|| str_field(v, "timestamp").and_then(parse_rfc3339));
     Some(PreviewMessage { role, text, at })
+}
+
+/// 整段对话里的一行：消息（同 [`message`]），加上 AI 消息里的 `toolCall` 块和 `toolResult` 消息。
+fn parts(v: &Value) -> Vec<Part> {
+    let mut out: Vec<Part> = message(v).map(Part::Message).into_iter().collect();
+    if str_field(v, "type") != Some("message") {
+        return out;
+    }
+    let Some(m) = v.get("message") else {
+        return out;
+    };
+    let content = m.get("content").unwrap_or(&Value::Null);
+    match str_field(m, "role") {
+        Some("assistant") => {
+            for it in content.as_array().into_iter().flatten() {
+                if str_field(it, "type") == Some("toolCall") {
+                    out.push(Part::ToolCall {
+                        name: str_field(it, "name").unwrap_or("工具").to_owned(),
+                        input: transcript::input_summary(
+                            it.get("arguments").unwrap_or(&Value::Null),
+                        ),
+                    });
+                }
+            }
+        }
+        Some("toolResult") => out.push(Part::ToolResult {
+            text: transcript::output_text(content),
+        }),
+        _ => {}
+    }
+    out
 }
 
 /// `<时间>_<id>.jsonl` → id。

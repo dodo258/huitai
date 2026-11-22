@@ -13,7 +13,8 @@ use super::jsonl::{self, str_field};
 use super::time::parse_rfc3339;
 use super::window::Window;
 use super::{
-    Command, Counted, PreviewMessage, Progress, Role, Scan, Source, Trash, TrashEntry, encode_path,
+    Command, Counted, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript, Trash,
+    TrashEntry, encode_path, transcript,
 };
 use crate::core::{Session, SessionId, Vendor};
 
@@ -54,6 +55,10 @@ impl Source for ClaudeSource {
 
     fn load_preview(&self, session: &Session, n: usize) -> io::Result<Vec<PreviewMessage>> {
         jsonl::last_messages(&session.path, n, message)
+    }
+
+    fn load_transcript(&self, session: &Session) -> io::Result<Transcript> {
+        transcript::read(&session.path, parts)
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
@@ -222,6 +227,31 @@ pub(crate) fn message(v: &Value) -> Option<PreviewMessage> {
         text,
         at: str_field(v, "timestamp").and_then(parse_rfc3339),
     })
+}
+
+/// 整段对话里的一行：消息（同 [`message`]），加上 AI 的 `tool_use` 块和用户行里的 `tool_result` 块。
+/// 子代理的行不算（它们在附属目录里另有文件）。
+fn parts(v: &Value) -> Vec<Part> {
+    let mut out: Vec<Part> = message(v).map(Part::Message).into_iter().collect();
+    if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return out;
+    }
+    let Some(items) = v.pointer("/message/content").and_then(Value::as_array) else {
+        return out;
+    };
+    for it in items {
+        match str_field(it, "type") {
+            Some("tool_use") => out.push(Part::ToolCall {
+                name: str_field(it, "name").unwrap_or("工具").to_owned(),
+                input: transcript::input_summary(it.get("input").unwrap_or(&Value::Null)),
+            }),
+            Some("tool_result") => out.push(Part::ToolResult {
+                text: transcript::output_text(it.get("content").unwrap_or(&Value::Null)),
+            }),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// 最后一条 `type == kind` 的行里的字符串字段 `key`（非空）。

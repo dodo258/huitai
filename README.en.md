@@ -52,7 +52,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 ## Get started in three steps
 
 1. **Install**: see above.
-2. **Type `ai`**: the tools you have installed sit along the top as tabs (missing ones are hidden); click one or press `Tab` to switch. Conversations are grouped by project on the left; the last few messages are previewed on the right.
+2. **Type `ai`**: the tools you have installed sit along the top as tabs (missing ones are hidden); click one or press `Tab` to switch. Conversations are grouped by project on the left; the last few messages are previewed on the right, and `v` shows the whole conversation.
 3. **Press Enter to continue**: select a conversation and press Enter. A new tab opens in the project directory and resumes it.
 
 Not sure everything is set up? Run `ai doctor`. It checks the three CLIs and their versions, the session directories, quota, whether the current terminal can open new tabs, and whether the background daemon is running.
@@ -83,6 +83,8 @@ Right after the seal, the top bar totals all three tools: conversations huitai h
 
 - Type `ai` inside a project directory (or any subdirectory) and that project opens expanded.
 - `!` jumps to the next conversation waiting for you, across all three tools; clicking `◆` in the top bar does the same. Clicking `●N 别处` in the top bar jumps to the next one open elsewhere, such as the desktop app.
+- `s` lists every conversation waiting for you or running, across all three tools, with the waiting ones first, so you can see at a glance which ones are stuck; `Esc` goes back to the list.
+- `v` (or `→`) shows the whole conversation, read-only: it starts at the end, tool calls are folded into one line (`t` unfolds them), and when opened from search results the search words are highlighted and `n` jumps to the next one. Once you are sure it is the right one, `⏎` continues it.
 - `⌥Space` brings up huitai from anywhere. It works once the daemon is up, which happens the first time you open a conversation.
 - `c` copies the resume command (`cd 'dir' && claude --resume …`); paste it into any terminal to continue.
 - `x` ends a conversation running in the background.
@@ -114,6 +116,8 @@ Every action is a single key. The bottom bar shows the most common ones; `?` sho
 | | `/` | Search titles and text |
 | | `1-9` | Jump to a project |
 | | `!` | Next conversation waiting for you (any tool) |
+| | `s` | Everything waiting for you or running, all three tools in one list |
+| | `v` / `→` | Read the whole conversation (`t` unfolds tool calls) |
 | | `b` | Show / hide background conversations |
 | Open | `⏎` | Open in a new tab |
 | | `w` / `⌥⏎` | Open in the current window (`⌥⏎` needs Option as Alt) |
