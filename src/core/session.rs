@@ -39,6 +39,11 @@ impl fmt::Display for SessionId {
 /// 状态灯（notify）和闲置收回（host）用同一个判断。
 pub const REDRAW_GRACE: Duration = Duration::from_secs(2);
 
+/// 在跑的对话这么久没有任何输出，状态灯就当这一轮停了。只改灯：闲置收回不认它（见 `host::idle`）。
+/// 给答完不发提醒信号的 CLI 用（pi 只发 OSC 133 区段，不响铃不发通知）；Claude、Codex 干活时转圈一直有输出，
+/// 守护进程每秒最多报一次有输出，20 秒没报就是真没动静。取舍见 DECISIONS.md「安静超时」。
+pub const QUIET_AFTER: Duration = Duration::from_secs(20);
+
 /// 对话在会话台里的状态（状态灯）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

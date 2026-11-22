@@ -422,11 +422,7 @@ fn present(p: &Path) -> bool {
 }
 
 fn vendor_key(v: Vendor) -> &'static str {
-    match v {
-        Vendor::Claude => "claude",
-        Vendor::Codex => "codex",
-        Vendor::Pi => "pi",
-    }
+    v.key()
 }
 
 fn file_name(p: &Path) -> String {

@@ -10,5 +10,5 @@ mod vendor;
 pub use config::Config;
 pub use dirs::VendorDirs;
 pub use quota::{QuotaReading, QuotaValue, QuotaWindow};
-pub use session::{REDRAW_GRACE, Session, SessionId, SessionState};
-pub use vendor::Vendor;
+pub use session::{QUIET_AFTER, REDRAW_GRACE, Session, SessionId, SessionState};
+pub use vendor::{VENDORS, Vendor, VendorInfo};

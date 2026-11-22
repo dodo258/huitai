@@ -155,14 +155,14 @@ pub(super) fn fetch_usage(req: &UsageRequest) -> Result<String, String> {
 pub(super) fn settings_arg(r: &QuotaReader, cwd: &Path) -> String {
     let cache_file = r
         .rules
-        .claude
+        .channels(Vendor::Claude)
         .iter()
         .find_map(|ch| match ch {
             Channel::Statusline { cache_file, .. } => Some(cache_file.as_str()),
             _ => None,
         })
         .expect("rules.json 里 Claude 有状态栏渠道（rules 单测保证）");
-    let original = original_statusline(&r.dirs.claude, cwd);
+    let original = original_statusline(r.dirs.dir(Vendor::Claude), cwd);
     let original_cmd = original
         .as_ref()
         .and_then(|o| o.get("command"))

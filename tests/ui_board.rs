@@ -211,7 +211,7 @@ fn renders_vendor_marks_projects_and_counts() {
     load_preview(&mut app);
     let text = dump(&render(&mut app, W, H));
     let lines: Vec<&str> = text.lines().collect();
-    assert!(lines[1].contains("等你回复和在跑的 · 三家"), "{}", lines[1]);
+    assert!(lines[1].contains("等你回复和在跑的 · 各家"), "{}", lines[1]);
     // 每行标题前是那家的标记，后面是项目名。
     assert!(lines[2].contains("π RSS 初稿  blog"), "{}", lines[2]);
     assert!(

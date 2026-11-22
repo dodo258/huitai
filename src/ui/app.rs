@@ -294,7 +294,7 @@ pub struct App {
     pub vendor: Vendor,
     /// 顶栏标签里显示哪几家（按 [`Vendor::ALL`] 的顺序），`Tab` 只在它们之间切换。见 [`App::hide_missing`]。
     pub shown: Vec<Vendor>,
-    pub lists: [VendorList; 3],
+    pub lists: [VendorList; Vendor::COUNT],
     pub home: PathBuf,
     /// 会话台从哪个目录启动的（N 的默认目录，列表空时 n 的目录）。
     pub launch_dir: PathBuf,
@@ -340,7 +340,7 @@ pub struct App {
     /// 项目的显示名和整组归档（index 标注里存的，三家共用）。
     pub projects: HashMap<PathBuf, ProjectNote>,
     /// 各家是不是已经把启动目录所在的项目展开、选中过（一家只做一次）。
-    launch_focused: [bool; 3],
+    launch_focused: [bool; Vendor::COUNT],
     /// 用户已经按过键或点过：之后数据到了不再抢选中。
     touched: bool,
     /// 后台守护进程比当前程序旧时，它还托管着的对话（顶栏提示「N 条对话结束后自动换新」）。
@@ -358,14 +358,6 @@ pub struct App {
     pub areas: Areas,
     last_click: Option<(Position, Instant)>,
     pub quit: bool,
-}
-
-fn slot(v: Vendor) -> usize {
-    match v {
-        Vendor::Claude => 0,
-        Vendor::Codex => 1,
-        Vendor::Pi => 2,
-    }
 }
 
 impl App {
@@ -401,7 +393,7 @@ impl App {
             autostart: false,
             folds: Folds::default(),
             projects: HashMap::new(),
-            launch_focused: [false; 3],
+            launch_focused: [false; Vendor::COUNT],
             touched: false,
             old_host: None,
             new_version: None,
@@ -416,11 +408,11 @@ impl App {
     }
 
     pub fn list(&self) -> &VendorList {
-        &self.lists[slot(self.vendor)]
+        &self.lists[self.vendor.index()]
     }
 
     fn list_mut(&mut self) -> &mut VendorList {
-        &mut self.lists[slot(self.vendor)]
+        &mut self.lists[self.vendor.index()]
     }
 
     /// 没装的那家不显示标签：`installed` 说这家装没装（数据目录在不在），没装、列表里也没有它的对话就藏起来，
@@ -442,7 +434,7 @@ impl App {
     }
 
     pub fn list_of(&self, v: Vendor) -> &VendorList {
-        &self.lists[slot(v)]
+        &self.lists[v.index()]
     }
 
     // ---- 运行层喂数据 ----
@@ -502,7 +494,7 @@ impl App {
             now: *now,
         };
         match only {
-            Some((v, entries)) => lists[slot(v)].regroup(Some(entries), &g),
+            Some((v, entries)) => lists[v.index()].regroup(Some(entries), &g),
             None => lists.iter_mut().for_each(|l| l.regroup(None, &g)),
         }
     }
@@ -518,7 +510,7 @@ impl App {
     /// 在某个项目目录（或它下面）敲 `ai`：这家第一次列出这个项目时把它展开、选中第一条。
     /// 这种展开不记进标注（不然在哪打开过的项目都会一直展开着）。用户已经动过当前这家的选中就只展开不抢选中。
     fn focus_launch_project(&mut self, vendor: Vendor) {
-        let i = slot(vendor);
+        let i = vendor.index();
         if self.launch_focused[i] {
             return;
         }
@@ -867,7 +859,7 @@ impl App {
         // `!` 键在搜索框里是输入的字，到不了这里。
         self.search = None;
         self.board = None;
-        let here = slot(self.vendor);
+        let here = self.vendor.index();
         // 位置按（第几家，第几组，组里第几条）排；组标题排在它第一条前面。
         let current = match self.selected_row() {
             Some(Row::Header(g)) => (0, g, None),
@@ -881,8 +873,8 @@ impl App {
             None => (0, 0, None),
         };
         let mut targets = Vec::new();
-        for k in 0..3 {
-            let l = &self.lists[(here + k) % 3];
+        for k in 0..Vendor::COUNT {
+            let l = &self.lists[(here + k) % Vendor::COUNT];
             for (gi, g) in l.groups.iter().enumerate() {
                 for (p, &ei) in g.items.iter().enumerate() {
                     let e = &l.entries[ei];
@@ -900,7 +892,7 @@ impl App {
             self.status = Some(none.to_owned());
             return Vec::new();
         };
-        let mut effects = self.set_vendor(Vendor::ALL[(here + k) % 3]);
+        let mut effects = self.set_vendor(Vendor::ALL[(here + k) % Vendor::COUNT]);
         // 目标在收着的「很久没聊」分区里：先打开分区，不然它的组整个不在列表里，选不中。
         if self.list().groups[gi].stale && self.folds.is_collapsed(&GroupKey::Stale) {
             self.folds.set(&GroupKey::Stale, false);

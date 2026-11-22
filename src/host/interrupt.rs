@@ -166,7 +166,7 @@ mod tests {
             &p,
             r#"[
               {"id":"a","vendor":"claude","project":"shop","cwd":"/p/shop","started_at":7,"future_field":{"x":1}},
-              {"id":"b","vendor":"gemini","project":"shop","cwd":"/p/shop","started_at":8},
+              {"id":"b","vendor":"not-a-vendor","project":"shop","cwd":"/p/shop","started_at":8},
               {"id":"c","vendor":"pi","project":"shop","cwd":"/p/shop","started_at":9}
             ]"#,
         )

@@ -1,4 +1,4 @@
-//! 三家适配器：扫描、元数据、预览、恢复/新建命令、回收站。对外接口：`trait Source`。
+//! 各家适配器：扫描、元数据、预览、恢复/新建命令、回收站。对外接口：`trait Source`。
 //!
 //! 全部只读厂商数据；唯一会移动厂商文件的是 [`Source::trash`]（移进会话台回收站，可恢复）。
 //! 扫描只读每个会话文件的头尾（见 `window`），不整文件解析。
@@ -9,9 +9,14 @@
 
 pub mod claude;
 pub mod codex;
+pub mod gemini;
+pub mod hermes;
 mod jsonl;
+pub mod kimi;
 pub mod live;
+pub mod opencode;
 pub mod pi;
+pub mod qwen;
 mod sqlite;
 mod time;
 mod transcript;
@@ -26,7 +31,12 @@ use crate::core::{Session, Vendor, VendorDirs};
 
 pub use claude::ClaudeSource;
 pub use codex::CodexSource;
+pub use gemini::GeminiSource;
+pub use hermes::HermesSource;
+pub use kimi::KimiSource;
+pub use opencode::OpenCodeSource;
 pub use pi::PiSource;
+pub use qwen::QwenSource;
 pub use transcript::{Part, TRANSCRIPT_MAX_BYTES, Transcript};
 pub use trash::{Trash, TrashEntry, TrashedFile};
 
@@ -108,18 +118,9 @@ pub trait Source: Send + Sync {
     }
 }
 
-/// 每家适配器的解析版本。改了这家的解析结果（`Session` 任何字段的取法、预览和正文的取法）就把它加一：
-/// index 记着每个会话文件、每条对话是哪个版本读的，版本比缓存新就整家重读，比缓存旧（同时开着旧版 `ai`）
-/// 就不覆盖新版写的结果。
+/// 每家适配器的解析版本，见 [`crate::core::VendorInfo::parse_version`]（在 `core::vendor` 的表里改）。
 pub const fn parse_version(vendor: Vendor) -> u32 {
-    match vendor {
-        // 2：项目目录改取和会话文件所在目录对得上的 cwd（对话归错项目）。
-        // 3：认出自动运行（`entrypoint` 为 `sdk-cli`）。
-        Vendor::Claude => 3,
-        // 2：认出自动运行（`source` 为 `exec`）。
-        Vendor::Codex => 2,
-        Vendor::Pi => 1,
-    }
+    vendor.info().parse_version
 }
 
 /// 按文件组织的来源的整家扫描：[`Source::session_files`] 加 [`Source::read_files`]。
@@ -284,17 +285,26 @@ fn affects_subdir_layout(root: &Path, path: &Path) -> bool {
     }
 }
 
-/// 本机三家的默认来源（`home` 是用户家目录；用环境变量改过数据目录的跟着改，见 `VendorDirs`）。
+/// 本机各家的默认来源（`home` 是用户家目录；用环境变量改过数据目录的跟着改，见 `VendorDirs`）。
+/// 顺序和 [`Vendor::ALL`] 一致。
 pub fn default_sources(home: &Path, trash: Trash) -> Vec<Box<dyn Source>> {
     let dirs = VendorDirs::from_env(home);
-    vec![
-        Box::new(ClaudeSource::new(
-            dirs.claude.join("projects"),
-            trash.clone(),
-        )),
-        Box::new(CodexSource::new(dirs.codex, trash.clone())),
-        Box::new(PiSource::new(dirs.pi.join("sessions"), trash)),
-    ]
+    Vendor::ALL
+        .into_iter()
+        .map(|v| -> Box<dyn Source> {
+            let dir = dirs.dir(v);
+            match v {
+                Vendor::Claude => Box::new(ClaudeSource::new(dir.join("projects"), trash.clone())),
+                Vendor::Codex => Box::new(CodexSource::new(dir, trash.clone())),
+                Vendor::Pi => Box::new(PiSource::new(dir.join("sessions"), trash.clone())),
+                Vendor::Hermes => Box::new(HermesSource::new(dir, trash.clone())),
+                Vendor::Kimi => Box::new(KimiSource::new(dir.join("sessions"), trash.clone())),
+                Vendor::Gemini => Box::new(GeminiSource::new(dir, trash.clone())),
+                Vendor::OpenCode => Box::new(OpenCodeSource::new(dir, trash.clone())),
+                Vendor::Qwen => Box::new(QwenSource::new(dir.join("projects"), trash.clone())),
+            }
+        })
+        .collect()
 }
 
 /// 有文件的厂商共用的「删除 = 移进回收站」。

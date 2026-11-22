@@ -265,20 +265,33 @@ fn last_str<'a>(lines: &'a [Value], kind: &str, key: &str) -> Option<&'a str> {
 
 /// 对话的项目目录。对话中途会换目录（cd 到别处、进 worktree），Claude 把文件存在
 /// `projects/<某个 cwd 的编码>/` 下，`claude --resume` 也只在那个目录找得到它：
-/// 取编码后等于文件所在目录名的 cwd（多个取最后一个），都对不上取最后一个 cwd，没有 cwd 按目录名反推。
+/// 取编码后等于文件所在目录名的 cwd（多个取最后一个）；只读头尾时可能一个都对不上（长对话中途搬过目录、
+/// 结尾在项目的工作树里），再找 cwd 的上级目录里对得上的；都没有取最后一个 cwd，没有 cwd 按目录名反推。
 fn project_cwd(path: &Path, head: &[Value], tail: &[Value]) -> PathBuf {
-    let cwds: Vec<&str> = head
+    let cwds: Vec<&Path> = head
         .iter()
         .chain(tail)
         .filter_map(|v| str_field(v, "cwd").filter(|s| !s.is_empty()))
+        .map(Path::new)
         .collect();
-    let dir = path.parent().and_then(Path::file_name);
+    let Some(dir) = path.parent().and_then(Path::file_name) else {
+        return cwds
+            .last()
+            .map_or_else(|| decode_dir(path), |c| c.to_path_buf());
+    };
+    let dir = dir.to_string_lossy();
+    let stored_here = |p: &&Path| encode_path(p) == dir;
     cwds.iter()
         .rev()
-        .find(|c| dir.is_some_and(|d| d.to_string_lossy() == encode_path(Path::new(c))))
-        .or(cwds.last())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| decode_dir(path))
+        .copied()
+        .find(stored_here)
+        .or_else(|| {
+            cwds.iter()
+                .rev()
+                .find_map(|c| c.ancestors().skip(1).find(stored_here))
+        })
+        .or(cwds.last().copied())
+        .map_or_else(|| decode_dir(path), Path::to_path_buf)
 }
 
 /// 文件里找不到 cwd 时，从项目目录名反推（有损：`/` 和 `.` 都编码成了 `-`）。

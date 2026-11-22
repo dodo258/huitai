@@ -36,7 +36,7 @@ use super::protocol::{
     MIN_CLIENT_PROTOCOL, OLD_CLIENT, Request, Response, RunRecord, SpawnSpec,
 };
 use super::pty;
-use super::scan::{Scanner, Signal};
+use super::scan::{Scanner, Signal, Status};
 use super::screen::Screen;
 use super::version;
 use crate::core::{Config, SessionId};
@@ -1330,12 +1330,13 @@ fn forward_output(shared: &Shared, hosted: &Hosted, chunk: &[u8]) -> Option<Vec<
     run.scanner.feed(chunk, &mut out, &mut signals);
     let now = shared.clock.now();
     run.activity.output(now);
-    if signals
-        .iter()
-        .any(|s| matches!(s, Signal::Bell | Signal::Notify { .. }))
-    {
+    if signals.iter().any(needs_you) {
         run.activity.signal(now);
     }
+    // CLI 明说在跑（OSC 7501 working）：不等节流，马上报一次有输出。
+    let working = signals
+        .iter()
+        .any(|s| matches!(s, Signal::Status(Status::Working)));
     run.screen.feed(chunk);
     let replies = run.screen.take_replies();
     // 持锁时不能写 PTY：CLI 不读输入时会一直卡住，整个守护进程跟着卡在这条对话的锁上。
@@ -1350,13 +1351,16 @@ fn forward_output(shared: &Shared, hosted: &Hosted, chunk: &[u8]) -> Option<Vec<
         *client = None;
         events.extend(detached_events(id));
     }
-    if last_output_event.is_none_or(|t| t.elapsed() >= OUTPUT_EVENT_GAP) {
+    if working || last_output_event.is_none_or(|t| t.elapsed() >= OUTPUT_EVENT_GAP) {
         *last_output_event = Some(Instant::now());
         events.push(HostEvent::Output { id: id.clone() });
     }
     for s in signals {
         events.push(match s {
+            // 程序状态不加新事件：要你回来的和响铃走同一条路（旧版会话台也认得），在跑的已经报过有输出。
             Signal::Bell => HostEvent::Bell { id: id.clone() },
+            Signal::Status(status) if status.needs_you() => HostEvent::Bell { id: id.clone() },
+            Signal::Status(_) => continue,
             Signal::Notify { title, body } => HostEvent::Notify {
                 id: id.clone(),
                 title,
@@ -1372,6 +1376,15 @@ fn forward_output(shared: &Shared, hosted: &Hosted, chunk: &[u8]) -> Option<Vec<
         });
     }
     Some(events)
+}
+
+/// 这个信号是不是 CLI 停下来要你回来：响铃、桌面通知、OSC 7501 的 blocked/done/error、Gemini 等待标题。
+fn needs_you(signal: &Signal) -> bool {
+    match signal {
+        Signal::Bell | Signal::Notify { .. } => true,
+        Signal::Status(status) => status.needs_you(),
+        Signal::Title(_) => false,
+    }
 }
 
 /// panic 之后状态机和扫描器可能停在半截，换成新的（大小不变）。

@@ -241,6 +241,12 @@ fn moved_session_groups_by_storage_dir() {
     assert_eq!(shop.cwd, PathBuf::from("/Users/demo/projects/shop"));
     assert_eq!(fold_group(&shop.cwd, Path::new("/Users/demo")), None);
 
+    // 读到的 cwd 里没有项目目录本身（换过目录的长对话，头尾只剩旧目录和工作树）：
+    // 工作树的上级目录对得上文件所在目录，归项目，不归 agentq 工作树。
+    let tool = by_id(&scan.sessions, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+    assert_eq!(tool.cwd, PathBuf::from("/Users/demo/projects/tool"));
+    assert_eq!(fold_group(&tool.cwd, Path::new("/Users/demo")), None);
+
     // 都对不上：取最后一个 cwd。
     let y = by_id(&scan.sessions, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     assert_eq!(y.cwd, PathBuf::from("/Users/demo/y"));

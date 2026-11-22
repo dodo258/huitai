@@ -1,9 +1,12 @@
-//! 别的进程开着的对话：从本机进程的命令行里认出带着会话 id 的三家 CLI。
+//! 别的进程开着的对话：从本机进程的命令行里认出带着会话 id 的各家 CLI。
 //! 桌面端、别的终端、后台任务开着一条对话时，CLI 进程的参数里带着它的 id
-//! （`claude --resume=<id>`、`claude -r <id>`、`claude --session-id <id>`、`codex resume <id>`）；
+//! （`claude --resume=<id>`、`claude -r <id>`、`claude --session-id <id>`、`codex resume <id>`、`hermes -r <id>`、
+//! `kimi -S <id>`、`opencode <目录> -s <id>`）；
 //! 对话在等工具或等你回复时会话文件可以几分钟不动，只看文件写入时间会误判成「已停」。
 
 use std::collections::HashSet;
+
+use super::opencode;
 
 /// `ps -axww -o command=` 的输出里，紧跟在会话参数后面的 id。只认参数位置，不在整行里找，
 /// 免得把提示词里提到的 id 也当成开着。
@@ -13,13 +16,22 @@ pub fn session_ids(ps_output: &str) -> HashSet<String> {
         let words: Vec<&str> = line.split_whitespace().collect();
         for (i, w) in words.iter().enumerate() {
             let id = match w.split_once('=') {
-                Some(("--resume" | "--session-id", v)) => Some(v),
-                _ if matches!(*w, "--resume" | "-r" | "--session-id" | "resume") => {
+                Some(("--resume" | "--session-id" | "--session", v)) => Some(v),
+                _ if matches!(
+                    *w,
+                    "--resume" | "-r" | "--session-id" | "resume" | "-S" | "-s" | "--session"
+                ) =>
+                {
                     words.get(i + 1).copied()
                 }
                 _ => None,
             };
-            if let Some(id) = id.filter(|id| is_uuid(id)) {
+            let Some(id) = id else { continue };
+            if opencode::is_session_id(id) {
+                // OpenCode 的 id 区分大小写（base62），原样记。
+                out.insert(id.to_owned());
+            } else if *w != "-s" && (is_uuid(id) || is_hermes_id(id) || is_kimi_id(id)) {
+                // `-s` 只是 OpenCode 的，别的程序 `-s <uuid>` 不算。
                 out.insert(id.to_ascii_lowercase());
             }
         }
@@ -35,6 +47,20 @@ fn is_uuid(s: &str) -> bool {
             .iter()
             .zip([8, 4, 4, 4, 12])
             .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Hermes 的 `YYYYMMDD_HHMMSS_<十六进制>`。
+fn is_hermes_id(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('_').collect();
+    matches!(parts.as_slice(), [date, time, hex]
+        if date.len() == 8 && time.len() == 6 && !hex.is_empty()
+            && date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit())
+            && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Kimi Code 的 `session_<uuid>`。
+fn is_kimi_id(s: &str) -> bool {
+    s.strip_prefix("session_").is_some_and(is_uuid)
 }
 
 #[cfg(test)]
@@ -55,6 +81,34 @@ mod tests {
         );
         let ids = session_ids(&ps);
         assert_eq!(ids, [A, B, C].map(str::to_owned).into());
+    }
+
+    #[test]
+    fn hermes_resume() {
+        let ids =
+            session_ids("/usr/local/bin/hermes -r 20261120_101500_a1b2c3\nhermes -r latest\n");
+        assert_eq!(ids, ["20261120_101500_a1b2c3".to_owned()].into());
+    }
+
+    #[test]
+    fn opencode_session_flag_keeps_case() {
+        let id = "ses_7f3a1b2c3d4eAbCdEfGhIjKlMn";
+        let ids = session_ids(&format!(
+            "/opt/homebrew/bin/opencode /work/api -s {id}\nopencode --session={id}x\nls -s 4\nfoo -s {A}\n"
+        ));
+        assert_eq!(ids, [id.to_owned(), format!("{id}x")].into());
+    }
+
+    #[test]
+    fn kimi_session() {
+        let id = format!("session_{A}");
+        let ps = format!(
+            "node /Users/me/.npm-global/bin/kimi -S {id}\n\
+             kimi --session=session_{B}\n\
+             kimi -S\n\
+             tmux -S /tmp/sock\n"
+        );
+        assert_eq!(session_ids(&ps), [id, format!("session_{B}")].into());
     }
 
     #[test]

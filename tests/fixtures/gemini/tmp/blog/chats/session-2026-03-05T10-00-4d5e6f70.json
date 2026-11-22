@@ -1,0 +1,14 @@
+{
+  "sessionId": "4d5e6f70-4444-4aaa-8bbb-000000000004",
+  "projectHash": "0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d",
+  "startTime": "2026-03-05T10:00:00.000Z",
+  "lastUpdated": "2026-03-05T10:02:00.000Z",
+  "messages": [
+    {
+      "id": "d1",
+      "timestamp": "2026-03-05T10:00:10.000Z",
+      "type": "user",
+      "content": "文章页加目录"
+    }
+  ]
+}

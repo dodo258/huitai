@@ -2,7 +2,7 @@
 //! 强调色一次只用一个，随当前标签（厂商）切换。
 //!
 //! 颜色按角色分，同一个颜色只表示一类东西：
-//! - 这家的强调色（Claude 橙、Codex 蓝、pi 紫）：能按的——印章、选中细条、序号、按键提示；项目名带三成。
+//! - 这家的强调色（Claude 橙、Codex 蓝、pi 紫、Hermes 黄铜、OpenCode 青绿、Qwen Code 蓝紫，色值在 `core::vendor` 的表里）：能按的——印章、选中细条、序号、按键提示；项目名带三成。
 //!   顶栏标签照 gitui、ratatui Tabs：不垫底色，标签之间淡竖线，当前这家强调色加粗加下划线；底色只给印章。
 //! - 状态色只给状态灯和状态计数：在跑绿、等你黄、刚做完青、别处柔绿、已停灰。青色不用蓝，免得和 Codex 的蓝混。
 //! - 红色只给快用完的额度和出错。
@@ -35,9 +35,8 @@ pub struct Theme {
     pub muted: Color,
     /// 暗文字（时间、路径提示、计数）。
     pub faint: Color,
-    claude: Color,
-    codex: Color,
-    pi: Color,
+    /// 浅色那套：厂商强调色取 [`crate::core::VendorInfo`] 里浅色的值。
+    light: bool,
     running: Color,
     waiting: Color,
     done: Color,
@@ -60,9 +59,7 @@ impl Theme {
         title: rgb(0xf2efe7),
         muted: rgb(0x7c7a72),
         faint: rgb(0x5c5a54),
-        claude: rgb(0xd97757),
-        codex: rgb(0x6e95e8),
-        pi: rgb(0xa37fe6),
+        light: false,
         running: rgb(0x78c98f),
         waiting: rgb(0xe8b85a),
         done: rgb(0x5ec4d6),
@@ -81,9 +78,7 @@ impl Theme {
         title: rgb(0x141518),
         muted: rgb(0x6f6d66),
         faint: rgb(0x9d9b94),
-        claude: rgb(0xc0603f),
-        codex: rgb(0x3c6dd0),
-        pi: rgb(0x7b53c8),
+        light: true,
         running: rgb(0x2e8f4c),
         waiting: rgb(0xa8740f),
         done: rgb(0x16808f),
@@ -92,12 +87,14 @@ impl Theme {
         alert: rgb(0xc23a2f),
     };
 
+    /// 这家的强调色，深浅两套都在 `core::vendor` 的表里。
     pub fn accent(&self, vendor: Vendor) -> Color {
-        match vendor {
-            Vendor::Claude => self.claude,
-            Vendor::Codex => self.codex,
-            Vendor::Pi => self.pi,
-        }
+        let info = vendor.info();
+        rgb(if self.light {
+            info.accent_light
+        } else {
+            info.accent_dark
+        })
     }
 
     pub fn state(&self, state: SessionState) -> Color {
@@ -249,5 +246,10 @@ mod tests {
         let t = Theme::DARK;
         assert_ne!(t.accent(Vendor::Claude), t.accent(Vendor::Codex));
         assert_eq!(t.accent(Vendor::Claude), Color::Rgb(0xd9, 0x77, 0x57));
+        assert_eq!(
+            Theme::LIGHT.accent(Vendor::Claude),
+            Color::Rgb(0xc0, 0x60, 0x3f)
+        );
+        assert_eq!(t.accent(Vendor::Hermes), Color::Rgb(0xbf, 0xae, 0x3a));
     }
 }

@@ -1,0 +1,2 @@
+{"uuid":"e00","parentUuid":null,"sessionId":"5e1c0a2b-5555-4aaa-8bbb-000000000005","timestamp":"2026-11-20T10:00:00.000Z","type":"system","cwd":"/Users/demo/projects/shop","version":"0.28.3","subtype":"session_model","systemPayload":{"model":"qwen3-coder-plus"}}
+{"uuid":"e01","parentUuid":"e00","sessionId":"5e1c0a2b-5555-4aaa-8bbb-000000000005","timestamp":"2026-11-20T10:00:01.000Z","type":"system","cwd":"/Users/demo/projects/shop","version":"0.28.3","subtype":"session_approval_mode","systemPayload":{"approvalMode":"default"}}

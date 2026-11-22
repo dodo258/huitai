@@ -1,0 +1,3 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1795000000000}
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"子代理才有的话：优惠券"}],"id":"m15000","toolCalls":[],"origin":{"kind":"user"}},"time":1795000015000}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"u15100","turnId":"1","step":1,"stepUuid":"s1","part":{"type":"text","text":"子代理回复"}},"time":1795000015100}

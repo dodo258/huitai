@@ -37,7 +37,7 @@ use crate::opener::{
     self, InlineOpener, KakuOpener, LoginItem, Opener, Outcome, Tabs, Terminal as Term,
 };
 use crate::quota;
-use crate::sources::{self, Command, Source, Transcript, Trash};
+use crate::sources::{self, Command, Source, Transcript, Trash, hermes, kimi, opencode};
 
 use super::app::{App, Effect, Preview};
 use super::text::{project_label, resume_line, truncate};
@@ -60,8 +60,8 @@ const HOSTED_POLL: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(120);
 /// 相对时间多久刷新一次。
 const CLOCK: Duration = Duration::from_secs(30);
-/// Codex 新对话的临时托管 id 前缀（后面接毫秒时间戳）。
-const TEMP_PREFIX: &str = "new-codex-";
+/// 新建时定不了 id 的那几家（Codex、Hermes），新对话的临时托管 id 是 `new-<存储名>-<毫秒时间戳>`。
+const TEMP_PREFIX: &str = "new-";
 /// 实时预览多久取一次画面。
 const LIVE_EVERY: Duration = Duration::from_millis(500);
 /// 按 R 重开被中断的对话时带进去的第一句话（方案「中断恢复」节）。
@@ -182,9 +182,9 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
 
     let mut ime = Switcher::new(Tis, app.config.auto_ascii_input);
     let mut tui = Tui::enter()?;
-    // Ghostty、Kaku 会报焦点：会话台是在前台的标签页里敲 `ai`（或呼出键）起来的，当作已在前台；
+    // Ghostty、Kaku、cmux（内嵌 Ghostty）会报焦点：会话台是在前台的标签页里敲 `ai`（或呼出键）起来的，当作已在前台；
     // 别的终端等它报来焦点再切，不报焦点的终端就一直不切（离开时没人告诉我们切回）。
-    if matches!(ctx.terminal, Term::Ghostty | Term::Kaku)
+    if matches!(ctx.terminal, Term::Ghostty | Term::Kaku | Term::Cmux)
         && let Err(e) = ime.focus_gained()
     {
         app.status = Some(format!("输入法没切成：{e}"));
@@ -216,11 +216,12 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
     result
 }
 
-/// 一条托管在临时 id 下的 Codex 新对话。
-#[derive(Debug, Clone, Default)]
-struct NewCodex {
+/// 一条托管在临时 id 下的新对话（新建时定不了 id 的那几家，见 `VendorInfo::presets_new_id`）。
+#[derive(Debug, Clone)]
+struct NewSession {
+    vendor: Vendor,
     cwd: PathBuf,
-    /// 新建那一刻这个项目里已有的 Codex 对话（这些肯定不是新建的那条）；守护进程报来的旧对话不知道，是空的。
+    /// 新建那一刻这个项目里已有的这家对话（这些肯定不是新建的那条）；守护进程报来的旧对话不知道，是空的。
     existing: HashSet<SessionId>,
 }
 
@@ -231,8 +232,8 @@ struct Ctx {
     data_dir: PathBuf,
     exe: PathBuf,
     terminal: Term,
-    /// 会话台新建的 Codex 对话：临时 id → 项目目录和新建那一刻这个项目里已有的 Codex 对话。
-    known: Arc<Mutex<HashMap<SessionId, NewCodex>>>,
+    /// 会话台新建、托管在临时 id 下的对话：临时 id → 厂商、项目目录和新建那一刻这个项目里已有的这家对话。
+    known: Arc<Mutex<HashMap<SessionId, NewSession>>>,
     /// 列表里的被中断对话 → 守护进程记它用的 id（会话台新建的 Codex 对话是临时 id，其余相同）。
     interrupted: Arc<Mutex<HashMap<SessionId, SessionId>>>,
     /// 取项目显示名（标签页标题前缀）。
@@ -407,9 +408,13 @@ fn register_new(
         .unwrap_or_default()
         .as_millis();
     let (id, cmd) = new_session_command(v, base, millis, random_uuid()?);
-    if v == Vendor::Codex {
-        let cwd = cwd.to_path_buf();
-        lock(&ctx.known).insert(id.clone(), NewCodex { cwd, existing });
+    if !v.info().presets_new_id {
+        let new = NewSession {
+            vendor: v,
+            cwd: cwd.to_path_buf(),
+            existing,
+        };
+        lock(&ctx.known).insert(id.clone(), new);
     }
     let attach = ctx.register(&id, v, cwd, cmd)?;
     Ok((id, attach))
@@ -422,13 +427,15 @@ fn new_session_command(
     millis: u128,
     uuid: String,
 ) -> (SessionId, Command) {
-    match v {
-        Vendor::Claude | Vendor::Pi => {
-            cmd.args.push("--session-id".to_owned());
-            cmd.args.push(uuid.clone());
-            (SessionId::from(uuid), cmd)
-        }
-        Vendor::Codex => (SessionId::from(format!("{TEMP_PREFIX}{millis}")), cmd),
+    if v.info().presets_new_id {
+        cmd.args.push("--session-id".to_owned());
+        cmd.args.push(uuid.clone());
+        (SessionId::from(uuid), cmd)
+    } else {
+        (
+            SessionId::from(format!("{TEMP_PREFIX}{}-{millis}", v.key())),
+            cmd,
+        )
     }
 }
 
@@ -479,9 +486,22 @@ fn codex_id_created(id: &SessionId) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
 }
 
-/// `s` 会不会是 `since` 那一刻在项目 `cwd` 里新建的 Codex 对话：同一项目、id 是那之后才生成的
+/// 对话生成时刻（新建时定不了 id 的那几家）：Codex、Hermes 从 id 看出，Kimi Code 的 id 看不出、读它的
+/// `state.json`。Hermes 的 id 只精确到秒，取那一秒的最后一刻，免得同一秒里稍晚新建的那条被当成新建之前就有的。
+/// 看不出的返回 `None`。
+fn id_created(s: &Session) -> Option<SystemTime> {
+    match s.vendor {
+        Vendor::Codex => codex_id_created(&s.id),
+        Vendor::Hermes => hermes::id_created(s.id.as_str()).map(|t| t + Duration::from_millis(999)),
+        Vendor::Kimi => kimi::created_at(&s.path),
+        Vendor::OpenCode => opencode::id_created(s.id.as_str(), s.last_active),
+        Vendor::Claude | Vendor::Pi | Vendor::Gemini | Vendor::Qwen => None,
+    }
+}
+
+/// `s` 会不会是 `since` 那一刻在项目 `cwd` 里新建的对话：同一项目、id 是那之后才生成的
 /// （新建之前就有的对话，不管后来在别处聊没聊，都不可能是它），且不在新建那一刻已有的对话 `existing` 里。
-/// id 看不出生成时间的（不是 UUIDv7）一律不认。
+/// id 看不出生成时间的一律不认。
 fn is_new_since(
     s: &Session,
     cwd: &Path,
@@ -489,7 +509,7 @@ fn is_new_since(
     existing: Option<&HashSet<SessionId>>,
 ) -> bool {
     s.cwd == cwd
-        && codex_id_created(&s.id).is_some_and(|c| c >= since)
+        && id_created(s).is_some_and(|c| c >= since)
         && !existing.is_some_and(|e| e.contains(&s.id))
 }
 
@@ -500,7 +520,7 @@ fn is_new_since(
 fn hosted_alias(
     s: &Session,
     hosted: &[HostedInfo],
-    known: &HashMap<SessionId, NewCodex>,
+    known: &HashMap<SessionId, NewSession>,
     listed: &[Entry],
 ) -> Hosted {
     let own = |id: &SessionId| hosted.iter().any(|h| h.id == *id);
@@ -526,19 +546,21 @@ fn hosted_alias(
     }
 }
 
-/// 会话台新建、托管在临时 id 下（`running` 为真）的 Codex 对话写出会话记录后，列表里是真实 id、看起来没托管；
+/// 会话台新建、托管在临时 id 下（`running` 为真）的对话写出会话记录后，列表里是真实 id、看起来没托管；
 /// 用打开时同一套认法（[`hosted_alias`]）找出这些真实 id（含认不准的，界面不把它们当成别处在用）。
+/// `listed` 是 `vendor` 这家的全部对话。
 fn aliased(
-    codex: &[Entry],
-    known: &HashMap<SessionId, NewCodex>,
+    vendor: Vendor,
+    listed: &[Entry],
+    known: &HashMap<SessionId, NewSession>,
     running: impl Fn(&SessionId) -> bool,
 ) -> HashSet<SessionId> {
     let hosted: Vec<HostedInfo> = known
         .iter()
-        .filter(|(id, _)| running(id))
+        .filter(|(id, n)| n.vendor == vendor && running(id))
         .map(|(id, n)| HostedInfo {
             id: id.clone(),
-            vendor: Vendor::Codex,
+            vendor,
             project: String::new(),
             cwd: n.cwd.clone(),
             pid: Some(0),
@@ -549,16 +571,21 @@ fn aliased(
     if hosted.is_empty() {
         return HashSet::new();
     }
-    codex
+    listed
         .iter()
-        .filter(|e| hosted_alias(&e.session, &hosted, known, codex) != Hosted::Own)
+        .filter(|e| hosted_alias(&e.session, &hosted, known, listed) != Hosted::Own)
         .map(|e| e.session.id.clone())
         .collect()
 }
 
 /// 临时 id 里记的新建时间。
 fn temp_started(id: &SessionId) -> Option<SystemTime> {
-    let ms: u64 = id.as_str().strip_prefix(TEMP_PREFIX)?.parse().ok()?;
+    let (key, ms) = id.as_str().strip_prefix(TEMP_PREFIX)?.rsplit_once('-')?;
+    Vendor::ALL
+        .iter()
+        .any(|v| v.key() == key && !v.info().presets_new_id)
+        .then_some(())?;
+    let ms: u64 = ms.parse().ok()?;
     Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
 }
 
@@ -759,6 +786,10 @@ impl Loop {
                 self.receive(msg);
                 dirty = true;
             }
+            for id in self.notifier.settle(Instant::now()) {
+                self.app.set_state(id.clone(), self.notifier.state(&id));
+                dirty = true;
+            }
             if let Some(e) = self.app.take_preview_request() {
                 let _ = self.previews.send(e);
             }
@@ -872,11 +903,17 @@ impl Loop {
     /// 托管在临时 id 下的 Codex 新对话认回列表里的真实 id（见 [`aliased`]），界面不把它们当成别处在用。
     fn refresh_aliases(&mut self) {
         let app = &self.app;
-        let ids = aliased(
-            &app.list_of(Vendor::Codex).entries,
-            &lock(&self.ctx.known),
-            |id| app.state_of(id) != SessionState::Stopped,
-        );
+        let known = lock(&self.ctx.known);
+        let ids = Vendor::ALL
+            .into_iter()
+            .filter(|v| !v.info().presets_new_id)
+            .flat_map(|v| {
+                aliased(v, &app.list_of(v).entries, &known, |id| {
+                    app.state_of(id) != SessionState::Stopped
+                })
+            })
+            .collect();
+        drop(known);
         self.app.aliased = ids;
     }
 
@@ -1113,7 +1150,8 @@ impl Loop {
                 self.forget_hosted(&alive);
                 let mut known = lock(&self.ctx.known);
                 for i in infos.iter().filter(|i| temp_started(&i.id).is_some()) {
-                    known.entry(i.id.clone()).or_insert_with(|| NewCodex {
+                    known.entry(i.id.clone()).or_insert_with(|| NewSession {
+                        vendor: i.vendor,
                         cwd: i.cwd.clone(),
                         existing: HashSet::new(),
                     });
@@ -1220,7 +1258,8 @@ pub fn activity(ev: HostEvent) -> Option<(SessionId, Activity)> {
 fn board_info(alerts: bool) -> BoardInfo {
     let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
     BoardInfo {
-        term_program: var("TERM_PROGRAM"),
+        // 记认出来的终端，不记原样的 TERM_PROGRAM：cmux 里它是 ghostty，呼出键会去找另一个 Ghostty。
+        term_program: Term::current().name().or_else(|| var("TERM_PROGRAM")),
         tty: own_tty(),
         pane: var("WEZTERM_PANE"),
         command: std::env::args().collect::<Vec<_>>().join(" "),
@@ -2048,6 +2087,106 @@ mod tests {
     }
 
     #[test]
+    fn hermes_new_session_is_hosted_under_temp_id_and_maps_back() {
+        let (id, cmd) =
+            new_session_command(Vendor::Hermes, base("hermes"), 1_000_000_000, String::new());
+        assert_eq!(id.as_str(), "new-hermes-1000000000");
+        assert!(cmd.args.is_empty());
+        assert_eq!(temp_started(&id), Some(at(1_000_000)));
+        // 能先定 id 的那几家不会有临时 id；不认得的厂商名也不算。
+        assert_eq!(
+            temp_started(&SessionId::from("new-claude-1000000000")),
+            None
+        );
+        assert_eq!(
+            temp_started(&SessionId::from("new-gemini-1000000000")),
+            None
+        );
+
+        let real = "20261122_213015_a1b2c3";
+        let created = hermes::id_created(real).expect("是 Hermes 的 id");
+        let ms = |t: SystemTime| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        };
+        let temp_at = |t: SystemTime| HostedInfo {
+            vendor: Vendor::Hermes,
+            ..hosted(&format!("new-hermes-{}", ms(t)), "/p/shop", true)
+        };
+        let s = Session {
+            vendor: Vendor::Hermes,
+            ..session(real, "/p/shop", 1_000_100)
+        };
+        let alias = |h: HostedInfo| {
+            hosted_alias(
+                &s,
+                std::slice::from_ref(&h),
+                &HashMap::new(),
+                &entries(std::slice::from_ref(&s)),
+            )
+        };
+        let temp = temp_at(created - Duration::from_secs(5));
+        assert_eq!(alias(temp.clone()), Hosted::Alias(temp.id));
+        // id 只到秒：同一秒里稍早一点新建的也认得出。
+        let same_second = temp_at(created + Duration::from_millis(500));
+        assert_eq!(alias(same_second.clone()), Hosted::Alias(same_second.id));
+        // 新建之前就有的不认。
+        assert_eq!(
+            alias(temp_at(created + Duration::from_secs(2))),
+            Hosted::Own
+        );
+    }
+
+    /// OpenCode 1.x 的 `-s` 不认不存在的 id，新建也走临时 id；真实 id 里带着毫秒级的生成时间，靠它认回来。
+    #[test]
+    fn opencode_new_session_is_hosted_under_temp_id_and_maps_back() {
+        let (id, cmd) = new_session_command(
+            Vendor::OpenCode,
+            base("opencode"),
+            1_000_000_000,
+            String::new(),
+        );
+        assert_eq!(id.as_str(), "new-opencode-1000000000");
+        assert!(cmd.args.is_empty());
+        assert_eq!(temp_started(&id), Some(at(1_000_000)));
+
+        // 2026-11-22 13:30:15.123 UTC 生成的 id（上游 descending 算法）。
+        let real = "ses_dfad5492cffeAbCdEfGhIjKlMn";
+        let created = SystemTime::UNIX_EPOCH + Duration::from_millis(1_795_383_015_123);
+        let s = Session {
+            vendor: Vendor::OpenCode,
+            last_active: created + Duration::from_secs(90),
+            ..session(real, "/p/shop", 0)
+        };
+        assert_eq!(id_created(&s), Some(created));
+        let ms = |t: SystemTime| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        };
+        let temp_at = |t: SystemTime| HostedInfo {
+            vendor: Vendor::OpenCode,
+            ..hosted(&format!("new-opencode-{}", ms(t)), "/p/shop", true)
+        };
+        let alias = |h: HostedInfo| {
+            hosted_alias(
+                &s,
+                std::slice::from_ref(&h),
+                &HashMap::new(),
+                &entries(std::slice::from_ref(&s)),
+            )
+        };
+        let temp = temp_at(created - Duration::from_secs(3));
+        assert_eq!(alias(temp.clone()), Hosted::Alias(temp.id));
+        // 新建之前就有的不认（精确到毫秒）。
+        assert_eq!(
+            alias(temp_at(created + Duration::from_millis(1))),
+            Hosted::Own
+        );
+    }
+
+    #[test]
     fn random_uuid_is_v4() {
         let u = random_uuid().unwrap();
         assert_eq!(u.len(), 36);
@@ -2123,7 +2262,7 @@ mod tests {
         let h = [hosted(TEMP, "/p/shop", true)];
         let none = HashMap::new();
         let real = session(&v7(1_000_050, 1), "/p/shop", 1_000_100);
-        let alias = |s: &Session, h: &[HostedInfo], known: &HashMap<SessionId, NewCodex>| {
+        let alias = |s: &Session, h: &[HostedInfo], known: &HashMap<SessionId, NewSession>| {
             hosted_alias(s, h, known, &entries(std::slice::from_ref(s)))
         };
         // 新建之后才生成的同项目对话：接到临时 id 那个进程上。
@@ -2142,7 +2281,8 @@ mod tests {
         let busy = v7(1_000_060, 2);
         let known = HashMap::from([(
             SessionId::from(TEMP),
-            NewCodex {
+            NewSession {
+                vendor: Vendor::Codex,
                 cwd: PathBuf::from("/p/shop"),
                 existing: HashSet::from([SessionId::from(busy.as_str())]),
             },
@@ -2179,10 +2319,12 @@ mod tests {
         );
         assert_eq!(
             aliased(
+                Vendor::Codex,
                 &both,
                 &HashMap::from([(
                     SessionId::from(TEMP),
-                    NewCodex {
+                    NewSession {
+                        vendor: Vendor::Codex,
                         cwd: PathBuf::from("/p/shop"),
                         existing: HashSet::new(),
                     }
@@ -2234,7 +2376,8 @@ mod tests {
         let busy = v7(1_000_060, 2);
         let known = HashMap::from([(
             temp.clone(),
-            NewCodex {
+            NewSession {
+                vendor: Vendor::Codex,
                 cwd: PathBuf::from("/p/shop"),
                 existing: HashSet::from([SessionId::from(busy.as_str())]),
             },
@@ -2248,11 +2391,11 @@ mod tests {
         ]);
         // 临时 id 那个进程在跑：新建之后才生成、同项目、新建时还没有的那条是它。
         assert_eq!(
-            aliased(&list, &known, |id| *id == temp),
+            aliased(Vendor::Codex, &list, &known, |id| *id == temp),
             HashSet::from([SessionId::from(real.as_str())])
         );
         // 进程退出了：谁也不是。
-        assert!(aliased(&list, &known, |_| false).is_empty());
+        assert!(aliased(Vendor::Codex, &list, &known, |_| false).is_empty());
     }
 
     fn record(id: &str, vendor: Vendor, cwd: &str) -> RunRecord {

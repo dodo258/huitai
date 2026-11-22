@@ -267,6 +267,119 @@ pub fn pi_entries() -> Vec<Entry> {
     )
 }
 
+pub fn hermes_entries() -> Vec<Entry> {
+    sorted(
+        Vendor::Hermes,
+        &[
+            Fake {
+                branch: Some("main"),
+                ..f(
+                    "20261120_101500_a1b2c3",
+                    "/Users/demo/projects/api",
+                    "整理接口文档的目录结构",
+                    60 * 30,
+                    6,
+                )
+            },
+            f(
+                "20261118_090000_d4e5f6",
+                "/Users/demo/projects/blog",
+                "把草稿里的图片压一遍",
+                60 * 24 * 3,
+                3,
+            ),
+        ],
+    )
+}
+
+pub fn kimi_entries() -> Vec<Entry> {
+    sorted(
+        Vendor::Kimi,
+        &[
+            f(
+                "session_6b1f0c2e-4d3a-4b5c-9e8f-7a6b5c4d3e2f",
+                "/Users/demo/projects/blog",
+                "首页图片改成懒加载",
+                20,
+                4,
+            ),
+            f(
+                "session_0a1b2c3d-1111-4222-8333-944455566677",
+                "/Users/demo/projects/shop",
+                "商品详情页加骨架屏",
+                60 * 8,
+                7,
+            ),
+        ],
+    )
+}
+
+pub fn gemini_entries() -> Vec<Entry> {
+    sorted(
+        Vendor::Gemini,
+        &[
+            f(
+                "1a2b3c4d-1111-4aaa-8bbb-000000000001",
+                "/Users/demo/projects/shop",
+                "修结算按钮",
+                45,
+                4,
+            ),
+            f(
+                "2b3c4d5e-2222-4aaa-8bbb-000000000002",
+                "/Users/demo/projects/blog",
+                "看 README 的部署步骤对不对",
+                60 * 26,
+                2,
+            ),
+        ],
+    )
+}
+
+pub fn opencode_entries() -> Vec<Entry> {
+    sorted(
+        Vendor::OpenCode,
+        &[
+            f(
+                "ses_e113ed23fffeV2onlyAbCdEfGh",
+                "/Users/demo/projects/shop",
+                "给登录页加验证码",
+                60 * 2,
+                4,
+            ),
+            f(
+                "ses_e11a99e17ffeV1fallbackAbCd",
+                "/Users/demo/projects/blog",
+                "评论换成自建的",
+                60 * 24 * 2,
+                2,
+            ),
+        ],
+    )
+}
+
+pub fn qwen_entries() -> Vec<Entry> {
+    sorted(
+        Vendor::Qwen,
+        &[
+            f(
+                "5e1c0a2b-1111-4aaa-8bbb-000000000001",
+                "/Users/demo/projects/shop",
+                "购物车数量改成可以直接输入",
+                60 * 5,
+                3,
+            ),
+            f(
+                "5e1c0a2b-7777-4aaa-8bbb-000000000007",
+                "/Users/demo/projects/blog",
+                "文章列表分页",
+                60 * 30,
+                2,
+            ),
+        ],
+    )
+}
+
 pub fn preview_for(vendor: Vendor) -> Preview {
     let m = |role, text: &str, mins| PreviewMessage {
         role,
@@ -308,6 +421,42 @@ pub fn preview_for(vendor: Vendor) -> Preview {
                 12,
             ),
         ],
+        Vendor::Hermes => vec![
+            m(Role::User, "接口文档按模块分目录，旧链接要能跳过去", 32),
+            m(
+                Role::Assistant,
+                "已按订单、用户、支付三块分好目录，旧路径都加了重定向。",
+                30,
+            ),
+        ],
+        Vendor::Kimi => vec![
+            m(Role::User, "首页图片改成懒加载", 20),
+            m(Role::Assistant, "首屏以下的图片都加了 loading=lazy。", 18),
+        ],
+        Vendor::Gemini => vec![
+            m(Role::User, "结算按钮点了没反应", 45),
+            m(
+                Role::Assistant,
+                "优惠券算完后没有重新启用按钮，已修好。",
+                43,
+            ),
+        ],
+        Vendor::Qwen => vec![
+            m(Role::User, "购物车数量改成可以直接输入", 310),
+            m(
+                Role::Assistant,
+                "数量框改成输入框了，输入 0 会删掉这件商品。",
+                300,
+            ),
+        ],
+        Vendor::OpenCode => vec![
+            m(Role::User, "给登录页加验证码", 125),
+            m(
+                Role::Assistant,
+                "验证码加好了，用的滑块；改了 src/login.tsx。",
+                120,
+            ),
+        ],
     };
     Preview {
         at: SystemTime::UNIX_EPOCH,
@@ -329,6 +478,10 @@ pub fn quota_for(vendor: Vendor) -> QuotaReading {
         ),
         Vendor::Codex => (QuotaValue::Windows(vec![w("7 天", 9.0, 10080)]), "rollout"),
         Vendor::Pi => (QuotaValue::TokensToday(1_234_567), "本机统计"),
+        // Hermes、Kimi Code、Gemini、OpenCode、Qwen Code 还没有额度渠道，顶栏不写额度。
+        Vendor::Hermes | Vendor::Kimi | Vendor::Gemini | Vendor::OpenCode | Vendor::Qwen => {
+            (QuotaValue::Unavailable, "")
+        }
     };
     QuotaReading {
         value,
@@ -337,7 +490,7 @@ pub fn quota_for(vendor: Vendor) -> QuotaReading {
     }
 }
 
-/// 三家都有数据的会话台，停在 `vendor`。
+/// 各家都有数据的会话台，停在 `vendor`。
 pub fn demo_app(vendor: Vendor) -> App {
     let mut app = App::new(
         PathBuf::from(HOME),
@@ -348,6 +501,11 @@ pub fn demo_app(vendor: Vendor) -> App {
     app.set_entries(Vendor::Claude, claude_entries());
     app.set_entries(Vendor::Codex, codex_entries());
     app.set_entries(Vendor::Pi, pi_entries());
+    app.set_entries(Vendor::Hermes, hermes_entries());
+    app.set_entries(Vendor::Kimi, kimi_entries());
+    app.set_entries(Vendor::Gemini, gemini_entries());
+    app.set_entries(Vendor::OpenCode, opencode_entries());
+    app.set_entries(Vendor::Qwen, qwen_entries());
     for v in Vendor::ALL {
         app.quota.insert(v, quota_for(v));
     }
@@ -375,6 +533,20 @@ pub fn demo_app(vendor: Vendor) -> App {
 }
 
 /// 往下按到选中这条为止。
+/// 当 Kimi Code、Gemini、OpenCode、Qwen Code 都没装（没有对话、数据目录不在），顶栏回到四家：测「不到五家时」的顶栏行为用。
+pub fn only_first_four(app: &mut App) {
+    app.set_entries(Vendor::Kimi, Vec::new());
+    app.set_entries(Vendor::Gemini, Vec::new());
+    app.set_entries(Vendor::OpenCode, Vec::new());
+    app.set_entries(Vendor::Qwen, Vec::new());
+    app.hide_missing(|v| {
+        !matches!(
+            v,
+            Vendor::Kimi | Vendor::Gemini | Vendor::OpenCode | Vendor::Qwen
+        )
+    });
+}
+
 pub fn select_id(app: &mut App, id: &str) {
     for _ in 0..100 {
         if app

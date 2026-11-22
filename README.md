@@ -2,7 +2,7 @@
 
 # 会话台 `ai`
 
-在终端里敲 `ai`，本机 Claude Code、Codex、pi 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。
+在终端里敲 `ai`，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。
 
 [![Release](https://img.shields.io/github/v/release/dodo258/huitai?label=release&color=16181D)](https://github.com/dodo258/huitai/releases/latest) [![License](https://img.shields.io/badge/license-MIT-16181D)](LICENSE) ![macOS](https://img.shields.io/badge/macOS-16181D?logo=apple&logoColor=white) ![Rust](https://img.shields.io/badge/Rust-16181D?logo=rust&logoColor=white)
 
@@ -21,9 +21,9 @@
 
 ## 它是什么
 
-一个装在终端里的命令行工具，不是终端，也不用 tmux。你照样用自己的终端（Ghostty、Kaku 或别的），会话台只负责三件事：
+一个装在终端里的命令行工具，不是终端，也不用 tmux。你照样用自己的终端（Ghostty、Kaku、cmux 或别的），会话台只负责三件事：
 
-- **找得到**：三家的对话放在一起，按项目分组、按时间排，标题和正文都能搜。
+- **找得到**：各家的对话放在一起，按项目分组、按时间排，标题和正文都能搜。
 - **接得上**：回车在新标签页里进到项目目录接着聊；已经开着的直接切过去，不开第二个。
 - **断不了**：对话跑在会话台自己的后台里，关掉标签页甚至整个终端，它照样干活；回来回车，画面和历史都在。断电重启后列出被中断的，一键全部接着做。
 
@@ -43,7 +43,7 @@ curl -fsSL https://github.com/dodo258/huitai/releases/latest/download/install.sh
 cargo install --locked --git https://github.com/dodo258/huitai
 ```
 
-**要求**：macOS（在 macOS 27、Apple 芯片上开发和测试；Intel 版只做了构建，没有真机测过）。在新标签页打开对话需要 [Ghostty](https://ghostty.org) 1.3 以上或 [Kaku](https://github.com/tw93/Kaku)，别的终端在当前窗口打开。Claude Code、Codex、pi 装了哪家就列哪家：CLI 装在哪都行，你的终端里敲得出来就行；用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`PI_CODING_AGENT_DIR` 把数据放在别处的，会话台跟着去那里找。界面是简体中文。
+**要求**：macOS（在 macOS 27、Apple 芯片上开发和测试；Intel 版只做了构建，没有真机测过）。在新标签页打开对话需要 [Ghostty](https://ghostty.org) 1.3 以上、[Kaku](https://github.com/tw93/Kaku) 或 [cmux](https://cmux.com)，别的终端在当前窗口打开（cmux 不支持开机自动打开和 ⌥空格新开会话台，它不接受从外面控制）。Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 装了哪家就列哪家：CLI 装在哪都行，你的终端里敲得出来就行；用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`PI_CODING_AGENT_DIR` 把数据放在别处的，会话台跟着去那里找。界面是简体中文。
 
 **占用**：会话台开着时约 27 MB 内存，后台守护进程空闲时约 22 MB（Apple M4 Max 实测）；没东西在跑时不重画，几乎不占 CPU。
 
@@ -53,7 +53,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 2. **敲 `ai`**：顶上一排标签是你装了的那几家（没装的不显示），单击或按 `Tab` 切换；左边按项目分组列对话，右边预览最后几条消息，按 `v` 看整段对话。
 3. **回车接着聊**：选中一条按回车，新标签页里进到项目目录，接着这条对话聊。
 
-拿不准装好没有，跑 `ai doctor`：它会查三家 CLI 和版本、会话目录、额度、当前终端能不能开新标签页、后台在不在。
+拿不准装好没有，跑 `ai doctor`：它会查各家 CLI 和版本、会话目录、额度、当前终端能不能开新标签页、后台在不在。
 
 ## 常用操作
 
@@ -75,13 +75,13 @@ cargo install --locked --git https://github.com/dodo258/huitai
 
 列表里的状态灯：转着的绿色半圆 `◐` 在跑，`◆` 等你回复（慢慢闪），`✓` 刚做完，`○` 已停；一条对话从在跑停下来（做完或要你回复）的那一刻，整行亮一下再慢慢淡掉，收起的项目组由组标题替它亮；淡绿色的是别处（比如桌面端）开着的对话，转着表示它正在干活、不转表示只是开着，打开前会先问你。
 
-顶栏印章后面是三家合计：会话台托管的在跑几条（`◐3 在跑`）、等你几条（`◆1 等你`），别处开着几条（`●2 别处`）；没有就不写。单击「等你」跳到下一条等你回复的，单击「别处」跳到下一条别处开着的。
+顶栏印章后面是各家合计：会话台托管的在跑几条（`◐3 在跑`）、等你几条（`◆1 等你`），别处开着几条（`●2 别处`）；没有就不写。单击「等你」跳到下一条等你回复的，单击「别处」跳到下一条别处开着的。
 
 ## 使用技巧
 
 - 在项目目录（或它的子目录）里敲 `ai`，这个项目自动展开。
-- `!` 跳到下一条等你回复的对话，三家轮着找；点顶栏的 `◆` 也一样。点顶栏的 `●N 别处` 跳到下一条桌面端等别处开着的。
-- `s` 把三家等你回复和在跑的对话列在一起，等你的排最前，一眼看出哪几条卡着；`Esc` 回到列表。
+- `!` 跳到下一条等你回复的对话，各家轮着找；点顶栏的 `◆` 也一样。点顶栏的 `●N 别处` 跳到下一条桌面端等别处开着的。
+- `s` 把各家等你回复和在跑的对话列在一起，等你的排最前，一眼看出哪几条卡着；`Esc` 回到列表。
 - `v`（或 `→`）看整段对话：只读，从最后看起，工具调用折成一行、`t` 展开；从搜索结果里打开会高亮搜索词，`n` 跳下一处。确认是这条再 `⏎` 接着聊。
 - `⌥空格` 随时呼出会话台。后台第一次开对话时起来，之后一直有效。
 - `c` 复制恢复命令（`cd '目录' && claude --resume …`），粘进任何终端都能接着聊。
@@ -96,7 +96,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 
 ## 隐私
 
-- 只读本机三家的会话文件，不改它们的配置（`~/.claude/settings.json`、`~/.codex/config.toml`、`~/.pi/agent/`）。唯一会动厂商文件的是删除：移进会话台回收站，能恢复。
+- 只读本机各家的会话文件，不改它们的配置（`~/.claude/settings.json`、`~/.codex/config.toml`、`~/.pi/agent/`）。唯一会动厂商文件的是删除：移进会话台回收站，能恢复。
 - 不上传对话，没有统计和遥测。改名、置顶、归档、设置都存在本机 `~/Library/Application Support/huitai/`。
 - 会话台启动 Claude 时用 `--settings` 加一个状态栏命令来读额度，只对这次启动有效，你原来的状态栏照常显示。
 - 联网只有两处。一是 Claude 额度的备用渠道：状态栏的数据读不到时，用本机 Claude Code 的登录凭证问一次 Anthropic 官方用量接口，结果缓存 5 分钟；凭证只在内存里用，不存盘。`ai doctor` 会把每个渠道都试一遍，也会问这一次。
@@ -114,7 +114,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 | | `/` | 搜标题和正文 |
 | | `1-9` | 跳到第几个项目 |
 | | `!` | 下一条等你回复的（跨家） |
-| | `s` | 三家等你回复和在跑的列在一起 |
+| | `s` | 各家等你回复和在跑的列在一起 |
 | | `v` / `→` | 看整段对话（只读，`t` 展开工具调用） |
 | | `b` | 显示 / 隐藏后台对话 |
 | 开 | `⏎` | 新标签页打开 |
@@ -146,8 +146,8 @@ cargo install --locked --git https://github.com/dodo258/huitai
 
 | | 会话台 | Rex |
 |---|---|---|
-| 是什么 | 装在你现有终端里的一条命令 `ai`，Ghostty、Kaku 照用 | 一个独立的终端 App，用来替换你现在的终端 |
-| 管哪些对话 | 本机 Claude Code、Codex、pi 的全部历史对话，按项目分组、全文搜索，回车接着聊 | 在 Rex 里开的会话；给 Claude Code、Codex、OpenCode、pi 标出谁在干活、谁在等你 |
+| 是什么 | 装在你现有终端里的一条命令 `ai`，Ghostty、Kaku、cmux 照用 | 一个独立的终端 App，用来替换你现在的终端 |
+| 管哪些对话 | 本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的全部历史对话，按项目分组、全文搜索，回车接着聊 | 在 Rex 里开的会话；给 Claude Code、Codex、OpenCode、pi 标出谁在干活、谁在等你 |
 | 额度 | 顶栏显示 Claude、Codex 的限额窗口和 pi 的今日 token | 官方资料里没提到 |
 | 多台机器 | 只管本机 | 强项：连接别的机器上的 Rex 服务，iOS 等客户端在路上 |
 | 怎么拿到 | 一行命令安装，MIT 开源 | 加入邮件列表等邀请，免费、不用注册账号 |

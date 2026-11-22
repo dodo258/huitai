@@ -32,7 +32,22 @@ fn tab(app: &mut App, shift: bool) {
 fn missing_vendor_is_hidden_and_skipped() {
     let mut app = demo_app(Vendor::Codex);
     app.set_entries(Vendor::Pi, Vec::new());
-    app.hide_missing(|v| v != Vendor::Pi);
+    app.set_entries(Vendor::Hermes, Vec::new());
+    app.set_entries(Vendor::Kimi, Vec::new());
+    app.set_entries(Vendor::Gemini, Vec::new());
+    app.set_entries(Vendor::OpenCode, Vec::new());
+    app.set_entries(Vendor::Qwen, Vec::new());
+    app.hide_missing(|v| {
+        !matches!(
+            v,
+            Vendor::Pi
+                | Vendor::Hermes
+                | Vendor::Kimi
+                | Vendor::Gemini
+                | Vendor::OpenCode
+                | Vendor::Qwen
+        )
+    });
     assert_eq!(app.shown, vec![Vendor::Claude, Vendor::Codex]);
     let line = top(&mut app);
     assert!(!line.contains("π pi"), "{line}");
@@ -72,6 +87,7 @@ fn hidden_current_vendor_moves_to_first_shown() {
 fn tabs_read_as_tabs_without_background_blocks() {
     // 照 gitui / ratatui Tabs：不垫底色；标签之间一道淡竖线；当前这家强调色加粗加下划线，别的家次要色。
     let mut app = demo_app(Vendor::Codex);
+    only_first_four(&mut app);
     let buf = render(&mut app, W, H);
     let t = Theme::DARK;
     let line = top(&mut app);
@@ -87,4 +103,21 @@ fn tabs_read_as_tabs_without_background_blocks() {
             assert!(!c.modifier.contains(ratatui::style::Modifier::UNDERLINED));
         }
     }
+}
+
+#[test]
+fn very_narrow_terminal_shrinks_other_tabs_to_marks() {
+    let mut app = demo_app(Vendor::Codex);
+    only_first_four(&mut app);
+    // 别的都去掉了还放不下四家全名：别的家只留标记，当前这家写全名，标签还能点。
+    let line = dump(&render(&mut app, 40, H))
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(line.contains("✻ │ ◎ Codex │ π │ ☤"), "{line}");
+    let shown: Vec<Vendor> = app.areas.tabs.iter().map(|(v, _)| *v).collect();
+    assert_eq!(shown, app.shown);
+    // 宽的时候照旧写全名。
+    assert!(top(&mut app).contains("✻ Claude │ ◎ Codex │ π pi │ ☤ Hermes"));
 }

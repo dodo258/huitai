@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub use crate::core::REDRAW_GRACE;
-use crate::core::{SessionId, SessionState};
+use crate::core::{QUIET_AFTER, SessionId, SessionState};
 
 /// 一轮提醒先攒这么久再发：CLI 常把响铃和带文字的通知前后脚一起发，合成一条。
 pub const COALESCE: Duration = Duration::from_millis(300);
@@ -17,7 +17,7 @@ pub enum Activity {
     Started,
     /// CLI 有输出。
     Output,
-    /// CLI 响铃（BEL）。
+    /// CLI 停下来要你回来：响铃（BEL）或托管层认出的程序状态（OSC 7501、Gemini 等待标题）。
     Bell,
     /// CLI 发的桌面通知（OSC 9 / OSC 777）。
     Notify { title: Option<String>, body: String },
@@ -42,9 +42,17 @@ pub struct Alert {
 }
 
 /// 所有托管对话的状态灯和提醒去重。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Notifier {
     sessions: HashMap<SessionId, Track>,
+    /// 在跑的对话这么久没输出就当这一轮停了（[`QUIET_AFTER`]；测试里调短）。
+    quiet: Duration,
+}
+
+impl Default for Notifier {
+    fn default() -> Self {
+        Self::with_quiet(QUIET_AFTER)
+    }
 }
 
 #[derive(Debug)]
@@ -55,6 +63,8 @@ struct Track {
     foreground: Option<bool>,
     /// 最近一次提醒信号的时间，用来判断之后的输出是不是收尾重画。
     last_signal: Option<Instant>,
+    /// 在跑以来最近一次有输出（开跑时算一次），用来判断安静超时。
+    last_output: Instant,
     /// 这一轮（从开跑到下一次开跑）已经处理过提醒，不再提醒。
     handled: bool,
     pending: Option<Pending>,
@@ -70,12 +80,13 @@ struct Pending {
 }
 
 impl Track {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             state: SessionState::Running,
             attached: false,
             foreground: None,
             last_signal: None,
+            last_output: now,
             handled: false,
             pending: None,
         }
@@ -96,8 +107,9 @@ impl Track {
         self.handled = true;
     }
 
-    fn running(&mut self) {
+    fn running(&mut self, now: Instant) {
         self.state = SessionState::Running;
+        self.last_output = now;
         self.last_signal = None;
         self.handled = false;
         self.pending = None;
@@ -143,19 +155,29 @@ impl Notifier {
         Self::default()
     }
 
+    /// 安静时长换成 `quiet`（测试用）。
+    pub fn with_quiet(quiet: Duration) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            quiet,
+        }
+    }
+
     /// 喂一件事。
     pub fn notify(&mut self, id: SessionId, activity: Activity, now: Instant) {
         if activity == Activity::Exited {
             self.sessions.remove(&id);
             return;
         }
-        let track = self.sessions.entry(id).or_insert_with(Track::new);
+        let track = self.sessions.entry(id).or_insert_with(|| Track::new(now));
         match activity {
-            Activity::Started => track.running(),
+            Activity::Started => track.running(now),
             Activity::Output => {
                 let redraw = track.last_signal.is_some_and(|t| now - t < REDRAW_GRACE);
-                if track.state != SessionState::Running && !redraw {
-                    track.running();
+                if track.state == SessionState::Running {
+                    track.last_output = now;
+                } else if !redraw {
+                    track.running(now);
                 }
             }
             Activity::Bell => track.signal(None, None, now),
@@ -200,6 +222,27 @@ impl Notifier {
         }
         alerts.sort_by(|a, b| a.id.cmp(&b.id));
         alerts
+    }
+
+    /// 在跑却已经安静了 `quiet` 的对话：当这一轮停了（标签页在前台算等你回复，否则算刚做完）。
+    /// 只改状态灯，不产生提醒（安静可能是误判）；之后真来了响铃或通知照常提醒。返回状态变了的对话。
+    pub fn settle(&mut self, now: Instant) -> Vec<SessionId> {
+        let mut changed = Vec::new();
+        for (id, track) in &mut self.sessions {
+            if track.state != SessionState::Running
+                || now.saturating_duration_since(track.last_output) < self.quiet
+            {
+                continue;
+            }
+            track.state = if track.in_front() {
+                SessionState::Waiting
+            } else {
+                SessionState::Done
+            };
+            changed.push(id.clone());
+        }
+        changed.sort();
+        changed
     }
 
     /// 最早一条待发提醒的到期时间，事件循环据此决定等多久再 `poll`。

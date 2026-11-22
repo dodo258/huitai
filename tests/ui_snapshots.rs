@@ -186,11 +186,10 @@ fn same_name_projects_show_path_and_preview_shows_full_path() {
     assert!(text.contains("~/projects/shop"));
     assert!(text.contains("已在标签页打开"));
     let top = row_text(&render(&mut app, W, H), 0);
+    // 五家同屏：当前这家写全名，别的家缩成标记。
     assert!(
-        top.contains("会话台")
-            && top.contains("✻ Claude")
-            && top.contains("◎ Codex")
-            && top.contains("π pi")
+        top.contains("会话台") && top.contains("✻ Claude │ ◎ │ π │ ☤ │ K"),
+        "{top}"
     );
     assert!(top.contains("5 小时") && top.contains("23%"));
 }
@@ -296,8 +295,8 @@ fn old_daemon_hint_in_top_bar() {
     let x = (0..W).find(|&x| buf[(x, 0)].symbol() == "后").unwrap();
     assert_eq!(buf[(x, 0)].fg, Theme::DARK.faint);
 
-    // 印章和全局状态占了左边，84 列时放得下提示、放不下额度。
-    let narrow = top(&mut app, 84);
+    // 印章、全局状态和四家标签占了左边，95 列时放得下提示、放不下额度。
+    let narrow = top(&mut app, 95);
     assert!(narrow.contains("后台是旧版，2 条"), "{narrow}");
     assert!(!narrow.contains('%'), "放不下时额度让位：{narrow}");
 

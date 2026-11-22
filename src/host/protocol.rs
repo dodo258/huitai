@@ -249,7 +249,8 @@ pub enum HostEvent {
     Output {
         id: SessionId,
     },
-    /// CLI 响铃（BEL）。
+    /// CLI 停下来要你回来：响铃（BEL），或 OSC 7501 报 blocked/done/error、Gemini 的「✋ Action Required」标题。
+    /// 程序状态不另加事件，旧版会话台也认得。
     Bell {
         id: SessionId,
     },

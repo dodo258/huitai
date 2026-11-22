@@ -1,7 +1,7 @@
 # 项目地图（保持精简，只写稳定信息）
 
 ## 项目是什么
-会话台（huitai）：装在终端里的命令行工具（不是终端模拟器），命令 `ai`。按厂商（Claude Code / Codex / pi）分开、按项目分组列出本机全部 AI 对话，回车在 Ghostty / Kaku 新标签页里接着聊；对话由会话台的透传托管守护进程保活，关窗口不停。只支持 macOS。完整方案：`docs/specs/huitai-v1.md`。
+会话台（huitai）：装在终端里的命令行工具（不是终端模拟器），命令 `ai`。按厂商（Claude Code / Codex / pi / Hermes / Kimi Code / Gemini CLI / OpenCode / Qwen Code）分开、按项目分组列出本机全部 AI 对话，回车在 Ghostty / Kaku 新标签页里接着聊；对话由会话台的透传托管守护进程保活，关窗口不停。只支持 macOS。完整方案：`docs/specs/huitai-v1.md`。
 
 ## 技术栈与目录
 - Rust（单个 crate，单个二进制 `ai`），界面 ratatui。索引缓存和全文搜索用 SQLite FTS5（rusqlite bundled），监听目录用 notify（FSEvents）。
@@ -15,8 +15,8 @@
 
 | 路径 | 只负责 | 对外接口 |
 |---|---|---|
-| `src/core/` | 共享类型和配置：Vendor、Session、SessionId、SessionState、QuotaReading、Config | 纯数据 |
-| `src/sources/` | 三家适配器：扫描、元数据、预览、恢复/新建命令、回收站 | `trait Source` |
+| `src/core/` | 共享类型和配置：Vendor（每家静态信息在 `VENDORS` 一张表，别处查表）、Session、SessionId、SessionState、QuotaReading、Config | 纯数据 |
+| `src/sources/` | 各家适配器（每家一个文件）：扫描、元数据、预览、恢复/新建命令、回收站 | `trait Source` |
 | `src/index/` | 缓存、增量扫描（FSEvents）、全文搜索、会话台自己的标注（改名/置顶/归档） | `Index` |
 | `src/host/` | 守护进程：PTY 托管、原样转发、终端状态机重连恢复、标题改写、通知序列识别、防休眠、闲置收回、socket 协议和版本握手 | `Hello/Spawn/Attach/Detach/Kill/List/Events` |
 | `src/opener/` | 识别终端、开新标签页、聚焦已开标签页 | `trait Opener` |
@@ -43,7 +43,7 @@
 - 测试和截图不得把本机真实会话内容写进仓库；fixtures 一律手写脱敏样例。
 - 自动跑的任务不做会在屏幕上弹窗或开窗口的真机测试（开 Ghostty/Kaku 标签页、系统通知、全局热键、登录项、AppleScript 自动化）：用单测和假实现覆盖，真机项写进 `docs/TEST-MATRIX.md`，由人在真机上测。
 - 界面颜色、快捷键以方案「界面」一节为准，颜色集中在 `src/ui/theme.rs`。
-- 改了 sources 的解析结果（`Session` 任何字段、预览或正文的取法）就把该家解析版本加一（`src/sources/mod.rs` 的 `parse_version`），否则旧缓存里没变的文件永远是旧结果。
+- 改了 sources 的解析结果（`Session` 任何字段、预览或正文的取法）就把该家解析版本加一（`src/core/vendor.rs` 的 `VENDORS` 表里的 `parse_version`），否则旧缓存里没变的文件永远是旧结果。
 - socket 协议（`src/host/protocol.rs`）和 `running.json` 里的字段只加不改，新字段带 `#[serde(default)]`；协议有不兼容的改动才把 `PROTOCOL` 加一，新旧客户端和守护进程怎么相处见 DECISIONS.md「版本握手」。
 - 索引缓存只加列时不改 `SCHEMA_VERSION`，在 `src/index/store.rs` 的 `ADDED_COLUMNS` 补列：改版本号会让同时开着的旧版把整个库删了重建。
 

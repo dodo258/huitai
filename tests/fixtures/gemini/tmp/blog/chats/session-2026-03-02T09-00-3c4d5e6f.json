@@ -1,0 +1,20 @@
+{
+  "sessionId": "3c4d5e6f-3333-4aaa-8bbb-000000000003",
+  "projectHash": "0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d0c1d",
+  "startTime": "2026-03-02T09:00:00.000Z",
+  "lastUpdated": "2026-03-02T09:05:00.000Z",
+  "messages": [
+    {
+      "id": "c1",
+      "timestamp": "2026-03-02T09:00:10.000Z",
+      "type": "user",
+      "content": "给博客加 RSS"
+    },
+    {
+      "id": "c2",
+      "timestamp": "2026-03-02T09:01:00.000Z",
+      "type": "gemini",
+      "content": "加好了，在 /feed.xml。"
+    }
+  ]
+}

@@ -3,16 +3,13 @@ use std::path::{Path, PathBuf};
 
 use super::Vendor;
 
-/// 三家 CLI 存数据的目录。默认在家目录下；用户用环境变量改过的（多账号、放别的盘），跟着 CLI 自己的规则走：
-/// Claude Code 认 `CLAUDE_CONFIG_DIR`，Codex 认 `CODEX_HOME`，pi 认 `PI_CODING_AGENT_DIR`。
+/// 各家 CLI 存数据的目录。默认在家目录下；用户用环境变量改过的（多账号、放别的盘），跟着 CLI 自己的规则走：
+/// 变量名和默认位置见 [`crate::core::VendorInfo`]（Claude Code 认 `CLAUDE_CONFIG_DIR`，Codex 认 `CODEX_HOME`，
+/// pi 认 `PI_CODING_AGENT_DIR`，Hermes 认 `HERMES_HOME`，Gemini CLI 认 `GEMINI_CLI_HOME`——它换的是家目录）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorDirs {
-    /// Claude Code 的配置目录（下面有 `projects/`、`settings.json`）。
-    pub claude: PathBuf,
-    /// Codex 的 `CODEX_HOME`（下面有 `sessions/`）。
-    pub codex: PathBuf,
-    /// pi 的 agent 目录（下面有 `sessions/`）。
-    pub pi: PathBuf,
+    /// 按 [`Vendor::index`] 放。
+    dirs: [PathBuf; Vendor::COUNT],
 }
 
 impl VendorDirs {
@@ -20,22 +17,32 @@ impl VendorDirs {
     /// 末尾的 `/` 和中间的 `.` 去掉：
     /// 记进回收站、交给守护进程的都是绝对路径，换个目录启动也指向同一处。
     pub fn new(home: &Path, cwd: &Path, env: impl Fn(&str) -> Option<OsString>) -> Self {
-        let pick = |key: &str, default: PathBuf| {
-            env(key)
+        let pick = |v: Vendor| {
+            let info = v.info();
+            env(info.dir_env)
                 .filter(|v| !v.is_empty())
                 // 按路径分段重新拼一遍：末尾的 `/`、中间的 `.` 不让同一个目录变成两组。
                 .map(|v| {
-                    cwd.join(expand_home(home, PathBuf::from(v)))
+                    let dir: PathBuf = cwd
+                        .join(expand_home(home, PathBuf::from(v)))
                         .components()
-                        .collect()
+                        .collect();
+                    if info.dir_env_is_home {
+                        dir.join(info.default_dir)
+                    } else {
+                        dir
+                    }
                 })
-                .unwrap_or(default)
+                .unwrap_or_else(|| home.join(info.default_dir))
         };
         Self {
-            claude: pick("CLAUDE_CONFIG_DIR", home.join(".claude")),
-            codex: pick("CODEX_HOME", home.join(".codex")),
-            pi: pick("PI_CODING_AGENT_DIR", home.join(".pi/agent")),
+            dirs: Vendor::ALL.map(pick),
         }
+    }
+
+    /// 这家的数据目录。
+    pub fn dir(&self, vendor: Vendor) -> &Path {
+        &self.dirs[vendor.index()]
     }
 
     /// 按当前进程的环境变量和工作目录。
@@ -44,25 +51,32 @@ impl VendorDirs {
         Self::new(home, &cwd, |k| std::env::var_os(k))
     }
 
-    /// 三家都在家目录下的默认位置（没设环境变量）。
+    /// 都在家目录下的默认位置（没设环境变量）。
     pub fn defaults(home: &Path) -> Self {
         Self::new(home, home, |_| None)
     }
 
     /// 这家的目录和对应的环境变量名。
     pub fn of(&self, vendor: Vendor) -> (&'static str, &Path) {
-        match vendor {
-            Vendor::Claude => ("CLAUDE_CONFIG_DIR", &self.claude),
-            Vendor::Codex => ("CODEX_HOME", &self.codex),
-            Vendor::Pi => ("PI_CODING_AGENT_DIR", &self.pi),
-        }
+        (vendor.info().dir_env, self.dir(vendor))
     }
 
-    /// 这家不在默认位置时，启动它的 CLI 要显式带上的环境变量：交给守护进程的命令不一定继承同一份环境
+    /// 这家不在默认位置时，启动它的 CLI 要显式带上的环境变量和值：交给守护进程的命令不一定继承同一份环境
     /// （守护进程的环境来自第一次拉起它的那个终端）。在默认位置就不带。
+    /// 变量指家目录的（[`crate::core::VendorInfo::dir_env_is_home`]），值是数据目录往上退掉 `default_dir` 那几层。
     pub fn override_of(&self, vendor: Vendor, home: &Path) -> Option<(&'static str, &Path)> {
         let (key, dir) = self.of(vendor);
-        (dir != Self::defaults(home).of(vendor).1).then_some((key, dir))
+        if dir == Self::defaults(home).of(vendor).1 {
+            return None;
+        }
+        let info = vendor.info();
+        let value = if info.dir_env_is_home {
+            dir.ancestors()
+                .nth(Path::new(info.default_dir).components().count())?
+        } else {
+            dir
+        };
+        Some((key, value))
     }
 
     /// 有哪家不在默认位置时，这组目录的短名字（8 位十六进制，同一组目录永远一样）：
@@ -72,8 +86,14 @@ impl VendorDirs {
             return None;
         }
         // FNV-1a：std 的哈希不保证跨版本稳定，这里要跨版本不变。
+        // 最早的三家总是算进去，后来加的只在改过目录时才算：老用户的名字不变，缓存不用重建。
+        let defaults = Self::defaults(home);
         let mut h: u32 = 0x811c_9dc5;
-        for p in [&self.claude, &self.codex, &self.pi] {
+        let counted = Vendor::ALL.into_iter().filter(|&v| {
+            matches!(v, Vendor::Claude | Vendor::Codex | Vendor::Pi)
+                || self.dir(v) != defaults.dir(v)
+        });
+        for p in counted.map(|v| self.dir(v)) {
             for b in p.as_os_str().as_encoded_bytes().iter().chain(&[0]) {
                 h ^= u32::from(*b);
                 h = h.wrapping_mul(0x0100_0193);
@@ -82,7 +102,7 @@ impl VendorDirs {
         Some(format!("{h:08x}"))
     }
 
-    /// 会话台自己的缓存（列表缓存、额度缓存）放哪：三家都在默认位置就是数据目录本身，
+    /// 会话台自己的缓存（列表缓存、额度缓存）放哪：都在默认位置就是数据目录本身，
     /// 否则是数据目录下 `profiles/<profile>`，两组目录互不串。
     pub fn cache_dir(&self, data_dir: &Path, home: &Path) -> PathBuf {
         match self.profile(home) {
@@ -95,13 +115,9 @@ impl VendorDirs {
     /// 别的相对路径照旧接在家目录后面。
     pub fn resolve(&self, home: &Path, rel: &str) -> PathBuf {
         let rel = Path::new(rel);
-        for (default, actual) in [
-            (".claude", &self.claude),
-            (".codex", &self.codex),
-            (".pi/agent", &self.pi),
-        ] {
-            if let Ok(rest) = rel.strip_prefix(default) {
-                return actual.join(rest);
+        for v in Vendor::ALL {
+            if let Ok(rest) = rel.strip_prefix(v.info().default_dir) {
+                return self.dir(v).join(rest);
             }
         }
         home.join(rel)
@@ -126,9 +142,11 @@ mod tests {
     #[test]
     fn defaults_under_home() {
         let d = VendorDirs::new(Path::new("/h"), Path::new("/cwd"), env_of(&[]));
-        assert_eq!(d.claude, Path::new("/h/.claude"));
-        assert_eq!(d.codex, Path::new("/h/.codex"));
-        assert_eq!(d.pi, Path::new("/h/.pi/agent"));
+        assert_eq!(d.dir(Vendor::Claude), Path::new("/h/.claude"));
+        assert_eq!(d.dir(Vendor::Codex), Path::new("/h/.codex"));
+        assert_eq!(d.dir(Vendor::Pi), Path::new("/h/.pi/agent"));
+        assert_eq!(d.dir(Vendor::Hermes), Path::new("/h/.hermes"));
+        assert_eq!(d.dir(Vendor::Gemini), Path::new("/h/.gemini/tmp"));
         assert_eq!(
             d.resolve(Path::new("/h"), ".pi/agent/sessions"),
             Path::new("/h/.pi/agent/sessions")
@@ -169,7 +187,7 @@ mod tests {
             Path::new("/cwd"),
             env_of(&[("CODEX_HOME", "")]),
         );
-        assert_eq!(d.codex, Path::new("/h/.codex"));
+        assert_eq!(d.dir(Vendor::Codex), Path::new("/h/.codex"));
     }
 
     #[test]
@@ -192,7 +210,7 @@ mod tests {
             Path::new("/work/a"),
             env_of(&[("PI_CODING_AGENT_DIR", ".pi-profile")]),
         );
-        assert_eq!(d.pi, Path::new("/work/a/.pi-profile"));
+        assert_eq!(d.dir(Vendor::Pi), Path::new("/work/a/.pi-profile"));
     }
 
     #[test]
@@ -216,6 +234,41 @@ mod tests {
         assert_ne!(other.profile(h), Some(key));
         // 显式写成默认位置，等于没改。
         let same = VendorDirs::new(h, h, env_of(&[("CLAUDE_CONFIG_DIR", "/h/.claude")]));
+        assert_eq!(same.profile(h), None);
+    }
+
+    /// 名字是缓存目录名：加了新厂商以后，只改过最早三家目录的老用户名字不变（值按加 Hermes 之前的算法算出），
+    /// 只改了新厂商目录的也有自己的名字。
+    #[test]
+    fn profile_name_is_stable_across_new_vendors() {
+        let h = Path::new("/h");
+        let moved = VendorDirs::new(h, h, env_of(&[("CODEX_HOME", "/data/codex")]));
+        assert_eq!(moved.profile(h).as_deref(), Some("7f687171"));
+        let hermes = VendorDirs::new(h, h, env_of(&[("HERMES_HOME", "/data/hermes")]));
+        assert_eq!(hermes.dir(Vendor::Hermes), Path::new("/data/hermes"));
+        let key = hermes.profile(h).expect("改过 Hermes 目录也算");
+        assert_ne!(Some(key), moved.profile(h));
+        assert_eq!(
+            hermes.resolve(h, ".hermes/state.db"),
+            Path::new("/data/hermes/state.db")
+        );
+    }
+
+    /// `GEMINI_CLI_HOME` 换的是 Gemini CLI 的家目录：数据在它下面的 `.gemini/tmp`，
+    /// 命令前带的还是变量原来的值。
+    #[test]
+    fn gemini_variable_names_a_home() {
+        let h = Path::new("/h");
+        let d = VendorDirs::new(h, Path::new("/work"), env_of(&[("GEMINI_CLI_HOME", "g2/")]));
+        assert_eq!(d.dir(Vendor::Gemini), Path::new("/work/g2/.gemini/tmp"));
+        assert_eq!(
+            d.override_of(Vendor::Gemini, h),
+            Some(("GEMINI_CLI_HOME", Path::new("/work/g2")))
+        );
+        assert!(d.profile(h).is_some());
+        // 指回家目录本身就是默认位置。
+        let same = VendorDirs::new(h, h, env_of(&[("GEMINI_CLI_HOME", "/h")]));
+        assert_eq!(same.override_of(Vendor::Gemini, h), None);
         assert_eq!(same.profile(h), None);
     }
 

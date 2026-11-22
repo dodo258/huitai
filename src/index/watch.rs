@@ -37,14 +37,13 @@ enum Msg {
 
 /// 后台扫描和监听。丢掉它就停止监听并等线程退出。
 pub struct Background {
-    watcher: Option<RecommendedWatcher>,
     tx: Sender<Msg>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for Background {
     fn drop(&mut self) {
-        self.watcher.take();
+        // 线程收到 Stop 退出，监听跟着线程里的 `_watcher` 一起停。
         let _ = self.tx.send(Msg::Stop);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -70,33 +69,30 @@ impl Index {
             })
             .collect();
 
-        let watcher = match watch(&roots, tx.clone()) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                let _ = up_tx.send(Update::Problem(format!(
-                    "监听三家目录失败，只能手动刷新: {e}"
-                )));
-                None
-            }
-        };
-
         let index = self.clone();
         let problems = up_tx.clone();
+        let events = tx.clone();
+        // 监听也在线程里开：FSEvents 建流在机器忙时要上百毫秒到一秒多，放在这里会拖慢会话台的第一帧。
+        // 先开监听再扫，首扫期间的变动不会漏。
         let thread = thread::Builder::new()
             .name("huitai-index".into())
-            .spawn(move || run(&index, &roots, &rx, &up_tx))
+            .spawn(move || {
+                let _watcher = match watch(&roots, events) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        let _ = up_tx.send(Update::Problem(format!(
+                            "监听三家目录失败，只能手动刷新: {e}"
+                        )));
+                        None
+                    }
+                };
+                run(&index, &roots, &rx, &up_tx);
+            })
             .map_err(|e| {
                 let _ = problems.send(Update::Problem(format!("起不了后台扫描线程: {e}")));
             })
             .ok();
-        (
-            Background {
-                watcher,
-                tx,
-                thread,
-            },
-            up_rx,
-        )
+        (Background { tx, thread }, up_rx)
     }
 }
 

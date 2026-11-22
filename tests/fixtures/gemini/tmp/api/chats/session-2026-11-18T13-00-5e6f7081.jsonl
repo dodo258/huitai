@@ -1,0 +1,3 @@
+{"sessionId":"5e6f7081-5555-4aaa-8bbb-000000000005","projectHash":"0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c","startTime":"2026-11-18T13:00:00.000Z","lastUpdated":"2026-11-18T13:00:00.000Z","kind":"main"}
+{"id":"e1","timestamp":"2026-11-18T13:00:01.000Z","type":"user","content":[{"text":"/help"}]}
+{"id":"e2","timestamp":"2026-11-18T13:00:01.000Z","type":"info","content":"帮助"}

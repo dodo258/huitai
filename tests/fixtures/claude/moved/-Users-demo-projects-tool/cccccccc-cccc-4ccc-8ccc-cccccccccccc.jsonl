@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":"在旧目录里聊起来"},"timestamp":"2026-11-05T08:00:00Z","cwd":"/Users/demo/old","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"好，挪到 projects/tool 接着做。"}]},"timestamp":"2026-11-05T08:00:05Z","cwd":"/Users/demo/old"}
+{"type":"user","message":{"role":"user","content":"进工作树解冲突"},"timestamp":"2026-11-05T09:00:00Z","cwd":"/Users/demo/projects/tool/.claude/worktrees/1122-y"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"冲突解好了。"}]},"timestamp":"2026-11-05T09:00:05Z","cwd":"/Users/demo/projects/tool/.claude/worktrees/1122-y"}

@@ -239,6 +239,8 @@ fn clicking_status_jumps_like_bang() {
 #[test]
 fn narrow_top_bar_drops_in_order() {
     let mut app = demo_app(Vendor::Claude);
+    // 不到五家时的去掉顺序（五家以上先把别的家缩成标记，见 ui_tabs）。
+    only_first_four(&mut app);
     // 每一样东西在多宽时最后一次出现（从宽到窄扫，去掉了就不再回来）。
     let marks = [
         ("来源", "状态栏"),

@@ -4,6 +4,7 @@
 //! `Tabs::open_or_focus` 打开一条对话（已开着就聚焦），`Tabs::restore_all` 恢复上次所有标签；
 //! [`LoginItem`] 是「开机自动打开会话台」的登录项。
 
+mod cmux;
 pub mod exec;
 mod ghostty;
 mod inline;
@@ -17,6 +18,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub use cmux::CmuxOpener;
 pub use ghostty::GhosttyOpener;
 pub use inline::InlineOpener;
 pub use kaku::{KakuOpener, Pane, ps_command_line};
@@ -39,6 +41,11 @@ pub enum TabHandle {
         tty: String,
         command: String,
     },
+    /// cmux 标签页（surface）的 UUID 和它所在工作区的 UUID。
+    Cmux {
+        surface_id: String,
+        workspace_id: String,
+    },
 }
 
 /// `Opener::open` 的结果。
@@ -59,11 +66,12 @@ pub trait Opener {
     fn focus(&self, handle: &TabHandle) -> io::Result<bool>;
 }
 
-/// 这个终端用哪种开法。`env` 取环境变量（Kaku 要找它的命令行工具）。
+/// 这个终端用哪种开法。`env` 取环境变量（Kaku、cmux 要找它们的命令行工具）。
 pub fn opener_for(terminal: &Terminal, env: impl Fn(&str) -> Option<String>) -> Box<dyn Opener> {
     match terminal {
         Terminal::Ghostty => Box::new(GhosttyOpener),
         Terminal::Kaku => Box::new(KakuOpener::new(env)),
+        Terminal::Cmux => Box::new(CmuxOpener::new(env)),
         Terminal::Other(_) => Box::new(InlineOpener),
     }
 }

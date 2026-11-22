@@ -31,6 +31,11 @@ pub fn quota(vendor: Vendor) -> QuotaReading {
     }
 }
 
+/// 这家有没有额度渠道（没有的顶栏不写额度）。
+pub fn supported(vendor: Vendor) -> bool {
+    !Rules::builtin().channels(vendor).is_empty()
+}
+
 /// 给会话台启动的 Claude 加的 `--settings` 参数值（JSON 字符串）。
 /// 注入的状态栏命令把官方给状态栏的数据写进缓存，再原样调用用户原有的状态栏命令，不覆盖。
 /// `cwd` 是 Claude 的项目目录（用来找项目级的原有状态栏设置）。

@@ -87,7 +87,7 @@ pub fn launch_args(
                 format!("{board}; exec {shell_q} -l"),
             ])
         }
-        Terminal::Other(_) => Err(io::Error::new(
+        Terminal::Cmux | Terminal::Other(_) => Err(io::Error::new(
             ErrorKind::Unsupported,
             format!("{terminal} 不支持开机自动打开，先在设置里把首选终端选成 Ghostty 或 Kaku"),
         )),

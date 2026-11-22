@@ -1,0 +1,14 @@
+{
+  "sessionId": "1a2b3c4d-1111-4aaa-8bbb-000000000001",
+  "projectHash": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c",
+  "startTime": "2026-01-10T08:00:00.000Z",
+  "lastUpdated": "2026-01-10T08:00:00.000Z",
+  "messages": [
+    {
+      "id": "x1",
+      "timestamp": "2026-01-10T08:00:01.000Z",
+      "type": "user",
+      "content": "旧副本"
+    }
+  ]
+}

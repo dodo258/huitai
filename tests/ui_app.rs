@@ -66,7 +66,8 @@ fn tab_cycles_vendors_both_ways() {
     assert_eq!(app.vendor, Vendor::Codex);
     app.key(key(KeyCode::BackTab));
     app.key(key(KeyCode::BackTab));
-    assert_eq!(app.vendor, Vendor::Pi);
+    // 从第一家往回绕到最后一家。
+    assert_eq!(app.vendor, *Vendor::ALL.last().unwrap());
 }
 
 #[test]
@@ -411,8 +412,9 @@ fn clicking_a_tab_switches_vendor() {
         .iter()
         .find(|(v, _)| *v == Vendor::Pi)
         .unwrap();
+    // 五家以上放不下时别的家缩成一格标记，点它那一格。
     app.mouse(
-        mouse(MouseEventKind::Down(MouseButton::Left), r.x + 1, 0),
+        mouse(MouseEventKind::Down(MouseButton::Left), r.x, 0),
         Instant::now(),
     );
     assert_eq!(app.vendor, Vendor::Pi);

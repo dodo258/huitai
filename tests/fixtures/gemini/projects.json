@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "/work/shop": "shop",
+    "/work/blog": "blog",
+    "/work/api": "api"
+  }
+}

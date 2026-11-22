@@ -8,10 +8,11 @@ use std::thread;
 use std::time::Duration;
 
 use host_support::*;
-use huitai::core::SessionId;
+use huitai::core::{SessionId, SessionState};
 use huitai::host::{
-    AttachMsg, Daemon, EndReason, HostEvent, Request, Response, Screen, socket_path,
+    AttachMsg, Daemon, EndReason, EventStream, HostEvent, Request, Response, Screen, socket_path,
 };
+use huitai::notify::Notifier;
 
 /// 假 CLI 都先切原始模式（和真 TUI 一样），这样输出不经换行转换、输入不回显。
 const RAW: &str = "stty raw -echo;";
@@ -153,6 +154,113 @@ fn bell_and_notifications_become_events_and_pass_through() {
         .filter(|e| matches!(e, HostEvent::Bell { .. } | HostEvent::Notify { .. }))
         .collect();
     assert_eq!(signals, want);
+}
+
+/// 会话台那边的状态灯：读到 `pred` 成立的事件为止，用会话台同一个映射（`ui::activity`）喂 `Notifier`。
+fn feed_lamps(
+    events: &mut EventStream,
+    lamps: &mut Notifier,
+    what: &str,
+    pred: impl Fn(&HostEvent) -> bool,
+) -> Vec<HostEvent> {
+    let got = wait_event(events, what, pred);
+    for e in got.clone() {
+        if let Some((id, a)) = huitai::ui::activity(e) {
+            lamps.notify(id, a, std::time::Instant::now());
+        }
+    }
+    got
+}
+
+/// 「等你」：刚做完（没看过）或等你回复，顶栏都算等你。
+fn waiting(state: SessionState) -> bool {
+    matches!(state, SessionState::Done | SessionState::Waiting)
+}
+
+#[test]
+fn program_status_osc7501_turns_the_lamp_to_waiting_and_passes_through() {
+    let host = TestHost::start();
+    let raw = b"\x1b]7501;state=working:app=hermes\x1b\\W\x1b]7501;state=blocked:kind=permission:app=hermes\x07B\x1b]7501;state=done\x1b\\D\x1b]7501;state=error:app=opencode\x07\x1b]7501;state=idle\x07END";
+    host.file("s.bin", raw);
+    let id = host.spawn("status", &format!("{RAW} cat s.bin; sleep 60"));
+    let mut events = host.subscribe();
+    let mut lamps = Notifier::new();
+    let mut att = host.attach(&id, COLS, ROWS);
+    let mut seen = Seen::new(COLS, ROWS);
+    read_snapshot(&mut att, &mut seen);
+    read_until(&mut att, &mut seen, "END", |s| s.live.ends_with(b"END"));
+    assert_eq!(seen.live, raw, "7501 原样转给终端");
+
+    let bells = std::cell::Cell::new(0);
+    let got = feed_lamps(&mut events, &mut lamps, "三次要你回来", |e| {
+        if matches!(e, HostEvent::Bell { .. }) {
+            bells.set(bells.get() + 1);
+        }
+        bells.get() == 3
+    });
+    assert!(
+        got.iter().all(|e| !matches!(e, HostEvent::Notify { .. })),
+        "7501 不是桌面通知：{got:?}"
+    );
+    let state = lamps.state(&id);
+    assert!(
+        waiting(state),
+        "发了 blocked/done/error 该是等你，实际 {state:?}"
+    );
+}
+
+#[test]
+fn program_status_working_after_waiting_turns_the_lamp_back_to_running() {
+    let host = TestHost::start();
+    host.file("b.bin", b"\x1b]7501;state=blocked:app=hermes\x1b\\ask");
+    host.file("w.bin", b"\x1b]7501;state=working:app=hermes\x1b\\");
+    // 两段之间隔过「提醒后的收尾重画」窗口（2 秒），之后只发 working、没有别的输出。
+    let id = host.spawn(
+        "working",
+        &format!("{RAW} cat b.bin; sleep 3; cat w.bin; sleep 60"),
+    );
+    let mut events = host.subscribe();
+    let mut lamps = Notifier::new();
+    let _att = host.attach(&id, COLS, ROWS);
+    feed_lamps(&mut events, &mut lamps, "blocked", |e| {
+        matches!(e, HostEvent::Bell { .. })
+    });
+    assert!(waiting(lamps.state(&id)), "{:?}", lamps.state(&id));
+    feed_lamps(&mut events, &mut lamps, "working 的有输出", |e| {
+        matches!(e, HostEvent::Output { .. })
+    });
+    assert_eq!(lamps.state(&id), SessionState::Running);
+}
+
+#[test]
+fn gemini_action_required_title_turns_the_lamp_to_waiting() {
+    let host = TestHost::start();
+    let raw = "\x1b]0;✦  Working… (demo)\x07\x1b]0;✋  Action Required (demo)\x07END";
+    host.file("g.bin", raw.as_bytes());
+    let id = host.spawn("gemini", &format!("{RAW} cat g.bin; sleep 60"));
+    let mut events = host.subscribe();
+    let mut lamps = Notifier::new();
+    let mut att = host.attach(&id, COLS, ROWS);
+    let mut seen = Seen::new(COLS, ROWS);
+    read_snapshot(&mut att, &mut seen);
+    read_until(&mut att, &mut seen, "END", |s| {
+        s.live_text().ends_with("END")
+    });
+    // 标题改写规则不变：只加前缀。
+    assert_eq!(
+        seen.live_text(),
+        "\x1b]0;✻ demo · ✦  Working… (demo)\x07\x1b]0;✻ demo · ✋  Action Required (demo)\x07END"
+    );
+    let got = feed_lamps(&mut events, &mut lamps, "等待标题", |e| {
+        matches!(e, HostEvent::Bell { .. })
+    });
+    assert!(
+        got.iter().any(
+            |e| matches!(e, HostEvent::Title { title, .. } if title.contains("Action Required"))
+        ),
+        "{got:?}"
+    );
+    assert!(waiting(lamps.state(&id)), "{:?}", lamps.state(&id));
 }
 
 #[test]

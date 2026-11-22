@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::{Config, QuotaReading, QuotaValue, Vendor};
 use crate::host::{self, Build, DaemonInfo, version};
-use crate::opener::{KakuOpener, Terminal, exec};
+use crate::opener::{CmuxOpener, KakuOpener, Terminal, exec};
 use crate::quota::{ChannelReport, QuotaReader};
 use crate::sources::{self, Source, Trash};
 use crate::ui::{text, view};
@@ -95,7 +95,7 @@ pub fn report(dir: &Path) -> String {
         clis,
         scans,
         quotas,
-        terminal_section(&Terminal::current(), &env, config.as_ref().ok(), kaku_probe),
+        terminal_section(&Terminal::current(), &env, config.as_ref().ok(), cli_probe),
         Section {
             title: "守护进程".to_owned(),
             items: vec![daemon_item(me, host::probe(dir))],
@@ -354,12 +354,12 @@ fn reading_text(r: &QuotaReading) -> String {
 /// Ghostty 从 1.3 起有 AppleScript 字典，开新标签页靠它。
 const GHOSTTY_MIN: (u32, u32) = (1, 3);
 
-/// 当前终端能不能开新标签页；`kaku` 是问 Kaku 的办法（测试里换成假的）。
+/// 当前终端能不能开新标签页；`kaku` 是问终端命令行工具（Kaku、cmux）的办法（测试里换成假的）。
 pub fn terminal_section(
     term: &Terminal,
     env: &dyn Fn(&str) -> Option<String>,
     config: Option<&Config>,
-    kaku: fn(&Path) -> io::Result<String>,
+    kaku: fn(&Path, &[String]) -> io::Result<String>,
 ) -> Section {
     let mut items = vec![terminal_item(term, env, kaku)];
     let preferred = config.and_then(|c| c.preferred_terminal.as_deref());
@@ -383,7 +383,7 @@ pub fn terminal_section(
 fn terminal_item(
     term: &Terminal,
     env: &dyn Fn(&str) -> Option<String>,
-    kaku: fn(&Path) -> io::Result<String>,
+    kaku: fn(&Path, &[String]) -> io::Result<String>,
 ) -> Item {
     let name = format!("当前 {term}");
     match term {
@@ -409,7 +409,7 @@ fn terminal_item(
         }
         Terminal::Kaku => {
             let cli = KakuOpener::new(env).cli().to_path_buf();
-            match kaku(&cli) {
+            match kaku(&cli, &KakuOpener::list_args()) {
                 Ok(_) => item(
                     Mark::Ok,
                     name,
@@ -419,6 +419,21 @@ fn terminal_item(
                     Mark::Fail,
                     name,
                     format!("kaku cli 不通，⏎ 开不了新标签页：{e}"),
+                ),
+            }
+        }
+        Terminal::Cmux => {
+            let cli = CmuxOpener::new(env).cli().to_path_buf();
+            match kaku(&cli, &CmuxOpener::ping_args()) {
+                Ok(_) => item(
+                    Mark::Ok,
+                    name,
+                    "能开新标签页（cmux 命令行连得上）；开机打开、⌥空格新开会话台不支持 cmux",
+                ),
+                Err(e) => item(
+                    Mark::Fail,
+                    name,
+                    format!("cmux 命令行不通，⏎ 开不了新标签页，先用 w 在当前窗口打开：{e}"),
                 ),
             }
         }
@@ -443,9 +458,8 @@ fn major_minor(v: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// 问 Kaku 有哪些窗格：只读，Kaku 界面不在时报错，不另起后台 mux。
-fn kaku_probe(cli: &Path) -> io::Result<String> {
-    let args = KakuOpener::list_args();
+/// 跑终端的命令行工具问一句只读的话（Kaku 列窗格、cmux ping），连不上就报错。
+fn cli_probe(cli: &Path, args: &[String]) -> io::Result<String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     exec::run(cli, &args, KAKU_TIMEOUT)
 }
@@ -723,11 +737,11 @@ mod tests {
         assert_eq!(none.last().unwrap().mark, Mark::Warn);
     }
 
-    fn no_kaku(_: &Path) -> io::Result<String> {
+    fn no_kaku(_: &Path, _: &[String]) -> io::Result<String> {
         Err(io::Error::other("Kaku 没开"))
     }
 
-    fn yes_kaku(_: &Path) -> io::Result<String> {
+    fn yes_kaku(_: &Path, _: &[String]) -> io::Result<String> {
         Ok("[]".to_owned())
     }
 
@@ -751,6 +765,12 @@ mod tests {
             Mark::Fail
         );
         assert_eq!(first(&Terminal::Kaku, &env(""), yes_kaku).mark, Mark::Ok);
+        assert_eq!(first(&Terminal::Cmux, &env(""), yes_kaku).mark, Mark::Ok);
+        let cmux_down = first(&Terminal::Cmux, &env(""), no_kaku);
+        assert!(
+            cmux_down.mark == Mark::Fail && cmux_down.detail.contains("w 在当前窗口"),
+            "{cmux_down:?}"
+        );
         let down = first(&Terminal::Kaku, &env(""), no_kaku);
         assert!(
             down.mark == Mark::Fail && down.detail.contains("Kaku 没开"),

@@ -666,11 +666,7 @@ pub(crate) fn pending_bodies(conn: &Connection, limit: usize) -> io::Result<Vec<
 }
 
 pub(crate) fn vendor_key(v: Vendor) -> &'static str {
-    match v {
-        Vendor::Claude => "claude",
-        Vendor::Codex => "codex",
-        Vendor::Pi => "pi",
-    }
+    v.key()
 }
 
 #[cfg(test)]

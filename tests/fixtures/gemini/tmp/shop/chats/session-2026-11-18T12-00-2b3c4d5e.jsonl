@@ -1,0 +1,4 @@
+{"sessionId":"2b3c4d5e-2222-4aaa-8bbb-000000000002","projectHash":"0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c0b1c","startTime":"2026-11-18T12:00:00.000Z","lastUpdated":"2026-11-18T12:00:00.000Z","kind":"main"}
+{"id":"n1","timestamp":"2026-11-18T12:00:10.000Z","type":"user","content":[{"text":"看 @README.md 写的部署步骤对不对\n--- README.md ---\n（展开的文件内容）"}],"displayContent":[{"text":"看 @README.md 写的部署步骤对不对"}]}
+{"id":"n2","timestamp":"2026-11-18T12:00:30.000Z","type":"gemini","content":"第三步少了 npm run build。"}
+{"id":"n3","timestamp":"2026-11-18T12:00:40.000Z","type":"info","content":"已切换到 gemini-2.5-flash"}

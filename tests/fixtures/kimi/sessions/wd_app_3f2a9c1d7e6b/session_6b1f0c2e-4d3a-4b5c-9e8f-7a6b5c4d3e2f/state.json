@@ -1,0 +1,20 @@
+{
+  "id": "session_6b1f0c2e-4d3a-4b5c-9e8f-7a6b5c4d3e2f",
+  "version": 2,
+  "title": "整理接口文档",
+  "titleKind": "generated",
+  "lastPrompt": "旧链接要能跳过去",
+  "cwd": "/work/app",
+  "createdAt": 1795000000000,
+  "updatedAt": 1795000050000,
+  "archived": false,
+  "agents": {
+    "main": {
+      "homedir": "agents/main",
+      "type": "main"
+    }
+  },
+  "custom": {},
+  "isCustomTitle": false,
+  "lastTurnReason": "completed"
+}

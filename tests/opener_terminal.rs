@@ -6,7 +6,7 @@ use std::process::Command as Proc;
 
 use huitai::core::{SessionId, Vendor};
 use huitai::opener::{
-    GhosttyOpener, KakuOpener, Terminal, attach_command, ps_command_line, tab_title,
+    CmuxOpener, GhosttyOpener, KakuOpener, Terminal, attach_command, ps_command_line, tab_title,
 };
 
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -26,6 +26,106 @@ fn detects_ghostty_and_kaku_by_term_program() {
     assert_eq!(Terminal::detect(kaku), Terminal::Kaku);
     assert_eq!(Terminal::from_name("GHOSTTY"), Terminal::Ghostty);
     assert_eq!(Terminal::from_name("kaku"), Terminal::Kaku);
+}
+
+#[test]
+fn detects_cmux_even_though_it_says_ghostty() {
+    // 2026-11-22 本机实测 cmux 0.65.2：TERM_PROGRAM=ghostty，另设 CMUX_SOCKET_PATH、CMUX_SURFACE_ID 等。
+    let cmux = env(&[
+        ("TERM_PROGRAM", "ghostty"),
+        ("CMUX_SOCKET_PATH", "/Users/me/.local/state/cmux/cmux.sock"),
+        ("CMUX_SURFACE_ID", "ABC"),
+    ]);
+    assert_eq!(Terminal::detect(cmux), Terminal::Cmux);
+    let surface_only = env(&[("TERM_PROGRAM", "ghostty"), ("CMUX_SURFACE_ID", "ABC")]);
+    assert_eq!(Terminal::detect(surface_only), Terminal::Cmux);
+    // 只有 socket 路径（别的终端里为用 cmux 命令行设的）不算在 cmux 里：认终端自己（审计第 23 条）。
+    for (p, want) in [("Kaku", Terminal::Kaku), ("ghostty", Terminal::Ghostty)] {
+        let pairs = [("TERM_PROGRAM", p), ("CMUX_SOCKET_PATH", "/tmp/cmux.sock")];
+        assert_eq!(Terminal::detect(env(&pairs)), want);
+    }
+    // 空值不算；cmux 里再开 tmux，新标签页会落到 tmux 外面，仍按其他终端处理。
+    let empty = env(&[("TERM_PROGRAM", "ghostty"), ("CMUX_SURFACE_ID", "")]);
+    assert_eq!(Terminal::detect(empty), Terminal::Ghostty);
+    let tmux = env(&[("TERM_PROGRAM", "tmux"), ("CMUX_SURFACE_ID", "/x")]);
+    assert_eq!(
+        Terminal::detect(tmux),
+        Terminal::Other(Some("tmux".to_owned()))
+    );
+
+    assert_eq!(Terminal::from_name("cmux"), Terminal::Cmux);
+    assert_eq!(Terminal::Cmux.name().as_deref(), Some("cmux"));
+    assert_eq!(
+        Terminal::from_name(&Terminal::Ghostty.name().unwrap()),
+        Terminal::Ghostty
+    );
+    assert!(Terminal::Cmux.has_tabs());
+    // 登录项、呼出键从 cmux 外面驱动，cmux 不接受。
+    assert!(!Terminal::Cmux.drivable_from_outside());
+    assert!(Terminal::Ghostty.drivable_from_outside() && Terminal::Kaku.drivable_from_outside());
+}
+
+#[test]
+fn cmux_opens_surface_and_types_exec_line() {
+    let cmd = attach_command(
+        Path::new("/Users/me/My Tools/ai"),
+        &SessionId::from("s3"),
+        Path::new("/Users/me/proj x"),
+    );
+    assert_eq!(
+        CmuxOpener::open_args(&cmd),
+        [
+            "--json",
+            "--id-format",
+            "uuids",
+            "new-surface",
+            "--type",
+            "terminal",
+            "--working-directory",
+            "/Users/me/proj x",
+            "--command",
+            " exec '/Users/me/My Tools/ai' attach s3",
+            "--focus",
+            "true"
+        ]
+    );
+    // 聚焦只给 UUID：cmux 自己找它在哪个工作区。
+    assert_eq!(CmuxOpener::focus_args("S"), ["focus-panel", "--panel", "S"]);
+}
+
+#[test]
+fn cmux_cli_comes_from_bundled_path() {
+    let inside = env(&[(
+        "CMUX_BUNDLED_CLI_PATH",
+        "/Opt/cmux.app/Contents/Resources/bin/cmux",
+    )]);
+    assert_eq!(
+        CmuxOpener::new(inside).cli(),
+        Path::new("/Opt/cmux.app/Contents/Resources/bin/cmux")
+    );
+    assert_eq!(
+        CmuxOpener::new(env(&[])).cli(),
+        Path::new("/Applications/cmux.app/Contents/Resources/bin/cmux")
+    );
+}
+
+#[test]
+fn parses_cmux_new_surface_json() {
+    // 字段按 cmux v0.65.2 源码（surface.create 的返回，uuids 模式只留 *_id 和 type）。
+    let out = r#"{"pane_id":"P","surface_id":"S-1","type":"terminal","window_id":"W","workspace_id":"WS"}
+"#;
+    assert_eq!(
+        CmuxOpener::parse_created(out).unwrap(),
+        ("S-1".to_owned(), "WS".to_owned())
+    );
+    assert_eq!(
+        CmuxOpener::parse_created(r#"{"surface_id":"S"}"#).unwrap(),
+        ("S".to_owned(), String::new())
+    );
+    // remote tmux 工作区之类不带 surface 的回答、文本输出都算失败，不瞎记。
+    assert!(CmuxOpener::parse_created(r#"{"surface_id":""}"#).is_err());
+    assert!(CmuxOpener::parse_created("OK surface:5 pane:2 workspace:1").is_err());
+    assert!(CmuxOpener::parse_created("").is_err());
 }
 
 #[test]

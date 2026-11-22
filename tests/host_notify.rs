@@ -149,6 +149,9 @@ impl Drop for Outer {
 
 /// 每收到一行就响一次铃。
 const BELL_PER_LINE: &str = "printf ready; while read l; do printf '\\007'; done";
+/// 每读一行发一次 OSC 7501 blocked（Hermes、OpenCode v2 的写法，ST 结尾），不响铃。
+const BLOCKED_PER_LINE: &str =
+    "printf ready; while read l; do printf '\\033]7501;state=blocked:app=hermes\\033\\\\'; done";
 
 fn daemon_log(home: &Home) -> String {
     fs::read_to_string(home.data.join("daemon.log")).unwrap_or_default()
@@ -441,4 +444,44 @@ fn focus_reports_reach_a_cli_that_asked_for_them_unchanged() {
     outer.wait_for(b"ready");
     outer.type_in(b"\x1b[Ox\x1b[Iy\n");
     outer.wait_for(b"^[[Ox^[[Iy\n");
+}
+
+#[test]
+fn osc7501_blocked_alerts_when_the_tab_is_switched_away() {
+    let mut home = Home::new("n7501out");
+    home.ensure_daemon();
+    let id = register(&home, "s7-1", BLOCKED_PER_LINE);
+    let mut board = BoardLamps::subscribe(&home);
+    let mut outer = Outer::attach(&home, &id);
+    outer.wait_for(b"ready");
+    outer.wait_for(b"\x1b[?1004h");
+    outer.type_in(b"\x1b[O");
+    outer.type_in(b"b\r");
+    outer.wait_for(b"\x1b]7501;state=blocked:app=hermes\x1b\\");
+    board.until("blocked 当响铃", |e| matches!(e, HostEvent::Bell { .. }));
+    // 守护进程（alert_loop 吃同一份 Focus）提醒了，会话台的灯是「刚做完」。
+    wait_notification(&home, "✻ demo\t在等你回复");
+    assert_eq!(board.notifier.state(&id), SessionState::Done);
+}
+
+#[test]
+fn osc7501_blocked_does_not_alert_when_the_tab_is_in_front() {
+    let mut home = Home::new("n7501in");
+    home.ensure_daemon();
+    let id = register(&home, "s7-2", BLOCKED_PER_LINE);
+    let mut board = BoardLamps::subscribe(&home);
+    let mut outer = Outer::attach(&home, &id);
+    outer.wait_for(b"ready");
+    outer.wait_for(b"\x1b[?1004h");
+    outer.type_in(b"\x1b[O");
+    outer.type_in(b"\x1b[I");
+    board.until("切回前台", |e| {
+        matches!(e, HostEvent::Focus { front: true, .. })
+    });
+    outer.type_in(b"b\r");
+    board.until("blocked 当响铃", |e| matches!(e, HostEvent::Bell { .. }));
+    thread::sleep(Duration::from_millis(1000));
+    let text = fs::read_to_string(notifications_log(&home.home)).unwrap_or_default();
+    assert!(text.is_empty(), "在前台不该提醒：{text:?}");
+    assert_eq!(board.notifier.state(&id), SessionState::Waiting);
 }

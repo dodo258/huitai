@@ -1,6 +1,6 @@
-//! 本机实测：在当前终端（Ghostty 或 Kaku）里开两个新标签页，再打开第一条，确认是聚焦而不是开第三个；
+//! 本机实测：在当前终端（Ghostty、Kaku 或 cmux）里开两个新标签页，再打开第一条，确认是聚焦而不是开第三个；
 //! 关掉它再打开，确认会重开。会在真终端里开标签页，结束时关掉自己开的。
-//! 必须在 Ghostty / Kaku 的标签页里、终端窗口在前台时手动跑：
+//! 必须在 Ghostty / Kaku / cmux 的标签页里、终端窗口在前台时手动跑：
 //! `cargo test --test opener_live -- --ignored --nocapture`
 //!
 //! `ai attach` 还没接上托管层，标签页里跑一个替身：打开终端的焦点上报（`ESC[?1004h`），
@@ -53,6 +53,23 @@ fn raw(dir: &Path, id: &str) -> String {
         .to_string()
 }
 
+fn cmux_cli() -> String {
+    std::env::var("CMUX_BUNDLED_CLI_PATH")
+        .unwrap_or_else(|_| "/Applications/cmux.app/Contents/Resources/bin/cmux".to_owned())
+}
+
+/// cmux 当前工作区里的标签页数：`list-panels` 输出里的 UUID 个数（每个标签页一行）。
+fn cmux_panels() -> usize {
+    let ws = std::env::var("CMUX_WORKSPACE_ID").unwrap();
+    let out = Proc::new(cmux_cli())
+        .args(["--id-format", "uuids", "list-panels", "--workspace", &ws])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    println!("cmux list-panels：\n{text}");
+    text.lines().filter(|l| l.matches('-').count() >= 4).count()
+}
+
 fn kaku_cli() -> String {
     std::env::var("WEZTERM_EXECUTABLE")
         .unwrap_or_else(|_| "/Applications/Kaku.app/Contents/MacOS/kaku".to_owned())
@@ -67,6 +84,7 @@ fn tab_count(terminal: &Terminal) -> usize {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
         }
+        Terminal::Cmux => cmux_panels(),
         _ => {
             let out = Proc::new(kaku_cli())
                 .args(["cli", "--no-auto-start", "list", "--format", "json"])
@@ -86,6 +104,20 @@ fn close(handle: &TabHandle) {
                 format!(r#"tell application "Ghostty" to close terminal id "{terminal_id}""#);
             let _ = Proc::new("/usr/bin/osascript")
                 .args(["-e", &script])
+                .output();
+        }
+        TabHandle::Cmux {
+            surface_id,
+            workspace_id,
+        } => {
+            let _ = Proc::new(cmux_cli())
+                .args([
+                    "close-surface",
+                    "--surface",
+                    surface_id,
+                    "--workspace",
+                    workspace_id,
+                ])
                 .output();
         }
         TabHandle::Kaku { pane_id, .. } => {
@@ -122,12 +154,12 @@ fn settle() {
 }
 
 #[test]
-#[ignore = "在真终端里开标签页，手动在 Ghostty / Kaku 里跑"]
+#[ignore = "在真终端里开标签页，手动在 Ghostty / Kaku / cmux 里跑"]
 fn open_then_focus_existing_tab() {
     let terminal = Terminal::current();
     assert!(
         terminal.has_tabs(),
-        "要在 Ghostty 或 Kaku 里跑，当前是 {terminal}"
+        "要在 Ghostty、Kaku 或 cmux 里跑，当前是 {terminal}"
     );
     println!("终端：{terminal}");
     let opener: Box<dyn Opener> = opener_for(&terminal, |k| std::env::var(k).ok());
@@ -217,6 +249,15 @@ fn open_then_focus_existing_tab() {
         Terminal::Ghostty => TabHandle::Ghostty {
             terminal_id: "00000000-0000-0000-0000-000000000000".to_owned(),
         },
+        Terminal::Cmux => {
+            let TabHandle::Cmux { workspace_id, .. } = tabs.records()[&b].handle.clone() else {
+                unreachable!()
+            };
+            TabHandle::Cmux {
+                surface_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+                workspace_id,
+            }
+        }
         _ => {
             let TabHandle::Kaku { pane_id, tty, .. } = tabs.records()[&b].handle.clone() else {
                 unreachable!()

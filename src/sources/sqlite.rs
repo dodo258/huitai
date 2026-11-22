@@ -114,9 +114,13 @@ fn immutable_uri(db: &Path) -> String {
     uri
 }
 
-/// 拼进 SQL 的 id 只允许字母数字和 `-`，其余拒绝。
+/// 拼进 SQL 的 id 只允许字母数字、`-` 和 `_`（Hermes 的 id 带下划线），其余拒绝。
 pub(crate) fn safe_id(id: &str) -> Option<&str> {
-    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')).then_some(id)
+    (!id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then_some(id)
 }
 
 #[cfg(test)]
@@ -134,6 +138,10 @@ mod tests {
     #[test]
     fn safe_id_rejects_quotes() {
         assert_eq!(safe_id("019b-AF"), Some("019b-AF"));
+        assert_eq!(
+            safe_id("20261122_213015_a1b2c3"),
+            Some("20261122_213015_a1b2c3")
+        );
         assert_eq!(safe_id("x' or 1=1 --"), None);
         assert_eq!(safe_id(""), None);
     }

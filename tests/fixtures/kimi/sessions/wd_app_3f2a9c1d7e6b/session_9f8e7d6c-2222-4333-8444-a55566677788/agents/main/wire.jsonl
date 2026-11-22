@@ -1,0 +1,2 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1795000000000}
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>注入</system-reminder>"}],"id":"m90001","toolCalls":[],"origin":{"kind":"injection"}},"time":1795000090001}

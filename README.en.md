@@ -2,7 +2,7 @@
 
 # huitai `ai`
 
-Type `ai` in your terminal to see every Claude Code, Codex and pi conversation on this Mac, grouped by project. Press Enter to pick one back up. Close the window and it keeps running in the background.
+Type `ai` in your terminal to see every Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Qwen Code conversation on this Mac, grouped by project. Press Enter to pick one back up. Close the window and it keeps running in the background.
 
 [![Release](https://img.shields.io/github/v/release/dodo258/huitai?label=release&color=16181D)](https://github.com/dodo258/huitai/releases/latest) [![License](https://img.shields.io/badge/license-MIT-16181D)](LICENSE) ![macOS](https://img.shields.io/badge/macOS-16181D?logo=apple&logoColor=white) ![Rust](https://img.shields.io/badge/Rust-16181D?logo=rust&logoColor=white)
 
@@ -21,9 +21,9 @@ Type `ai` in your terminal to see every Claude Code, Codex and pi conversation o
 
 ## What it is
 
-A command-line tool that lives in your terminal. It is not a terminal and it does not use tmux. You keep your own terminal (Ghostty, Kaku or anything else); huitai does three things:
+A command-line tool that lives in your terminal. It is not a terminal and it does not use tmux. You keep your own terminal (Ghostty, Kaku, cmux or anything else); huitai does three things:
 
-- **Find**: conversations from all three tools in one place, grouped by project, newest first, with search over titles and message text.
+- **Find**: conversations from every tool in one place, grouped by project, newest first, with search over titles and message text.
 - **Resume**: Enter opens the conversation in a new tab in its project directory; if it is already open, that tab comes to the front.
 - **Keep running**: conversations run inside huitai's own background daemon, so closing the tab or the whole terminal does not stop them. Press Enter later and the screen and history are still there. After a power cut, the interrupted ones are listed and can all be resumed with one key.
 
@@ -45,7 +45,7 @@ Or build from source (needs a recent stable Rust, `rustup update stable`):
 cargo install --locked --git https://github.com/dodo258/huitai
 ```
 
-**Requirements**: macOS (developed and tested on macOS 27 with Apple silicon; the Intel build is compiled but not tested on real hardware). Opening conversations in a new tab needs [Ghostty](https://ghostty.org) 1.3 or later or [Kaku](https://github.com/tw93/Kaku); other terminals open them in the current window. Whichever of Claude Code, Codex and pi you have installed shows up. The CLIs can live anywhere on your PATH, and if you moved their data with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, huitai looks there too.
+**Requirements**: macOS (developed and tested on macOS 27 with Apple silicon; the Intel build is compiled but not tested on real hardware). Opening conversations in a new tab needs [Ghostty](https://ghostty.org) 1.3 or later, [Kaku](https://github.com/tw93/Kaku) or [cmux](https://cmux.com); other terminals open them in the current window (cmux does not support opening at login or ⌥Space opening a new board, because it refuses control from outside). Whichever of Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Qwen Code you have installed shows up. The CLIs can live anywhere on your PATH, and if you moved their data with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, huitai looks there too.
 
 **Footprint**: about 27 MB of memory while the list is open and about 22 MB for the idle background daemon (measured on an Apple M4 Max); when nothing is running it does not redraw and uses almost no CPU.
 
@@ -77,13 +77,13 @@ A header row tops the list: projects on the left, then columns for status, backg
 
 Status lights in the list: a spinning green half-circle `◐` is running, `◆` is waiting for you (slowly blinking), `✓` just finished, `○` stopped. The moment a conversation stops running (done, or waiting for you) its whole row lights up and fades out over a couple of seconds; a collapsed project lights its header instead. Pale green means the conversation is open somewhere else (the desktop app, say): spinning while it works, still while it is just open; you are asked before opening it.
 
-Right after the seal, the top bar totals all three tools: conversations huitai hosts that are running (`◐3 在跑`) or waiting for you (`◆1 等你`), and conversations open elsewhere (`●2 别处`); zeros are left out. Click the waiting count to jump to the next one waiting for you, or the elsewhere count to jump to the next one open elsewhere.
+Right after the seal, the top bar totals every tool: conversations huitai hosts that are running (`◐3 在跑`) or waiting for you (`◆1 等你`), and conversations open elsewhere (`●2 别处`); zeros are left out. Click the waiting count to jump to the next one waiting for you, or the elsewhere count to jump to the next one open elsewhere.
 
 ## Tips
 
 - Type `ai` inside a project directory (or any subdirectory) and that project opens expanded.
-- `!` jumps to the next conversation waiting for you, across all three tools; clicking `◆` in the top bar does the same. Clicking `●N 别处` in the top bar jumps to the next one open elsewhere, such as the desktop app.
-- `s` lists every conversation waiting for you or running, across all three tools, with the waiting ones first, so you can see at a glance which ones are stuck; `Esc` goes back to the list.
+- `!` jumps to the next conversation waiting for you, across every tool; clicking `◆` in the top bar does the same. Clicking `●N 别处` in the top bar jumps to the next one open elsewhere, such as the desktop app.
+- `s` lists every conversation waiting for you or running, across every tool, with the waiting ones first, so you can see at a glance which ones are stuck; `Esc` goes back to the list.
 - `v` (or `→`) shows the whole conversation, read-only: it starts at the end, tool calls are folded into one line (`t` unfolds them), and when opened from search results the search words are highlighted and `n` jumps to the next one. Once you are sure it is the right one, `⏎` continues it.
 - `⌥Space` brings up huitai from anywhere. It works once the daemon is up, which happens the first time you open a conversation.
 - `c` copies the resume command (`cd 'dir' && claude --resume …`); paste it into any terminal to continue.
@@ -116,7 +116,7 @@ Every action is a single key. The bottom bar shows the most common ones; `?` sho
 | | `/` | Search titles and text |
 | | `1-9` | Jump to a project |
 | | `!` | Next conversation waiting for you (any tool) |
-| | `s` | Everything waiting for you or running, all three tools in one list |
+| | `s` | Everything waiting for you or running, every tool in one list |
 | | `v` / `→` | Read the whole conversation (`t` unfolds tool calls) |
 | | `b` | Show / hide background conversations |
 | Open | `⏎` | Open in a new tab |
@@ -148,8 +148,8 @@ There are five commands: `ai` (the list), `ai doctor` (self-check), `ai update` 
 
 | | huitai | Rex |
 |---|---|---|
-| What it is | One command, `ai`, inside the terminal you already use (Ghostty, Kaku, others) | A standalone terminal app that replaces your current terminal |
-| Which conversations | Every past Claude Code, Codex and pi conversation on this Mac, grouped by project, full-text searchable, resumed with Enter | Sessions opened in Rex; shows which Claude Code, Codex, OpenCode or pi session is working or waiting for you |
+| What it is | One command, `ai`, inside the terminal you already use (Ghostty, Kaku, cmux, others) | A standalone terminal app that replaces your current terminal |
+| Which conversations | Every past Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Qwen Code conversation on this Mac, grouped by project, full-text searchable, resumed with Enter | Sessions opened in Rex; shows which Claude Code, Codex, OpenCode or pi session is working or waiting for you |
 | Quota | Top bar shows Claude and Codex limit windows and pi's tokens today | Not mentioned in the official material |
 | Several machines | This Mac only | Its strength: connect to Rex servers on other machines; iOS and other clients are on the way |
 | Getting it | One-line install, MIT licensed | Join the mailing list and wait for an invite; free, no account needed |

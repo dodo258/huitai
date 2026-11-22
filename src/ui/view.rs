@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use crate::core::{QuotaReading, QuotaValue, SessionState, Vendor};
 use crate::host::{CellColor, ScreenSnapshot, attr};
 use crate::index::Entry;
+use crate::quota;
 use crate::sources::Role;
 
 use super::app::{App, Overlay, Prompt, TERMINAL_CHOICES};
@@ -153,7 +154,7 @@ fn keep_visible(app: &mut App, height: u16) {
         Some(s) if !s.query.is_empty() => fix(s.selected, &mut s.offset),
         _ => {
             let v = app.vendor;
-            let l = &mut app.lists[Vendor::ALL.iter().position(|x| *x == v).unwrap_or(0)];
+            let l = &mut app.lists[v.index()];
             let len = l.rows.len();
             l.offset = l.offset.min(len.saturating_sub(h));
             fix(l.selected, &mut l.offset);
@@ -300,6 +301,30 @@ fn top_layouts(hint: bool) -> Vec<(StatusForm, Option<QuotaCut>, bool, bool)> {
     out
 }
 
+/// 标签几时缩成标记：装了五家以上时，放不下先缩标签（当前这家留全名），再按 `layouts` 依次去掉别的；
+/// 少于五家时标签一直写全名，别的都去掉了还放不下才缩。
+fn with_tab_forms<L: Copy>(layouts: Vec<L>, tabs: usize) -> Vec<(L, bool)> {
+    const MANY_TABS: usize = 5;
+    let Some(&last) = layouts.last() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(L, bool)> = Vec::new();
+    for (i, l) in layouts.into_iter().enumerate() {
+        if tabs >= MANY_TABS {
+            if i == 0 {
+                out.push((l, false));
+            }
+            out.push((l, true));
+        } else {
+            out.push((l, false));
+        }
+    }
+    if tabs < MANY_TABS {
+        out.push((last, true));
+    }
+    out
+}
+
 /// 全局状态，分两段（各自单击做的事不同）：会话台自己托管的在跑（绿）、等你回复（黄，慢闪的暗半拍换暗色），
 /// 和别处在用（柔绿；有正在干活的就转圈）。都没有就是空的。
 fn status_spans(
@@ -358,16 +383,28 @@ fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
     app.areas.elsewhere = Rect::default();
     let accent = t.accent(app.vendor);
     let seal = " 会话台 ";
-    let tabs: Vec<(Vendor, String)> = app
-        .shown
-        .iter()
-        .copied()
-        .map(|v| (v, format!("{} {}", v.mark(), v.name())))
-        .collect();
+    // 缩写的标签：别的家只写标记字符，当前这家写全名。
+    let tabs_of = |compact: bool| -> Vec<(Vendor, String)> {
+        app.shown
+            .iter()
+            .map(|&v| {
+                let label = if compact && v != app.vendor {
+                    v.mark().to_string()
+                } else {
+                    format!("{} {}", v.mark(), v.name())
+                };
+                (v, label)
+            })
+            .collect()
+    };
     // 标签之间隔一道淡竖线（两边各一格空）。
     const TAB_DIVIDER: &str = " │ ";
-    let tabs_w: usize = tabs.iter().map(|(_, l)| width(l)).sum::<usize>()
-        + width(TAB_DIVIDER) * tabs.len().saturating_sub(1);
+    let tabs_width = |tabs: &[(Vendor, String)]| {
+        tabs.iter().map(|(_, l)| width(l)).sum::<usize>()
+            + width(TAB_DIVIDER) * tabs.len().saturating_sub(1)
+    };
+    let full_w = tabs_width(&tabs_of(false));
+    let compact_w = tabs_width(&tabs_of(true));
     // 后台是旧版的提示比新版提醒要紧，两条只放一条。
     let hint = app
         .old_host
@@ -388,21 +425,24 @@ fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
         let (a, b) = (line_width(own), line_width(other));
         a + b + if a > 0 && b > 0 { 2 } else { 0 }
     };
-    let left_w = |status: &(Vec<Span>, Vec<Span>)| {
+    let left_w = |status: &(Vec<Span>, Vec<Span>), compact: bool| {
         let sw = status_w(status);
+        let tabs_w = if compact { compact_w } else { full_w };
         1 + width(seal) + if sw > 0 { 1 + sw } else { 0 } + gap.len() + tabs_w
     };
     // 从全到简挑第一种放得下的；连最简的都放不下（很窄）就只有印章和标签。
-    let (status, right) = top_layouts(hint.is_some())
+    let (status, right, compact) = with_tab_forms(top_layouts(hint.is_some()), app.shown.len())
         .into_iter()
-        .map(|(form, cut, with_hint, with_elsewhere)| {
+        .map(|((form, cut, with_hint, with_elsewhere), compact)| {
             let mut status = status_spans(app, form, t);
             if !with_elsewhere {
                 status.1.clear();
             }
-            let mut right = cut.map_or_else(Vec::new, |c| {
-                quota_spans(app.quota.get(&app.vendor), app.now, app.vendor, t, c)
-            });
+            let mut right = cut
+                .filter(|_| quota::supported(app.vendor))
+                .map_or_else(Vec::new, |c| {
+                    quota_spans(app.quota.get(&app.vendor), app.now, app.vendor, t, c)
+                });
             if let Some(h) = hint.as_ref().filter(|_| with_hint) {
                 let lead = if right.is_empty() { "" } else { gap };
                 right.splice(
@@ -410,13 +450,14 @@ fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
                     [sp(h.clone(), fg(t.faint)), sp(lead, Style::default())],
                 );
             }
-            (status, right)
+            (status, right, compact)
         })
-        .find(|(status, right)| {
+        .find(|(status, right, compact)| {
             let rw = line_width(right);
-            left_w(status) + if rw > 0 { 2 + rw } else { 0 } < total
+            left_w(status, *compact) + if rw > 0 { 2 + rw } else { 0 } < total
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| (Default::default(), Vec::new(), true));
+    let tabs = tabs_of(compact);
 
     // 印章：反白，底色是当前这家的强调色，字是顶栏底色。整个界面唯一的大胆元素。
     let mut x = area.x + 1;
@@ -717,7 +758,7 @@ fn board(
     t: &Theme,
     accent: Color,
 ) {
-    const LABEL: &str = "等你回复和在跑的 · 三家";
+    const LABEL: &str = "等你回复和在跑的 · 各家";
     let line = |i: u16| Rect {
         y: area.y + i,
         height: 1,
@@ -1954,4 +1995,24 @@ fn settings(buf: &mut Buffer, area: Rect, app: &App, cursor: usize, t: &Theme, a
         )],
         vec![],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_tab_forms;
+
+    #[test]
+    fn tabs_shrink_first_only_with_five_or_more() {
+        // 少于五家：每种写法都用全名，最后再加一种缩写的。
+        assert_eq!(
+            with_tab_forms(vec![1, 2, 3], 4),
+            [(1, false), (2, false), (3, false), (3, true)]
+        );
+        // 五家以上：最全的写法先试全名，放不下就缩标签，之后都是缩写的。
+        assert_eq!(
+            with_tab_forms(vec![1, 2, 3], 5),
+            [(1, false), (1, true), (2, true), (3, true)]
+        );
+        assert!(with_tab_forms(Vec::<u8>::new(), 5).is_empty());
+    }
 }

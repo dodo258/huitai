@@ -56,7 +56,7 @@ pub fn open_terminal(preferred: Option<&str>, current: Terminal) -> Option<Termi
         .map(Terminal::from_name)
         .into_iter()
         .chain([current])
-        .find(Terminal::has_tabs)
+        .find(Terminal::drivable_from_outside)
 }
 
 /// 切到会话台所在的标签页。`Ok(false)`：认不出它在哪（其他终端、缺 tty、窗格已不是它）。
@@ -79,7 +79,8 @@ fn focus_board(board: &BoardInfo) -> io::Result<bool> {
             Some(h) => h,
             None => return Ok(false),
         },
-        Terminal::Other(_) => return Ok(false),
+        // cmux 不接受守护进程控制它；认不出就新开（落到首选终端）。
+        Terminal::Cmux | Terminal::Other(_) => return Ok(false),
     };
     opener::opener_for(&term, |k| std::env::var(k).ok()).focus(&handle)
 }

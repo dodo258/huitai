@@ -293,3 +293,82 @@ fn focus_decides_whether_the_open_tab_is_in_front() {
     assert_eq!(n.state(&id("a")), SessionState::Done);
     assert_eq!(n.poll(t1 + Duration::from_secs(1)).len(), 1);
 }
+
+// —— 安静超时：答完不发提醒信号的 CLI（pi）——
+
+fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+#[test]
+fn quiet_running_session_becomes_done_without_alert() {
+    let t0 = Instant::now();
+    let mut n = Notifier::with_quiet(secs(20));
+    started(&mut n, "a", t0);
+    n.notify(id("a"), Activity::Output, t0 + secs(5));
+    assert!(n.settle(t0 + secs(24)).is_empty());
+    assert_eq!(n.state(&id("a")), SessionState::Running);
+    assert_eq!(n.settle(t0 + secs(25)), vec![id("a")]);
+    assert_eq!(n.state(&id("a")), SessionState::Done);
+    // 只改状态灯：不产生提醒，也不重复报变化。
+    assert!(n.poll(t0 + secs(60)).is_empty());
+    assert!(n.settle(t0 + secs(60)).is_empty());
+}
+
+#[test]
+fn quiet_in_front_is_waiting() {
+    let t0 = Instant::now();
+    let mut n = Notifier::with_quiet(secs(20));
+    started(&mut n, "a", t0);
+    n.notify(id("a"), Activity::Attached, t0);
+    n.notify(id("a"), Activity::Focus(true), t0);
+    n.settle(t0 + secs(20));
+    assert_eq!(n.state(&id("a")), SessionState::Waiting);
+}
+
+#[test]
+fn output_after_quiet_runs_again_and_redraw_rules_still_apply() {
+    let t0 = Instant::now();
+    let mut n = Notifier::with_quiet(secs(20));
+    started(&mut n, "a", t0);
+    n.settle(t0 + secs(20));
+    assert_eq!(n.state(&id("a")), SessionState::Done);
+    n.notify(id("a"), Activity::Output, t0 + secs(30));
+    assert_eq!(n.state(&id("a")), SessionState::Running);
+    // 又安静了 20 秒：再停。
+    assert!(n.settle(t0 + secs(49)).is_empty());
+    assert_eq!(n.settle(t0 + secs(50)), vec![id("a")]);
+    // 响铃之后 2 秒内的收尾重画不算开跑（原有规则不变）。
+    n.notify(id("a"), Activity::Output, t0 + secs(60));
+    n.notify(id("a"), Activity::Bell, t0 + secs(61));
+    n.notify(
+        id("a"),
+        Activity::Output,
+        t0 + secs(61) + REDRAW_GRACE - ms(1),
+    );
+    assert_eq!(n.state(&id("a")), SessionState::Done);
+}
+
+#[test]
+fn steady_output_never_settles() {
+    let t0 = Instant::now();
+    let mut n = Notifier::with_quiet(secs(20));
+    started(&mut n, "a", t0);
+    for s in 1..=300 {
+        n.notify(id("a"), Activity::Output, t0 + secs(s));
+        assert!(n.settle(t0 + secs(s)).is_empty());
+    }
+    assert_eq!(n.state(&id("a")), SessionState::Running);
+}
+
+#[test]
+fn real_bell_after_quiet_still_alerts() {
+    let t0 = Instant::now();
+    let mut n = Notifier::with_quiet(secs(20));
+    started(&mut n, "a", t0);
+    n.settle(t0 + secs(20));
+    n.notify(id("a"), Activity::Bell, t0 + secs(30));
+    let alerts = n.poll(t0 + secs(30) + COALESCE);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].id, id("a"));
+}

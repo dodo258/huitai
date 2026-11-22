@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>会话台 ai · 终端里的 AI 对话台</title>
-<meta name="description" content="在终端里敲 ai，本机 Claude Code、Codex、pi 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。macOS，MIT 开源。">
+<meta name="description" content="在终端里敲 ai，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。macOS，MIT 开源。">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#1d1e23" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#e9e9e6" media="(prefers-color-scheme: light)">
 <meta property="og:type" content="website">
 <meta property="og:title" content="会话台 ai">
-<meta property="og:description" content="在终端里敲 ai，本机 Claude Code、Codex、pi 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。">
+<meta property="og:description" content="在终端里敲 ai，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。">
 <meta property="og:image" content="https://huitai.agentq.cc/img/board-dark.png?v=79ec7763">
 <meta property="og:locale" content="zh_CN">
 <meta name="twitter:card" content="summary_large_image">
@@ -35,8 +35,8 @@
 	<section class="hero">
 		<div class="wrap">
 			<h1><span class="stamp">会话台</span><code>ai</code></h1>
-			<p class="tag">终端里敲 <code>ai</code>，三家 AI 的对话按项目列出来。<br>回车接着聊，关掉窗口照样在后台跑。</p>
-			<p class="lead">本机 Claude Code、Codex、pi 装了哪家就列哪家。它是装在终端里的命令行工具，不是终端，也不用 tmux：你照样用自己的 Ghostty、Kaku 或别的终端。</p>
+			<p class="tag">终端里敲 <code>ai</code>，各家 AI 的对话按项目列出来。<br>回车接着聊，关掉窗口照样在后台跑。</p>
+			<p class="lead">本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 装了哪家就列哪家。它是装在终端里的命令行工具，不是终端，也不用 tmux：你照样用自己的 Ghostty、Kaku 或别的终端。</p>
 			<div class="cmd">
 				<code>curl -fsSL https://github.com/dodo258/huitai/releases/latest/download/install.sh | sh</code>
 				<button class="copy" type="button" data-done="已复制">复制</button>
@@ -70,7 +70,7 @@
 			<dl class="rows">
 				<div>
 					<dt>找得到</dt>
-					<dd>三家的对话放在一起，按项目分组、按时间排，标题和正文都能搜。在项目目录里敲 <code>ai</code>，这个项目自动展开。</dd>
+					<dd>各家的对话放在一起，按项目分组、按时间排，标题和正文都能搜。在项目目录里敲 <code>ai</code>，这个项目自动展开。</dd>
 					<dd class="keys"><span><kbd>Tab</kbd> 换一家</span><span><kbd>/</kbd> 搜标题和正文</span></dd>
 				</div>
 				<div>
@@ -110,7 +110,7 @@
 			<dl class="rows">
 				<div>
 					<dt>只读本机</dt>
-					<dd>只读三家在本机的会话文件，不改它们的配置（<code>~/.claude/settings.json</code>、<code>~/.codex/config.toml</code>、<code>~/.pi/agent/</code>）。唯一会动厂商文件的是删除：移进会话台回收站，能恢复。</dd>
+					<dd>只读各家在本机的会话文件，不改它们的配置（<code>~/.claude/settings.json</code>、<code>~/.codex/config.toml</code>、<code>~/.pi/agent/</code>）。唯一会动厂商文件的是删除：移进会话台回收站，能恢复。</dd>
 				</div>
 				<div>
 					<dt>不上传</dt>
@@ -140,7 +140,7 @@
 				<div><dt><kbd>Enter</kbd></dt><dd>新标签页打开</dd></div>
 				<div><dt><kbd>w</kbd></dt><dd>当前窗口打开</dd></div>
 				<div><dt><kbd>n</kbd></dt><dd>在这个项目开新对话</dd></div>
-				<div><dt><kbd>!</kbd></dt><dd>下一条等你回复的，三家轮着找</dd></div>
+				<div><dt><kbd>!</kbd></dt><dd>下一条等你回复的，各家轮着找</dd></div>
 				<div><dt><kbd>c</kbd></dt><dd>复制恢复命令</dd></div>
 				<div><dt><kbd>d</kbd> <kbd>u</kbd></dt><dd>进回收站 / 找回</dd></div>
 				<div><dt><kbd>m</kbd></dt><dd>新建项目，或在别的目录开对话</dd></div>
@@ -158,7 +158,7 @@
 			<div class="compare">
 				<div class="head"><span></span><span>会话台</span><span>Rex</span></div>
 				<div><span class="k">是什么</span><p data-who="会话台">装在你现有终端里的一条命令 <code>ai</code>，Ghostty、Kaku 照用</p><p data-who="Rex">一个独立的终端 App，替换你现在的终端</p></div>
-				<div><span class="k">管哪些对话</span><p data-who="会话台">本机三家的全部历史对话，按项目分组、全文搜索，回车接着聊</p><p data-who="Rex">在 Rex 里开的会话；标出 Claude Code、Codex、OpenCode、pi 谁在干活、谁在等你</p></div>
+				<div><span class="k">管哪些对话</span><p data-who="会话台">本机各家的全部历史对话，按项目分组、全文搜索，回车接着聊</p><p data-who="Rex">在 Rex 里开的会话；标出 Claude Code、Codex、OpenCode、pi 谁在干活、谁在等你</p></div>
 				<div><span class="k">额度</span><p data-who="会话台">顶栏显示 Claude、Codex 的限额窗口和 pi 的今日 token</p><p data-who="Rex" class="none">官方资料里没提到</p></div>
 				<div><span class="k">多台机器</span><p data-who="会话台">只管本机</p><p data-who="Rex">强项：连接别的机器上的 Rex 服务，iOS 等客户端在路上</p></div>
 				<div><span class="k">怎么拿到</span><p data-who="会话台">一行命令安装，MIT 开源</p><p data-who="Rex">加入邮件列表等邀请，免费、不用注册账号</p></div>
@@ -187,7 +187,7 @@
 
 <footer class="foot">
 	<div class="wrap">
-		<span>v0.1.2</span>
+		<span>v0.1.3</span>
 		<a href="https://github.com/dodo258/huitai/blob/main/LICENSE">MIT 许可</a>
 		<a href="https://github.com/dodo258/huitai">GitHub</a>
 		<a href="https://github.com/dodo258/huitai/issues">提问题</a>

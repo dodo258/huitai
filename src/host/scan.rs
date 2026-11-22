@@ -1,4 +1,5 @@
-//! 输出扫描：PTY 输出原样放行，只改写 OSC 0/1/2 标题（加前缀），并认出 BEL、OSC 9、OSC 777 通知。
+//! 输出扫描：PTY 输出原样放行，只改写 OSC 0/1/2 标题（加前缀），并认出 BEL、OSC 9、OSC 777 通知、
+//! OSC 7501 程序状态（Hermes、OpenCode v2 发）和 Gemini CLI 的「✋ Action Required」等待标题。
 //!
 //! 流式处理：序列被拆在两次读里也能认。只有标题序列在结束前会被暂扣（上限 [`MAX_HELD`] 字节，
 //! 超了就原样放出、不再改写），其余字节一律立即原样输出。
@@ -23,6 +24,29 @@ pub enum Signal {
     },
     /// CLI 设的标题（未加前缀）。
     Title(String),
+    /// CLI 报告的程序状态：OSC 7501 的 `state=`，或 Gemini 的等待标题（算 [`Status::Blocked`]）。
+    Status(Status),
+}
+
+/// OSC 7501 里会话台关心的状态（`idle`、`clear` 和不认识的不报）。
+/// 格式：`ESC ] 7501 ; key=value:key=value… ST`，`state` 必有，例 `state=blocked:kind=permission:app=hermes`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// 在跑。
+    Working,
+    /// 要你回复（权限、提问、登录）。
+    Blocked,
+    /// 做完了，等你看结果。
+    Done,
+    /// 出错停下了。
+    Error,
+}
+
+impl Status {
+    /// 停下来要你回来看（提醒、状态灯走和响铃一样的路）。
+    pub fn needs_you(self) -> bool {
+        self != Status::Working
+    }
 }
 
 #[derive(Debug)]
@@ -57,6 +81,8 @@ pub struct Scanner {
     prefix: Vec<u8>,
     state: State,
     held: Vec<u8>,
+    /// 上一次 CLI 设的标题是 Gemini 的等待标题：同一个标题重发不再报。
+    title_waiting: bool,
 }
 
 impl Scanner {
@@ -66,6 +92,7 @@ impl Scanner {
             prefix: prefix.as_bytes().to_vec(),
             state: State::Ground,
             held: Vec::new(),
+            title_waiting: false,
         }
     }
 
@@ -236,7 +263,7 @@ impl Scanner {
             }
             _ => {
                 out.push(b);
-                if matches!(ps, Some(9 | 777)) && note.len() < MAX_NOTE {
+                if matches!(ps, Some(9 | 777 | 7501)) && note.len() < MAX_NOTE {
                     note.push(b);
                 }
                 State::OscOther { ps, note }
@@ -252,7 +279,13 @@ impl Scanner {
         signals: &mut Vec<Signal>,
     ) {
         let body = &self.held[body_start..];
-        signals.push(Signal::Title(String::from_utf8_lossy(body).into_owned()));
+        let title = String::from_utf8_lossy(body).into_owned();
+        let waiting = is_waiting_title(&title);
+        signals.push(Signal::Title(title));
+        if waiting && !self.title_waiting {
+            signals.push(Signal::Status(Status::Blocked));
+        }
+        self.title_waiting = waiting;
         out.extend_from_slice(&self.held[..body_start]);
         out.extend_from_slice(&self.prefix);
         out.extend_from_slice(body);
@@ -281,8 +314,35 @@ fn finish_note(ps: Option<u32>, note: &[u8], signals: &mut Vec<Signal>) {
                 signals.push(Signal::Notify { title, body });
             }
         }
+        Some(7501) => {
+            if let Some(status) = parse_status(&text) {
+                signals.push(Signal::Status(status));
+            }
+        }
         _ => {}
     }
+}
+
+/// OSC 7501 正文里的 `state=`。查询（`?` 开头）和其余状态不算。
+fn parse_status(text: &str) -> Option<Status> {
+    let state = text
+        .split(':')
+        .find_map(|pair| pair.strip_prefix("state="))?;
+    match state {
+        "working" => Some(Status::Working),
+        "blocked" => Some(Status::Blocked),
+        "done" => Some(Status::Done),
+        "error" => Some(Status::Error),
+        _ => None,
+    }
+}
+
+/// Gemini CLI 等你确认时把窗口标题设成 `✋  Action Required (目录)`（`ui.dynamicWindowTitle`，默认开）。
+fn is_waiting_title(title: &str) -> bool {
+    title
+        .trim_start()
+        .strip_prefix('✋')
+        .is_some_and(|rest| rest.trim_start().starts_with("Action Required"))
 }
 
 fn is_conemu_subcommand(text: &str) -> bool {
@@ -412,5 +472,95 @@ mod tests {
     fn osc_without_params_passes_through() {
         let input = b"\x1b]\x07\x1b]abc\x07";
         assert_eq!(scan(input), (input.to_vec(), vec![]));
+    }
+
+    #[test]
+    fn osc7501_states_are_signals_with_both_terminators() {
+        let cases = [
+            ("working", Some(Status::Working)),
+            ("blocked", Some(Status::Blocked)),
+            ("done", Some(Status::Done)),
+            ("error", Some(Status::Error)),
+            ("idle", None),
+            ("clear", None),
+            ("bogus", None),
+        ];
+        for (state, want) in cases {
+            for end in ["\x07", "\x1b\\"] {
+                let input = format!("a\x1b]7501;state={state}:app=hermes{end}b");
+                let (out, sig) = scan(input.as_bytes());
+                assert_eq!(out, input.as_bytes(), "{state} 字节要原样");
+                let want: Vec<_> = want.into_iter().map(Signal::Status).collect();
+                assert_eq!(sig, want, "{state} {end:?}");
+                assert_eq!(scan_bytewise(input.as_bytes()), (input.into_bytes(), want));
+            }
+        }
+    }
+
+    #[test]
+    fn osc7501_state_can_come_after_other_keys() {
+        let input = b"\x1b]7501;app=opencode:kind=permission:state=blocked:msg=QXBwbHk/\x1b\\";
+        assert_eq!(
+            scan(input),
+            (input.to_vec(), vec![Signal::Status(Status::Blocked)])
+        );
+    }
+
+    #[test]
+    fn osc7501_split_across_reads_is_recognised() {
+        let input = b"x\x1b]7501;state=done:app=hermes\x1b\\y\x1b]7501;state=error\x07z";
+        let want = vec![Signal::Status(Status::Done), Signal::Status(Status::Error)];
+        // 每个位置切一刀都一样。
+        for cut in 0..input.len() {
+            let (a, b) = input.split_at(cut);
+            assert_eq!(
+                scan_chunks(&[a, b]),
+                (input.to_vec(), want.clone()),
+                "切在 {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc7501_query_and_missing_state_are_ignored() {
+        let input = b"\x1b]7501;?\x07\x1b]7501;app=hermes\x07\x1b]7501;xstate=done\x07\x1b]75010;state=done\x07";
+        assert_eq!(scan(input), (input.to_vec(), vec![]));
+    }
+
+    #[test]
+    fn gemini_action_required_title_means_waiting_once() {
+        let input = "\x1b]0;✦  Working… (demo)\x07\x1b]0;✋  Action Required (demo)\x07\x1b]0;✋  Action Required (demo)\x07\x1b]0;◇  Ready (demo)\x07\x1b]2;✋ Action Required\x1b\\";
+        let (out, sig) = scan(input.as_bytes());
+        let want_out = input
+            .replace("\x1b]0;", &format!("\x1b]0;{PREFIX}"))
+            .replace("\x1b]2;", &format!("\x1b]2;{PREFIX}"));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            want_out,
+            "只加前缀，其余原样"
+        );
+        let title = |t: &str| Signal::Title(t.to_owned());
+        assert_eq!(
+            sig,
+            vec![
+                title("✦  Working… (demo)"),
+                title("✋  Action Required (demo)"),
+                Signal::Status(Status::Blocked),
+                title("✋  Action Required (demo)"),
+                title("◇  Ready (demo)"),
+                title("✋ Action Required"),
+                Signal::Status(Status::Blocked),
+            ]
+        );
+        assert_eq!(scan_bytewise(input.as_bytes()).1, sig);
+    }
+
+    #[test]
+    fn titles_merely_mentioning_action_required_are_not_waiting() {
+        let (_, sig) = scan("\x1b]2;fix Action Required banner\x07".as_bytes());
+        assert_eq!(
+            sig,
+            vec![Signal::Title("fix Action Required banner".into())]
+        );
     }
 }

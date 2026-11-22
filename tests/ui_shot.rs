@@ -240,6 +240,132 @@ const PI: &[Fake] = &[
     },
 ];
 
+const HERMES: &[Fake] = &[
+    Fake {
+        project: "projects/api",
+        title: "整理接口文档的目录结构",
+        mins: 25,
+        turns: &[
+            (
+                "接口文档按模块分目录，旧链接要能跳过去",
+                "已按订单、用户、支付三块分好目录，旧路径都加了重定向。",
+            ),
+            (
+                "顺便把示例请求都跑一遍",
+                "跑了 14 个示例，2 个字段名过期，已改。",
+            ),
+        ],
+    },
+    Fake {
+        project: "projects/blog",
+        title: "把草稿里的图片压一遍",
+        mins: 60 * 30,
+        turns: &[(
+            "草稿里的图片太大了",
+            "压好了，平均小了六成，肉眼看不出差别。",
+        )],
+    },
+];
+
+const KIMI: &[Fake] = &[
+    Fake {
+        project: "projects/blog",
+        title: "首页图片改成懒加载",
+        mins: 18,
+        turns: &[
+            ("首页图片改成懒加载", "首屏以下的图片都加了 loading=lazy。"),
+            (
+                "再量一下首屏时间",
+                "首屏从 2.4 秒降到 1.6 秒，主要省在图片请求上。",
+            ),
+        ],
+    },
+    Fake {
+        project: "projects/shop",
+        title: "商品详情页加骨架屏",
+        mins: 60 * 8,
+        turns: &[(
+            "商品详情页加载时先显示骨架屏",
+            "加好了，图片和价格区各一块，数据到了淡出。",
+        )],
+    },
+];
+
+const GEMINI: &[Fake] = &[
+    Fake {
+        project: "projects/blog",
+        title: "文章页加目录，能折叠",
+        mins: 40,
+        turns: &[
+            ("文章页加一个目录", "按 h2、h3 生成了目录，放在正文右侧。"),
+            ("目录要能折叠", "加了折叠按钮，状态记在 localStorage。"),
+        ],
+    },
+    Fake {
+        project: "projects/api",
+        title: "看 README 的部署步骤对不对",
+        mins: 60 * 50,
+        turns: &[("看 README 的部署步骤对不对", "第三步少了 npm run build。")],
+    },
+];
+
+const OPENCODE: &[Fake] = &[
+    Fake {
+        project: "projects/shop",
+        title: "给登录页加验证码",
+        mins: 40,
+        turns: &[
+            (
+                "给登录页加验证码，别太难认",
+                "加好了，用的滑块，改了 src/login.tsx。",
+            ),
+            ("移动端也试一下", "移动端拖动正常，补了 3 个测试。"),
+        ],
+    },
+    Fake {
+        project: "projects/blog",
+        title: "评论换成自建的",
+        mins: 60 * 50,
+        turns: &[("评论换成自建的", "换好了，旧评论导进来了 128 条。")],
+    },
+];
+
+const QWEN: &[Fake] = &[
+    Fake {
+        project: "projects/shop",
+        title: "购物车数量改成可以直接输入",
+        mins: 55,
+        turns: &[
+            (
+                "购物车数量改成可以直接输入",
+                "数量框改成输入框了，输入 0 会删掉这件商品。",
+            ),
+            ("输入字母呢", "只收数字，别的字符直接忽略，补了 2 个测试。"),
+        ],
+    },
+    Fake {
+        project: "projects/api",
+        title: "接口限流",
+        mins: 60 * 30,
+        turns: &[("接口加个限流", "按 IP 每分钟 60 次，超了返回 429。")],
+    },
+];
+
+/// OpenCode 的会话 id：`ses_` + 12 位十六进制 + 14 位字母数字（形状对就行）。
+fn opencode_id(n: usize) -> String {
+    format!("ses_e11a9a1f{n:04x}AbCdEfGhIjKlMn")
+}
+
+/// Hermes 的会话 id：`YYYYMMDD_HHMMSS_<十六进制>`（时间部分只要形状对）。
+fn hermes_id(n: usize) -> String {
+    format!("20261120_1000{n:02}_{n:06x}")
+}
+
+/// SQL 里的字符串字面量。
+fn sql(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 fn uuid(n: usize) -> String {
     format!("{n:08x}-0000-4000-8000-{n:012x}")
 }
@@ -421,6 +547,226 @@ fn fake_home(home: &Path) {
             .join(format!("--{}--", encode(&cwd).trim_start_matches('-')));
         write_session(
             &dir.join(format!("{}_{id}.jsonl", ts[0].replace(':', "-"))),
+            &lines,
+            f,
+        );
+    }
+
+    // Hermes：一个 state.db（表结构见 tests/fixtures/hermes/state.sql），用系统 sqlite3 建。
+    let mut script = String::from(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, created_source TEXT, \
+         started_at REAL NOT NULL, cwd TEXT, git_branch TEXT, git_repo_root TEXT, title TEXT, \
+         last_activity_at REAL, end_reason TEXT, parent_session_id TEXT, \
+         archived INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0);\n\
+         CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, \
+         role TEXT NOT NULL, content TEXT, tool_calls TEXT, timestamp REAL NOT NULL, \
+         active INTEGER NOT NULL DEFAULT 1);\n",
+    );
+    for (i, f) in HERMES.iter().enumerate() {
+        let cwd = home.join(f.project);
+        fs::create_dir_all(&cwd).unwrap();
+        let id = hermes_id(i);
+        let end = now_secs() - f.mins * 60;
+        let n = f.turns.len() as i64 * 2;
+        script.push_str(&format!(
+            "INSERT INTO sessions (id, source, created_source, started_at, cwd, title, last_activity_at) \
+             VALUES ({}, 'local', 'tui', {}, {}, {}, {end});\n",
+            sql(&id),
+            end - n * 120,
+            sql(&cwd.to_string_lossy()),
+            sql(f.title)
+        ));
+        for (j, (q, a)) in f.turns.iter().enumerate() {
+            for (k, (role, text)) in [("user", q), ("assistant", a)].iter().enumerate() {
+                let at = end - (n - 1 - (j as i64 * 2 + k as i64)) * 120;
+                script.push_str(&format!(
+                    "INSERT INTO messages (session_id, role, content, timestamp) VALUES ({}, '{role}', {}, {at});\n",
+                    sql(&id),
+                    sql(text)
+                ));
+            }
+        }
+    }
+    let db = home.join(".hermes/state.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let out = std::process::Command::new("/usr/bin/sqlite3")
+        .arg(&db)
+        .arg(&script)
+        .output()
+        .expect("建 Hermes 库要 sqlite3（macOS 自带）");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Kimi Code：每条一个目录，state.json 记标题和目录，正文在 agents/main/wire.jsonl（见 tests/fixtures/kimi）。
+    for (i, f) in KIMI.iter().enumerate() {
+        let cwd = home.join(f.project);
+        fs::create_dir_all(&cwd).unwrap();
+        let id = format!("session_{}", uuid(0x500 + i));
+        let end_ms = (now_secs() - f.mins * 60) * 1000;
+        let n = f.turns.len() as i64 * 2;
+        let at = |k: i64| end_ms - (n - 1 - k) * 120_000;
+        let mut lines = vec![format!(
+            r#"{{"type":"metadata","protocol_version":"1.5","created_at":{}}}"#,
+            at(0)
+        )];
+        for (j, (q, a)) in f.turns.iter().enumerate() {
+            let k = j as i64 * 2;
+            lines.push(format!(
+                r#"{{"type":"context.append_message","agentId":"main","message":{{"role":"user","content":[{{"type":"text","text":{}}}],"origin":{{"kind":"user"}}}},"time":{}}}"#,
+                json(q),
+                at(k)
+            ));
+            lines.push(format!(
+                r#"{{"type":"context.append_loop_event","agentId":"main","event":{{"type":"content.part","turnId":"{j}","step":1,"part":{{"type":"text","text":{}}}}},"time":{}}}"#,
+                json(a),
+                at(k + 1)
+            ));
+        }
+        let dir = home
+            .join(".kimi-code/sessions")
+            .join(format!(
+                "wd_{}_{i:012x}",
+                cwd.file_name().unwrap().to_string_lossy()
+            ))
+            .join(&id);
+        write_lines(
+            &dir.join("state.json"),
+            &[format!(
+                r#"{{"id":"{id}","version":2,"title":{},"titleKind":"generated","cwd":{},"createdAt":{},"updatedAt":{end_ms},"archived":false,"isCustomTitle":false}}"#,
+                json(f.title),
+                json(&cwd.to_string_lossy()),
+                at(0)
+            )],
+        );
+        write_session(&dir.join("agents/main/wire.jsonl"), &lines, f);
+    }
+
+    // Gemini CLI：`~/.gemini/tmp/<短名>/.project_root` + `chats/session-*.jsonl`（格式见 tests/fixtures/gemini）。
+    for (i, f) in GEMINI.iter().enumerate() {
+        let cwd = home.join(f.project);
+        fs::create_dir_all(&cwd).unwrap();
+        let id = uuid(0x600 + i);
+        let ts = times(f);
+        let slug = home.join(".gemini/tmp").join(format!("g{i}"));
+        fs::create_dir_all(&slug).unwrap();
+        fs::write(slug.join(".project_root"), cwd.to_string_lossy().as_bytes()).unwrap();
+        let mut lines = vec![format!(
+            r#"{{"sessionId":"{id}","projectHash":"h","startTime":"{}","lastUpdated":"{}","kind":"main"}}"#,
+            ts[0],
+            ts[ts.len() - 1]
+        )];
+        for (j, (q, a)) in f.turns.iter().enumerate() {
+            lines.push(format!(
+                r#"{{"id":"u{j}","timestamp":"{}","type":"user","content":[{{"text":{}}}]}}"#,
+                ts[j * 2],
+                json(q)
+            ));
+            lines.push(format!(
+                r#"{{"id":"g{j}","timestamp":"{}","type":"gemini","content":{}}}"#,
+                ts[j * 2 + 1],
+                json(a)
+            ));
+        }
+        lines.push(format!(r#"{{"$set":{{"summary":{}}}}}"#, json(f.title)));
+        write_session(
+            &slug.join(format!("chats/session-2026-11-20T10-00-{}.jsonl", &id[..8])),
+            &lines,
+            f,
+        );
+    }
+
+    // OpenCode：一个 opencode.db，2.x 的表（表结构见 tests/fixtures/opencode/opencode.sql）。时间是毫秒。
+    let mut script = String::from(
+        "CREATE TABLE session_v2 (id text PRIMARY KEY, project_id text NOT NULL, parent_id text, \
+         slug text NOT NULL, directory text NOT NULL, title text, version text NOT NULL, \
+         time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer);\n\
+         CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, \
+         seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);\n",
+    );
+    for (i, f) in OPENCODE.iter().enumerate() {
+        let cwd = home.join(f.project);
+        fs::create_dir_all(&cwd).unwrap();
+        let id = opencode_id(i);
+        let end = (now_secs() - f.mins * 60) * 1000;
+        let n = f.turns.len() as i64 * 2;
+        script.push_str(&format!(
+            "INSERT INTO session_v2 VALUES ({}, 'prj', NULL, 's', {}, {}, '2.3.2', {}, {end}, NULL);\n",
+            sql(&id),
+            sql(&cwd.to_string_lossy()),
+            sql(f.title),
+            end - n * 120_000,
+        ));
+        for (j, (q, a)) in f.turns.iter().enumerate() {
+            for (k, (kind, data)) in [
+                ("user", format!(r#"{{"text":{}}}"#, json(q))),
+                (
+                    "assistant",
+                    format!(r#"{{"content":[{{"type":"text","text":{}}}]}}"#, json(a)),
+                ),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let seq = j as i64 * 2 + k as i64;
+                let at = end - (n - 1 - seq) * 120_000;
+                script.push_str(&format!(
+                    "INSERT INTO session_message VALUES ('msg_{i}_{seq}', {}, '{kind}', {seq}, {at}, {at}, {});\n",
+                    sql(&id),
+                    sql(data)
+                ));
+            }
+        }
+    }
+    let db = home.join(".local/share/opencode/opencode.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let out = std::process::Command::new("/usr/bin/sqlite3")
+        .arg(&db)
+        .arg(&script)
+        .output()
+        .expect("建 OpenCode 库要 sqlite3（macOS 自带）");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Qwen Code：`~/.qwen/projects/<编码路径>/chats/<id>.jsonl`，记录靠 parentUuid 串起来（格式见 tests/fixtures/qwen）。
+    for (i, f) in QWEN.iter().enumerate() {
+        let cwd = home.join(f.project);
+        fs::create_dir_all(&cwd).unwrap();
+        let id = uuid(0x800 + i);
+        let ts = times(f);
+        let cwd_s = cwd.to_string_lossy();
+        let mut lines = vec![format!(
+            r#"{{"uuid":"q{i}-t","parentUuid":null,"sessionId":"{id}","timestamp":"{}","type":"system","subtype":"custom_title","cwd":{},"systemPayload":{{"customTitle":{},"titleSource":"auto"}}}}"#,
+            ts[0],
+            json(&cwd_s),
+            json(f.title)
+        )];
+        let mut parent = format!("q{i}-t");
+        for (j, (q, a)) in f.turns.iter().enumerate() {
+            for (k, (kind, role, text)) in [("user", "user", q), ("assistant", "model", a)]
+                .iter()
+                .enumerate()
+            {
+                let uuid = format!("q{i}-{j}-{k}");
+                lines.push(format!(
+                    r#"{{"uuid":"{uuid}","parentUuid":"{parent}","sessionId":"{id}","timestamp":"{}","type":"{kind}","cwd":{},"message":{{"role":"{role}","parts":[{{"text":{}}}]}}}}"#,
+                    ts[j * 2 + k],
+                    json(&cwd_s),
+                    json(text)
+                ));
+                parent = uuid;
+            }
+        }
+        write_session(
+            &home
+                .join(".qwen/projects")
+                .join(encode(&cwd))
+                .join(format!("chats/{id}.jsonl")),
             &lines,
             f,
         );
@@ -1020,6 +1366,32 @@ fn real_terminal_screenshots() {
     run.wait_for("首页加阅读时长");
     run.wait_for("token");
     run.save(&out, "3-pi");
+    // Hermes：黄铜色印章和标签，没有额度渠道，顶栏右边不写额度。
+    run.send(b"\tl");
+    run.wait_for("整理接口文档的目录结构");
+    run.wait_for("2 个字段名过期");
+    run.save(&out, "3b-hermes");
+    // Kimi Code：玫红印章和标签。启动目录 shop 里有它的对话，切过去那组自动展开选中。
+    run.send(b"\t");
+    run.wait_for("商品详情页加骨架屏");
+    run.wait_for("数据到了淡出");
+    run.save(&out, "3c-kimi");
+    // Gemini：天蓝色印章和标签，和 Codex 的蓝、「做完」的青要分得开；没有额度渠道。
+    run.send(b"\tl");
+    run.wait_for("按 h2、h3 生成了目录");
+    run.save(&out, "3d-gemini");
+
+    // OpenCode：青绿色印章和标签，没有额度渠道（启动目录 shop 里有它的对话，组默认展开）。
+    run.send(b"\t");
+    run.wait_for("给登录页加验证码");
+    run.wait_for("补了 3 个测试");
+    run.save(&out, "3d-opencode");
+
+    // Qwen Code：兰紫色印章和标签，和 pi 的紫、Kimi 的玫红分得开；没有额度渠道（启动目录 shop 里有它的对话）。
+    run.send(b"\t");
+    run.wait_for("购物车数量改成可以直接输入");
+    run.wait_for("补了 2 个测试");
+    run.save(&out, "3e-qwen");
     run.send(b"\t?");
     run.wait_for("任意键关闭");
     run.save(&out, "4-help");
@@ -1102,6 +1474,28 @@ fn real_terminal_screenshots() {
     run.wait_for("购物车结算按钮点了没反应");
     run.wait_for("找到了");
     run.save(&out, "6-light");
+    // 浅色下的 Hermes 黄铜色：压暗一档，和「等你」的黄分开（项目组在第一轮已经展开，展开状态是记住的）。
+    run.send(b"\t\t\t");
+    run.wait_for("整理接口文档的目录结构");
+    run.wait_for("2 个字段名过期");
+    run.save(&out, "6b-light-hermes");
+    run.send(b"\t");
+    run.wait_for("商品详情页加骨架屏");
+    run.wait_for("数据到了淡出");
+    run.save(&out, "6c-light-kimi");
+    run.send(b"\t");
+    run.wait_for("文章页加目录，能折叠");
+    run.save(&out, "6d-light-gemini");
+
+    // 浅色下的 OpenCode 青绿：压暗一档，白底上看得清。
+    run.send(b"\t");
+    run.wait_for("给登录页加验证码");
+    run.wait_for("补了 3 个测试");
+    run.save(&out, "6d-light-opencode");
+    run.send(b"\t");
+    run.wait_for("购物车数量改成可以直接输入");
+    run.wait_for("补了 2 个测试");
+    run.save(&out, "6e-light-qwen");
     run.quit();
 
     // 实时预览：守护进程托管第一条对话（假 CLI 画一屏后空闲），选中它时预览区显示它此刻的屏幕。
@@ -1133,13 +1527,28 @@ fn real_terminal_screenshots() {
     run.send(b"\t");
     run.wait_for("token");
     run.save(&out, "11-seal-pi");
+    run.send(b"\t");
+    run.wait_for("整理接口文档的目录结构");
+    run.save(&out, "11b-seal-hermes");
+    run.send(b"\t");
+    run.wait_for("商品详情页加骨架屏");
+    run.save(&out, "11c-seal-kimi");
+    run.send(b"\t");
+    run.wait_for("文章页加目录，能折叠");
+    run.save(&out, "11d-seal-gemini");
+    run.send(b"\t");
+    run.wait_for("给登录页加验证码");
+    run.save(&out, "11d-seal-opencode");
+    run.send(b"\t");
+    run.wait_for("购物车数量改成可以直接输入");
+    run.save(&out, "11e-seal-qwen");
     // !：跳到等你回复的那条，跨家换回 Claude。
     run.send(b"!");
     run.wait_for("· ◆ 等你回复");
     run.save(&out, "12-jump-waiting");
     // s：三家等你回复和在跑的列在一起（等你的在前）。
     run.send(b"s");
-    run.wait_for("等你回复和在跑的 · 三家");
+    run.wait_for("等你回复和在跑的 · 各家");
     run.wait_for("等你 1 · 在跑 3");
     run.save(&out, "16-board");
     run.send(b"\x1b");

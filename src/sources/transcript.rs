@@ -106,10 +106,12 @@ fn cut(text: &str, max: usize) -> String {
 /// 工具参数的摘要：常见的命令、路径、搜索词字段取它的值，否则整个参数压成一行 JSON。
 /// 参数是 JSON 字符串（Codex `function_call.arguments`）先解开再取。
 pub(crate) fn input_summary(input: &Value) -> String {
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 12] = [
         "command",
         "cmd",
         "file_path",
+        // OpenCode 的读写编辑工具。
+        "filePath",
         "path",
         "pattern",
         "query",
