@@ -178,14 +178,14 @@ fn bottom_bar_follows_selection() {
     ));
     let bar = bottom(&mut app);
     assert!(
-        bar.contains("⏎ 进入   n 新对话   N 新项目   e 改名   ? 全部按键"),
+        bar.contains("⏎ 进入   n 新对话   m 新项目   e 改名   ? 全部按键"),
         "{bar}"
     );
     // → 展开后还停在组标题上，写「收起」（⏎ 会直接进到第一条对话）。
     app.key(key(KeyCode::Right));
     let bar = bottom(&mut app);
     assert!(
-        bar.contains("⏎ 收起   n 新对话   N 新项目   e 改名   ? 全部按键"),
+        bar.contains("⏎ 收起   n 新对话   m 新项目   e 改名   ? 全部按键"),
         "{bar}"
     );
 }

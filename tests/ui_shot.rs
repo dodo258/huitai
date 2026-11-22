@@ -999,7 +999,7 @@ fn real_terminal_screenshots() {
     run.send(b"b");
     run.wait_for("已隐藏后台对话");
     // N：目录候选（三家的项目目录 + ~/projects 下还没对话的 landing），打 a 筛、↓ 选第一个。
-    run.send(b"N");
+    run.send(b"m");
     run.wait_for("Tab 补全");
     run.wait_for("~/projects/landing");
     run.send(b"a");

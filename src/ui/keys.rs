@@ -100,7 +100,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char(c @ '1'..='9') => Action::Jump(c as u8 - b'0'),
         KeyCode::Char('!') => Action::NextWaiting,
         KeyCode::Char('n') => Action::New,
-        KeyCode::Char('N') => Action::NewElsewhere,
+        // m 是新建项目；N 是 v0.1.0 的老键，留着兼容，界面上不再提示。
+        KeyCode::Char('m' | 'N') => Action::NewElsewhere,
         KeyCode::Char('R') => Action::RestoreTabs,
         KeyCode::Char('c') => Action::CopyResume,
         KeyCode::Char('e') => Action::Rename,
@@ -154,7 +155,7 @@ pub fn bar(sel: Selected) -> Vec<KeyHelp> {
         Selected::Nothing => vec![
             k("/", "搜索"),
             k("n", "新对话"),
-            k("N", "新项目"),
+            k("m", "新项目"),
             k("Tab", "换 AI"),
         ],
         Selected::Group {
@@ -163,7 +164,7 @@ pub fn bar(sel: Selected) -> Vec<KeyHelp> {
         } => vec![
             k("⏎", toggle(expanded)),
             k("n", "新对话"),
-            k("N", "新项目"),
+            k("m", "新项目"),
             k("e", "改名"),
         ],
         Selected::Group { expanded, .. } => vec![k("⏎", toggle(expanded))],
@@ -201,7 +202,7 @@ pub fn menu(sel: Selected) -> Vec<MenuItem> {
         } => vec![
             m(A::Open, "⏎", toggle(expanded)),
             m(A::New, "n", "新对话"),
-            m(A::NewElsewhere, "N", "新建项目 / 在别的目录开对话"),
+            m(A::NewElsewhere, "m", "新建项目 / 在别的目录开对话"),
             m(A::Rename, "e", "改项目显示名"),
             m(A::Archive, "a", "整组归档 / 取消"),
             m(A::Editor, "o", "用编辑器打开"),
@@ -255,7 +256,7 @@ pub const HELP: &[(&str, &[KeyHelp])] = &[
             k("", "⌥⏎ 要终端把 Option 当 Alt，"),
             k("", "不然用 w"),
             k("n", "在这个项目新对话"),
-            k("N", "新建项目 / 换个目录开对话"),
+            k("m", "新建项目 / 换个目录开对话"),
             k("R", "被中断的全部接着做"),
             k("", "否则恢复上次所有标签"),
             k("c", "复制恢复命令"),
@@ -318,6 +319,11 @@ mod tests {
             action_for(key(KeyCode::Enter, KeyModifiers::ALT)),
             Some(Action::OpenHere)
         );
+        assert_eq!(
+            action_for(key(KeyCode::Char('m'), KeyModifiers::NONE)),
+            Some(Action::NewElsewhere)
+        );
+        // v0.1.0 的老键照样能用。
         assert_eq!(
             action_for(key(KeyCode::Char('N'), KeyModifiers::SHIFT)),
             Some(Action::NewElsewhere)

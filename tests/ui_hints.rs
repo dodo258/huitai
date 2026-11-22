@@ -50,7 +50,7 @@ fn search_bar_keys_use_accent() {
 
 #[test]
 fn new_project_key_is_offered_on_project_groups() {
-    // 项目上：底栏、预览的按键列表、右键菜单都有 `N 新项目`，菜单点它和按 N 一样弹出选目录的输入框。
+    // 项目上：底栏、预览的按键列表、右键菜单都有 `m 新项目`，菜单点它和按 m 一样弹出选目录的输入框。
     let mut app = demo_app(Vendor::Claude);
     let shop = app
         .list()
@@ -66,22 +66,22 @@ fn new_project_key_is_offered_on_project_groups() {
     }
     let text = dump(&render(&mut app, W, H));
     let bar = text.lines().last().unwrap_or_default();
-    assert!(bar.contains("N 新项目"), "{bar}");
+    assert!(bar.contains("m 新项目"), "{bar}");
     assert!(
-        text.contains("N  新建项目，或在别的目录开对话"),
-        "预览里要有 N"
+        text.contains("m  新建项目，或在别的目录开对话"),
+        "预览里要有 m"
     );
     let item = huitai::ui::keys::menu(app.selected_kind())
         .into_iter()
-        .position(|m| m.keys == "N")
+        .position(|m| m.keys == "m")
         .expect("右键菜单里要有 N");
     assert_eq!(
         huitai::ui::keys::menu(app.selected_kind())[item].action,
         huitai::ui::keys::Action::NewElsewhere
     );
-    app.key(key(KeyCode::Char('N')));
+    app.key(key(KeyCode::Char('m')));
     assert!(
         matches!(app.prompt, Some(huitai::ui::app::Prompt::NewDir { .. })),
-        "按 N 弹出选目录"
+        "按 m 弹出选目录"
     );
 }

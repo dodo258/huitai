@@ -63,7 +63,7 @@ Not sure everything is set up? Run `ai doctor`. It checks the three CLIs and the
 
 **Continue a conversation**: Enter opens it in a new tab; if it is already open, that tab comes to the front instead of a second one. Press `w` to chat in the current window; when the conversation ends you are back in the list.
 
-**New or existing projects**: `n` starts a new conversation in the selected project. `N` starts one in another directory, with `Tab` completion; a bare name is created under `~/projects`, and you are asked before a missing directory is created. On a project, `o` opens it in your editor, `f` shows it in Finder, `g` lists changed files.
+**New or existing projects**: `n` starts a new conversation in the selected project. `m` starts one in another directory, with `Tab` completion; a bare name is created under `~/projects`, and you are asked before a missing directory is created. On a project, `o` opens it in your editor, `f` shows it in Finder, `g` lists changed files.
 
 **Close the window, keep the work**: conversations run inside huitai's background daemon. Close the tab, or the whole terminal, and they keep working. Come back, select one and press Enter: the screen and history are still there. A conversation nobody is watching that has been waiting for you for 30 minutes has its process stopped; the record stays and Enter picks it up again. Change the time in settings (`,`).
 
@@ -118,7 +118,7 @@ Every action is a single key. The bottom bar shows the most common ones; `?` sho
 | Open | `⏎` | Open in a new tab |
 | | `w` / `⌥⏎` | Open in the current window (`⌥⏎` needs Option as Alt) |
 | | `n` | New conversation in this project |
-| | `N` | New project, or a conversation in another directory (`Tab` completes) |
+| | `m` | New project, or a conversation in another directory (`Tab` completes) |
 | | `R` | Resume everything interrupted; otherwise reopen last session's tabs |
 | | `c` | Copy the resume command |
 | Organize | `e` | Rename (on a project: display name) |

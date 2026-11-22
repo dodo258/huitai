@@ -130,7 +130,7 @@ fn open_keys_emit_open_effects() {
 #[test]
 fn new_elsewhere_asks_for_a_directory() {
     let mut app = demo_app(Vendor::Pi);
-    let effects = press(&mut app, 'N');
+    let effects = press(&mut app, 'm');
     assert_eq!(
         effects,
         vec![Effect::ScanProjectsRoot("/Users/demo/projects".into())]
@@ -150,7 +150,7 @@ fn new_elsewhere_asks_for_a_directory() {
         other => panic!("{other:?}"),
     }
     // 不存在的目录先问要不要新建。
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     press(&mut app, 'x');
     assert!(app.key(key(KeyCode::Enter)).is_empty());
     assert!(

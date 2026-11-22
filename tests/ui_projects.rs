@@ -74,7 +74,7 @@ fn tmp(name: &str) -> PathBuf {
 fn candidates_are_project_dirs_of_all_vendors_then_projects_root() {
     let mut app = demo_app(Vendor::Claude);
     assert_eq!(
-        press(&mut app, 'N'),
+        press(&mut app, 'm'),
         vec![Effect::ScanProjectsRoot(PathBuf::from(
             "/Users/demo/projects"
         ))]
@@ -114,7 +114,7 @@ fn candidates_are_project_dirs_of_all_vendors_then_projects_root() {
 #[test]
 fn typing_filters_candidates_name_prefix_first() {
     let mut app = demo_app(Vendor::Claude);
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     app.set_root_dirs(vec![PathBuf::from("/Users/demo/projects/apiary")]);
     typed(&mut app, "API");
     // 不分大小写；目录名开头对上的在前（api、api、apiary），路径里有的（没有）在后。
@@ -149,7 +149,7 @@ fn typing_filters_candidates_name_prefix_first() {
 #[test]
 fn tab_completes_and_arrows_pick() {
     let mut app = demo_app(Vendor::Claude);
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     typed(&mut app, "api");
     // Tab：没选就补成第一个。
     app.key(key(KeyCode::Tab));
@@ -186,7 +186,7 @@ fn enter_on_picked_candidate_uses_it() {
     let shop = root.join("shop");
     fs::create_dir_all(&shop).unwrap();
     let mut app = demo_app(Vendor::Codex);
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     app.set_root_dirs(vec![shop.clone()]);
     typed(&mut app, "sho");
     // 第一个是 ~/projects/shop（不存在），第二个是临时目录里真的 shop。
@@ -251,7 +251,7 @@ fn bare_name_uses_configured_projects_root_and_shows_target() {
         },
     );
     assert_eq!(
-        press(&mut app, 'N'),
+        press(&mut app, 'm'),
         vec![Effect::ScanProjectsRoot(PathBuf::from("/Users/demo/code"))]
     );
     typed(&mut app, "newapp");
@@ -276,7 +276,7 @@ fn missing_dir_asks_then_creates() {
             ..Config::default()
         },
     );
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     typed(&mut app, "fresh");
     assert!(app.key(key(KeyCode::Enter)).is_empty(), "先问，不新建");
     let want = root.join("fresh");
@@ -301,7 +301,7 @@ fn missing_dir_asks_then_creates() {
     assert!(!want.exists(), "界面层不建目录，交给运行层");
 
     // Esc 取消。
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     typed(&mut app, "fresh");
     app.key(key(KeyCode::Enter));
     assert!(app.key(key(KeyCode::Esc)).is_empty());
@@ -309,7 +309,7 @@ fn missing_dir_asks_then_creates() {
 
     // 已经有的目录直接新对话；是文件的说明一句。
     fs::create_dir_all(&want).unwrap();
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     typed(&mut app, "fresh");
     assert_eq!(
         app.key(key(KeyCode::Enter)),
@@ -319,7 +319,7 @@ fn missing_dir_asks_then_creates() {
         }]
     );
     fs::write(root.join("file"), "x").unwrap();
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     typed(&mut app, "file");
     assert!(app.key(key(KeyCode::Enter)).is_empty());
     assert!(app.status.as_deref().unwrap().contains("这不是目录"));
@@ -329,7 +329,7 @@ fn missing_dir_asks_then_creates() {
 #[test]
 fn candidate_list_is_drawn_above_bottom_bar() {
     let mut app = demo_app(Vendor::Claude);
-    press(&mut app, 'N');
+    press(&mut app, 'm');
     typed(&mut app, "api");
     app.key(key(KeyCode::Down));
     let text = dump(&render(&mut app, 120, 30));
