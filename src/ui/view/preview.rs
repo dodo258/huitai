@@ -173,7 +173,7 @@ fn meta_line(app: &App, e: &Entry, show_light: bool, w: usize, t: &Theme) -> Lin
     let fits = |with_branch: bool, with_count: bool| {
         let parts = [
             branch.filter(|_| with_branch),
-            Some(count.as_str()).filter(|_| with_count),
+            with_count.then_some(count.as_str()),
             Some(active.as_str()),
             light_text.as_deref(),
         ];
