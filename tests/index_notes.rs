@@ -3,6 +3,7 @@
 mod index_common;
 
 use std::fs;
+use std::path::Path;
 
 use huitai::core::{SessionId, Vendor};
 use huitai::index::{Edit, Note, ProjectEdit, ProjectNote};
@@ -256,4 +257,120 @@ fn project_name_and_archive_persist_without_touching_sessions_or_folder() {
     assert_eq!(env.open().projects().get(shop), None::<&ProjectNote>);
     let json = fs::read_to_string(env.data().join("annotations.json")).unwrap();
     assert!(!json.contains("projects"), "{json}");
+}
+
+/// 0.1.3 读 `annotations.json` 的格式（照它的源码）：厂商只认这 8 家，有一条不认得整份解析失败。
+mod v013 {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Vendor {
+        Claude,
+        Codex,
+        Pi,
+        Hermes,
+        Kimi,
+        Gemini,
+        OpenCode,
+        Qwen,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Record {
+        /// 只为让不认得的厂商解析失败，值不用。
+        #[serde(rename = "vendor")]
+        pub _vendor: Vendor,
+        pub id: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct FileFormat {
+        pub notes: Vec<Record>,
+    }
+}
+
+/// 0.1.3 能不能读这份标注文件，读得了返回里面的 id。
+fn read_as_v013(path: &Path) -> Result<Vec<String>, serde_json::Error> {
+    let text = fs::read_to_string(path).unwrap();
+    let file: v013::FileFormat = serde_json::from_str(&text)?;
+    Ok(file.notes.into_iter().map(|r| r.id).collect())
+}
+
+fn ids_in(path: &Path) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    v["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// 审计 v0.1.4 第 9 条（标注）：0.1.3 之后加的厂商（Antigravity）的标注不写进 `annotations.json`，
+/// 0.1.3 打开时不会把整份当坏文件改名、连 Claude 的标注一起丢；新版重开两边都在。
+#[test]
+fn new_vendor_notes_stay_out_of_the_file_old_versions_read() {
+    let env = Env::new("notes-v013");
+    {
+        let index = env.open();
+        index
+            .annotate(Vendor::Antigravity, &id("agy-1"), Edit::Pin(true))
+            .unwrap();
+        index
+            .annotate(Vendor::Claude, &id("a"), Edit::Rename(Some("结算".into())))
+            .unwrap();
+    }
+    let main = env.data().join("annotations.json");
+    assert_eq!(read_as_v013(&main).expect("0.1.3 读得了"), ["a"]);
+    assert_eq!(ids_in(&env.data().join("annotations-more.json")), ["agy-1"]);
+
+    // 新版重开再改一条：两份都还在。
+    let index = env.open();
+    assert!(index.problems().is_empty(), "{:?}", index.problems());
+    index
+        .annotate(Vendor::Codex, &id("c"), Edit::Archive(true))
+        .unwrap();
+    let mut old = read_as_v013(&main).unwrap();
+    old.sort();
+    assert_eq!(old, ["a", "c"]);
+    assert_eq!(ids_in(&env.data().join("annotations-more.json")), ["agy-1"]);
+}
+
+/// 同一条：分文件之前的新版已经把 Antigravity 的标注写进了 `annotations.json`，打开就分开写回；
+/// 以后的版本加的厂商（这里的 `futurecli`）解不了也原样留着，不把整份当坏文件。
+#[test]
+fn notes_written_before_the_split_are_moved_on_open() {
+    let env = Env::new("notes-split");
+    fs::create_dir_all(env.data()).unwrap();
+    let main = env.data().join("annotations.json");
+    fs::write(
+        &main,
+        r#"{"version":1,"notes":[
+            {"vendor":"claude","id":"a","pinned":true},
+            {"vendor":"antigravity","id":"agy-1","archived":true},
+            {"vendor":"futurecli","id":"f-1","pinned":true}
+        ],"projects":{"/p/shop":{"name":"商店"}}}"#,
+    )
+    .unwrap();
+    let index = env.open();
+    assert!(index.problems().is_empty(), "{:?}", index.problems());
+    assert_eq!(read_as_v013(&main).expect("打开后 0.1.3 读得了"), ["a"]);
+    let mut more = ids_in(&env.data().join("annotations-more.json"));
+    more.sort();
+    assert_eq!(more, ["agy-1", "f-1"]);
+    assert_eq!(
+        index
+            .projects()
+            .get(Path::new("/p/shop"))
+            .and_then(|n| n.name.clone()),
+        Some("商店".to_owned())
+    );
+    // 再改一条，不认得的那条照旧留着。
+    index
+        .annotate(Vendor::Antigravity, &id("agy-2"), Edit::Pin(true))
+        .unwrap();
+    let mut more = ids_in(&env.data().join("annotations-more.json"));
+    more.sort();
+    assert_eq!(more, ["agy-1", "agy-2", "f-1"]);
 }

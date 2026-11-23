@@ -15,7 +15,39 @@ impl SessionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// 账号 `account`（[`crate::core::Account::key`]）里厂商自己的 id `native`：默认账号就是 `native` 本身
+    /// （老用户的 id 不变），别的账号前面加 `<账号>:`，几个账号里同名的 id（Codex 临时 id）不会撞。
+    pub fn in_account(account: &str, native: &str) -> Self {
+        if account.is_empty() {
+            Self(native.to_owned())
+        } else {
+            Self(format!("{account}:{native}"))
+        }
+    }
+
+    /// 拆成（账号，厂商自己的 id），见 [`SessionId::in_account`]。没有账号前缀的账号是空串。
+    pub fn split_account(&self) -> (&str, &str) {
+        let s = self.0.as_str();
+        match s.split_at_checked(ACCOUNT_KEY_LEN) {
+            Some((key, rest))
+                if rest.starts_with(':')
+                    && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                (key, &rest[1..])
+            }
+            _ => ("", s),
+        }
+    }
+
+    /// 厂商自己的 id（去掉账号前缀）。
+    pub fn native(&self) -> &str {
+        self.split_account().1
+    }
 }
+
+/// 账号短名的长度（8 位十六进制）。
+const ACCOUNT_KEY_LEN: usize = 8;
 
 impl From<String> for SessionId {
     fn from(id: String) -> Self {
@@ -89,6 +121,17 @@ pub struct Session {
     /// 列表默认把它们收进「另有 N 条后台」。旧缓存里没有这一项时当作不是。
     #[serde(default)]
     pub automatic: bool,
+    /// 哪个账号的（[`crate::core::Account::key`]）：默认位置的账号是空串，旧缓存里没有这一项也是。
+    /// 非默认账号的 [`Session::id`] 带着同样的前缀。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account: String,
+}
+
+impl Session {
+    /// 有本机项目目录、能接着聊。没有的（Antigravity 的工作区为空或不是本机路径）只能查看：CLI 要在项目目录里启动。
+    pub fn resumable(&self) -> bool {
+        !self.cwd.as_os_str().is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +144,21 @@ mod tests {
         assert_eq!(id.as_str(), "abc-123");
         assert_eq!(id.to_string(), "abc-123");
         assert_eq!(serde_json::to_string(&id).unwrap(), "\"abc-123\"");
+    }
+
+    #[test]
+    fn account_prefix_round_trips() {
+        let plain = SessionId::in_account("", "abc-123");
+        assert_eq!(plain.as_str(), "abc-123");
+        assert_eq!(plain.split_account(), ("", "abc-123"));
+        let other = SessionId::in_account("0123abcd", "new-codex-17");
+        assert_eq!(other.as_str(), "0123abcd:new-codex-17");
+        assert_eq!(other.split_account(), ("0123abcd", "new-codex-17"));
+        assert_eq!(other.native(), "new-codex-17");
+        // 厂商 id 里本来就有冒号、或前面不是 8 位十六进制的，不当账号前缀。
+        assert_eq!(SessionId::from("Z123abcd:x").native(), "Z123abcd:x");
+        assert_eq!(SessionId::from("ses:x").native(), "ses:x");
+        assert_eq!(SessionId::from("中文标题").native(), "中文标题");
     }
 
     #[test]
@@ -125,6 +183,7 @@ mod tests {
             last_active: SystemTime::UNIX_EPOCH,
             message_count: 3,
             automatic: true,
+            account: "0123abcd".to_owned(),
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), s);
@@ -134,6 +193,8 @@ mod tests {
     fn old_cache_without_automatic_reads_as_own() {
         let json = r#"{"vendor":"claude","id":"s1","cwd":"/p","path":"/p/s1.jsonl","title":null,
             "git_branch":null,"last_active":{"secs_since_epoch":0,"nanos_since_epoch":0},"message_count":1}"#;
-        assert!(!serde_json::from_str::<Session>(json).unwrap().automatic);
+        let s = serde_json::from_str::<Session>(json).unwrap();
+        assert!(!s.automatic);
+        assert_eq!(s.account, "", "旧缓存里的都是默认账号的");
     }
 }

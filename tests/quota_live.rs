@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use huitai::core::Vendor;
 use huitai::quota::{QuotaReader, quota};
+use huitai::sources::local_accounts;
 
 #[test]
 #[ignore = "读本机真实数据、会联网，手动跑"]
@@ -17,12 +18,16 @@ fn print_live_readings() {
         for report in reports {
             println!("{vendor} · {}: {:?}", report.source, report.result);
         }
-        let started = Instant::now();
-        let reading = quota(vendor);
-        println!(
-            "{vendor} 最终读数（{:?}）: {reading:?}\n",
-            started.elapsed()
-        );
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("取不到 HOME"));
+        for account in local_accounts(&home).iter().filter(|a| a.vendor == vendor) {
+            let started = Instant::now();
+            let reading = quota(account);
+            println!(
+                "{vendor}「{}」最终读数（{:?}）: {reading:?}\n",
+                account.name,
+                started.elapsed()
+            );
+        }
     }
 }
 
@@ -35,6 +40,14 @@ fn print_claude_settings() {
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     println!(
         "{}",
-        huitai::quota::claude_settings(&cwd).expect("取不到 HOME")
+        huitai::quota::claude_settings(&primary_claude(), &cwd).expect("取不到 HOME")
     );
+}
+
+fn primary_claude() -> huitai::core::Account {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("取不到 HOME"));
+    local_accounts(&home)
+        .into_iter()
+        .find(|a| a.vendor == Vendor::Claude)
+        .expect("每家总有主账号")
 }

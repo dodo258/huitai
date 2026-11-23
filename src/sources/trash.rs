@@ -26,6 +26,8 @@ pub struct Trash {
     root: PathBuf,
     /// 保留天数；0 表示永不清理。
     keep_days: u32,
+    /// 这份回收站给哪个账号的来源用（账号数据目录，见 [`Trash::for_account`]）：只隐藏的条目按它分开。
+    account: Option<PathBuf>,
 }
 
 /// 回收站里的一条。
@@ -39,6 +41,10 @@ pub struct TrashEntry {
     /// 上次恢复时原处已被占：排到最后，`u` 先恢复更早的，不被这一条卡住。
     #[serde(default)]
     pub blocked: bool,
+    /// 删的是哪个账号的（账号数据目录，规范化过）。同一个原生 id 在几个账号的库里各有一份，只隐藏这个账号的；
+    /// 多账号之前记的没有这一项，照旧哪个账号都隐藏。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<PathBuf>,
     pub files: Vec<TrashedFile>,
     /// 这一条在回收站里的目录。
     #[serde(skip)]
@@ -57,7 +63,15 @@ impl Trash {
         Self {
             root: root.into(),
             keep_days: 0,
+            account: None,
         }
+    }
+
+    /// 给账号数据目录是 `dir` 的来源用：记下的条目带着这个账号，只隐藏的条目只对这个账号生效。
+    /// 目录按真实路径记（经链接、写法不同也认成同一个），取不到真实路径就照原样。
+    pub fn for_account(mut self, dir: &Path) -> Self {
+        self.account = Some(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
+        self
     }
 
     /// 进回收站超过 `days` 天的条目在回收站操作时清掉；0 表示永不清理。
@@ -283,12 +297,16 @@ impl Trash {
         Ok(out)
     }
 
-    /// 某家被隐藏（只隐藏不移动）的对话 id。
+    /// 某家被隐藏（只隐藏不移动）的对话 id：这个账号隐藏的，加上没记账号的（多账号之前的、没分账号的来源记的）。
     pub fn hidden_ids(&self, vendor: Vendor) -> io::Result<HashSet<String>> {
+        let mine = |e: &TrashEntry| match (&self.account, &e.account) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
         Ok(self
             .list()?
             .into_iter()
-            .filter(|e| e.vendor == vendor && e.hide_only)
+            .filter(|e| e.vendor == vendor && e.hide_only && mine(e))
             .map(|e| e.id)
             .collect())
     }
@@ -334,6 +352,7 @@ impl Trash {
             trashed_at: now,
             hide_only,
             blocked: false,
+            account: self.account.clone(),
             files: Vec::new(),
             dir,
         })

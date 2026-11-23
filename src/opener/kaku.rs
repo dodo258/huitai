@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::exec;
+use super::CLI_TIMEOUT;
 use super::{Opened, Opener, TabHandle};
+use crate::core::exec;
 use crate::sources::Command;
 
 /// Kaku 装在默认位置时的命令行工具。
@@ -83,8 +84,7 @@ impl KakuOpener {
     }
 
     fn kaku(&self, args: &[String]) -> io::Result<String> {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        exec::run(&self.cli, &args, exec::TIMEOUT)
+        exec::run(&self.cli, args, None, CLI_TIMEOUT)
     }
 
     fn panes(&self) -> io::Result<Vec<Pane>> {
@@ -107,7 +107,8 @@ fn tty_runs(tty: &str, command: &str) -> io::Result<bool> {
     let out = match exec::run(
         Path::new("/bin/ps"),
         &["-ww", "-o", "args=", "-t", tty],
-        exec::TIMEOUT,
+        None,
+        CLI_TIMEOUT,
     ) {
         Ok(out) => out,
         Err(e) if e.kind() == io::ErrorKind::Other => return Ok(false),

@@ -23,6 +23,7 @@ fn session(vendor: Vendor, id: &str, path: PathBuf) -> Session {
         last_active: at(1_795_000_000),
         message_count: 1,
         automatic: false,
+        account: String::new(),
     }
 }
 

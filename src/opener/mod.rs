@@ -5,7 +5,6 @@
 //! [`LoginItem`] 是「开机自动打开会话台」的登录项。
 
 mod cmux;
-pub mod exec;
 mod ghostty;
 mod inline;
 mod kaku;
@@ -15,6 +14,7 @@ mod terminal;
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,9 @@ pub use terminal::Terminal;
 
 use crate::core::{SessionId, Vendor};
 use crate::sources::Command;
+
+/// 辅助命令（osascript、kaku cli、cmux、ps）的超时。AppleScript 第一次连 Ghostty 会慢一些，给足。
+pub const CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 一个开着的标签页在终端里的位置。存进 `tabs.json`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

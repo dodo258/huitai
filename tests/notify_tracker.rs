@@ -372,3 +372,44 @@ fn real_bell_after_quiet_still_alerts() {
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].id, id("a"));
 }
+
+// —— 看过之后的重画不算新一轮（闪烁只表示没看过的新结果）——
+
+#[test]
+fn redraw_right_after_opening_keeps_it_seen() {
+    // 回车打开一条答完的对话：接上后 CLI 按新窗口大小重画，不算开跑；安静多久都还是看过的「等你回复」。
+    let t0 = Instant::now();
+    let mut n = Notifier::with_quiet(secs(20));
+    started(&mut n, "a", t0);
+    n.settle(t0 + secs(20));
+    assert_eq!(n.state(&id("a")), SessionState::Done, "答完没看");
+    let t1 = t0 + secs(600);
+    n.notify(id("a"), Activity::Attached, t1);
+    assert_eq!(n.state(&id("a")), SessionState::Waiting, "打开就算看过");
+    n.notify(id("a"), Activity::Output, t1 + ms(50));
+    n.notify(id("a"), Activity::Output, t1 + REDRAW_GRACE - ms(1));
+    assert!(n.settle(t1 + secs(60)).is_empty());
+    assert_eq!(n.state(&id("a")), SessionState::Waiting);
+    // 真有新一轮（重画窗口之后的输出）：答完又是没看过。
+    n.notify(id("a"), Activity::Output, t1 + secs(70));
+    assert_eq!(n.state(&id("a")), SessionState::Running);
+    n.notify(id("a"), Activity::Bell, t1 + secs(80));
+    assert_eq!(n.state(&id("a")), SessionState::Done);
+}
+
+#[test]
+fn seen_in_the_board_then_a_new_round_is_unseen_again() {
+    let t0 = Instant::now();
+    let mut n = Notifier::with_quiet(secs(20));
+    started(&mut n, "a", t0);
+    n.notify(id("a"), Activity::Bell, t0 + secs(1));
+    n.notify(id("a"), Activity::Seen, t0 + secs(5));
+    assert_eq!(n.state(&id("a")), SessionState::Waiting);
+    // 看过之后很久不回：一直是看过的，安静超时也不改。
+    assert!(n.settle(t0 + secs(3600)).is_empty());
+    assert_eq!(n.state(&id("a")), SessionState::Waiting);
+    // 回了一句、又答完：没看过。
+    n.notify(id("a"), Activity::Output, t0 + secs(3700));
+    n.settle(t0 + secs(3720));
+    assert_eq!(n.state(&id("a")), SessionState::Done);
+}

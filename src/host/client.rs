@@ -1,12 +1,10 @@
 //! 守护进程的客户端：发请求、拉起守护进程、attach 转发、订阅事件，以及 `ai attach` 的终端接线。
 //!
-//! 每条连接先握手（[`open`]）。守护进程是没有握手的旧版时记住这个 socket，之后对它按旧协议说话（不发 `Hello`），
-//! 旧版本来就有的请求照常能用。
+//! 每条连接先握手（[`open`]）。握手早于第一个公开版（v0.1.0），发布出去的守护进程都会握手。
 
 use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -35,30 +33,8 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(3);
 const RELAUNCH_GAP: Duration = Duration::from_millis(100);
 /// 旧版守护进程退出后多久看一次它让出来没有。
 const RETIRE_POLL: Duration = Duration::from_millis(20);
-/// 不认识的请求旧版守护进程直接关连接，这时告诉用户为什么。
-const OLD_DAEMON_REFUSED: &str =
-    "后台是旧版的守护进程，不认这个操作；它托管的对话都结束后会自动换成新版";
-
-/// 认出来是没有握手的旧版守护进程的那个 socket（文件的设备号、inode、改动时间；守护进程每次启动都新建 socket）。
-static LEGACY: Mutex<Option<SocketKey>> = Mutex::new(None);
-
-type SocketKey = (u64, u64, i64, i64);
-
-fn socket_key(dir: &Path) -> Option<SocketKey> {
-    let m = std::fs::metadata(socket_path(dir)).ok()?;
-    Some((m.dev(), m.ino(), m.ctime(), m.ctime_nsec()))
-}
-
-fn is_legacy(key: Option<SocketKey>) -> bool {
-    key.is_some() && *LEGACY.lock().unwrap_or_else(PoisonError::into_inner) == key
-}
-
-/// 连上并握手。守护进程不接待（协议太老）时报错，不发别的；返回 `None` 的应答表示它是没有握手的旧版。
-fn open(dir: &Path) -> io::Result<(UnixStream, Option<HelloReply>)> {
-    let key = socket_key(dir);
-    if is_legacy(key) {
-        return Ok((UnixStream::connect(socket_path(dir))?, None));
-    }
+/// 连上并握手。守护进程不接待（协议太老）时报错，不发别的。
+fn open(dir: &Path) -> io::Result<(UnixStream, HelloReply)> {
     let mut stream = UnixStream::connect(socket_path(dir))?;
     stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
     protocol::write_json(
@@ -69,19 +45,9 @@ fn open(dir: &Path) -> io::Result<(UnixStream, Option<HelloReply>)> {
     match protocol::read_json::<Response>(&mut stream, KIND_RESPONSE) {
         Ok(Response::Hello(hello)) => match hello.refused {
             Some(why) => Err(io::Error::other(why)),
-            None => Ok((stream, Some(hello))),
+            None => Ok((stream, hello)),
         },
         Ok(other) => Err(io::Error::other(format!("握手应答不对：{other:?}"))),
-        // 旧版读不懂 Hello，什么也不回就关了连接。
-        Err(e)
-            if matches!(
-                e.kind(),
-                ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
-            ) =>
-        {
-            *LEGACY.lock().unwrap_or_else(PoisonError::into_inner) = key;
-            Ok((UnixStream::connect(socket_path(dir))?, None))
-        }
         Err(e) => Err(e),
     }
 }
@@ -92,33 +58,25 @@ fn connect(dir: &Path) -> io::Result<UnixStream> {
 
 /// 发一个请求等一个应答（不用于 Attach/Events）。
 pub fn request(dir: &Path, req: &Request) -> io::Result<Response> {
-    let (mut stream, hello) = open(dir)?;
+    let mut stream = connect(dir)?;
     stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
     protocol::write_json(&mut stream, KIND_REQUEST, req)?;
-    match protocol::read_json(&mut stream, KIND_RESPONSE) {
-        Err(e) if hello.is_none() && e.kind() == ErrorKind::UnexpectedEof => {
-            Err(io::Error::other(OLD_DAEMON_REFUSED))
-        }
-        other => other,
-    }
+    protocol::read_json(&mut stream, KIND_RESPONSE)
 }
 
 /// 守护进程是哪一版、托管着几条对话。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonInfo {
-    /// `None`：没有握手的旧版。
-    pub build: Option<Build>,
+    pub build: Build,
     pub pid: u32,
     /// 登记着的托管对话条数（含还没启动的）。
     pub hosted: usize,
 }
 
 impl DaemonInfo {
-    /// 比当前程序旧（没有握手的旧版也算）。
+    /// 比当前程序旧。
     pub fn outdated(&self) -> bool {
-        self.build
-            .as_ref()
-            .is_none_or(|b| version::current().newer_than(b))
+        version::current().newer_than(&self.build)
     }
 
     /// 旧版且空着，可以直接换成新版。
@@ -130,43 +88,21 @@ impl DaemonInfo {
 /// 问在跑的守护进程是哪一版。没在跑时返回连接错误（不拉起）。
 pub fn probe(dir: &Path) -> io::Result<DaemonInfo> {
     let (_, hello) = open(dir)?;
-    if let Some(h) = hello {
-        return Ok(DaemonInfo {
-            build: Some(h.build),
-            pid: h.pid,
-            hosted: h.hosted,
-        });
-    }
-    let Response::Pong { pid } = request(dir, &Request::Ping)? else {
-        return Err(io::Error::other("旧版守护进程的 Ping 应答不对"));
-    };
-    let Response::List(list) = request(dir, &Request::List)? else {
-        return Err(io::Error::other("旧版守护进程的 List 应答不对"));
-    };
     Ok(DaemonInfo {
-        build: None,
-        pid,
-        hosted: list.len(),
+        build: hello.build,
+        pid: hello.pid,
+        hosted: hello.hosted,
     })
 }
 
 /// 让空着的旧版守护进程退出，等它让出 socket。返回它退了没有（刚好有人在它那儿开了对话就没退）。
-fn retire(dir: &Path, old: &DaemonInfo) -> io::Result<bool> {
-    if old.build.is_some() {
-        match request(dir, &Request::Retire) {
-            Ok(Response::Ok) => {}
-            Ok(_) => return Ok(false),
-            // 它定下退出后可能来不及回话就走了。
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {}
-            Err(e) => return Err(e),
-        }
-    } else {
-        // 旧版没有 Retire：空着时直接结束它（没有对话在跑，不会留下被中断的记录）。
-        let pid = libc::pid_t::try_from(old.pid).map_err(io::Error::other)?;
-        // SAFETY: 只发信号；pid 是守护进程自己在 Pong 里报的进程号。
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+fn retire(dir: &Path) -> io::Result<bool> {
+    match request(dir, &Request::Retire) {
+        Ok(Response::Ok) => {}
+        Ok(_) => return Ok(false),
+        // 它定下退出后可能来不及回话就走了。
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(e),
     }
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
     while UnixStream::connect(socket_path(dir)).is_ok() {
@@ -210,8 +146,8 @@ pub fn snapshot(dir: &Path, id: &SessionId, since: Option<u64>) -> io::Result<Sn
 pub fn ensure_daemon(dir: &Path, launch: Command) -> io::Result<DaemonInfo> {
     match probe(dir) {
         Ok(info) if !info.replaceable() => return Ok(info),
-        Ok(old) => {
-            if !retire(dir, &old)? {
+        Ok(_) => {
+            if !retire(dir)? {
                 return probe(dir);
             }
         }
@@ -398,7 +334,7 @@ pub enum BoardItem {
 }
 
 /// 会话台看守护进程的通道：订阅得上就收事件；守护进程比当前程序旧、不认这个订阅
-/// （没有握手的旧版，或以后订阅格式改了的旧版），就退而用它也认的 `List` 定期轮询。
+/// （以后订阅格式改了的旧版），就退而用它也认的 `List` 定期轮询。
 pub struct BoardFeed(Feed);
 
 enum Feed {

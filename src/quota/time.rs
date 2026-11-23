@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use super::exec;
+use crate::core::exec;
 
 pub fn to_secs(t: SystemTime) -> i64 {
     match t.duration_since(UNIX_EPOCH) {

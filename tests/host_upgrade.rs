@@ -1,12 +1,12 @@
 //! 升级不打断：客户端和守护进程版本不同的各种组合。
 //!
-//! 「另一个版本的构建」用真的 `ai daemon` 加环境变量伪造（`HUITAI_FAKE_VERSION` 报更老的版本号，
-//! `HUITAI_FAKE_PROTOCOL=0` 装成没有握手的旧版）；测试进程自己是当前版本的客户端。
+//! 「另一个版本的构建」用真的 `ai daemon` 加环境变量伪造（`HUITAI_FAKE_VERSION` 报更老的版本号）；
+//! 测试进程自己是当前版本的客户端。
 
 mod host_support;
 
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use huitai::core::{SessionId, Vendor};
 use huitai::host::protocol::{
     self, KIND_REQUEST, KIND_RESPONSE, MIN_CLIENT_PROTOCOL, OLD_CLIENT, PROTOCOL,
 };
-use huitai::host::version::{FAKE_PROTOCOL, FAKE_VERSION};
+use huitai::host::version::FAKE_VERSION;
 use huitai::host::{self, AttachMsg, Build, DaemonInfo, EndReason, Request, Response, SpawnSpec};
 
 const OLD_VERSION: &str = "0.0.1";
@@ -77,9 +77,8 @@ fn wait_gone(home: &Home) {
 }
 
 fn is_current(info: &DaemonInfo) -> bool {
-    info.build
-        .as_ref()
-        .is_some_and(|b| b.version == env!("CARGO_PKG_VERSION") && b.protocol == PROTOCOL)
+    info.build.version == env!("CARGO_PKG_VERSION")
+        && info.build.protocol == PROTOCOL
         && !info.outdated()
 }
 
@@ -87,7 +86,7 @@ fn is_current(info: &DaemonInfo) -> bool {
 fn idle_old_daemon_is_replaced_by_current_version() {
     let mut home = Home::new("up-idle");
     let old = launch(&mut home, &[(FAKE_VERSION, OLD_VERSION)]);
-    assert_eq!(old.build.as_ref().unwrap().version, OLD_VERSION);
+    assert_eq!(old.build.version, OLD_VERSION);
     assert!(old.replaceable(), "{old:?}");
 
     let report = doctor(&home);
@@ -149,37 +148,6 @@ fn old_daemon_keeps_its_sessions_and_steps_aside_after_the_last_one() {
     wait_gone(&home);
     let new = ensure_current(&mut home);
     assert_ne!(new.pid, old.pid);
-    assert!(is_current(&new), "{new:?}");
-}
-
-/// 没有握手的旧版（升级前装的那种）：读不懂 Hello，客户端认出来后按旧协议说话。
-#[test]
-fn daemon_without_handshake_is_used_as_is_then_replaced_when_empty() {
-    let mut home = Home::new("up-legacy");
-    let legacy = launch(
-        &mut home,
-        &[(FAKE_PROTOCOL, "0"), (FAKE_VERSION, OLD_VERSION)],
-    );
-    assert_eq!(legacy.build, None);
-    let id = spawn_echo(&home, "s1");
-    let (mut att, mut seen) = attach(&home, &id);
-
-    let info = ensure_current(&mut home);
-    assert_eq!(info.pid, legacy.pid);
-    assert!(info.outdated() && info.hosted == 1, "{info:?}");
-    echo(&mut att, &mut seen, "during");
-
-    // 旧版不会自己退出；空了之后新版客户端把它换掉。
-    att.writer().input(b"bye\r").unwrap();
-    read_until(&mut att, &mut seen, "CLI 退出", |s| s.end.is_some());
-    let deadline = Instant::now() + WAIT;
-    while host::probe(&home.data).unwrap().hosted > 0 {
-        assert!(Instant::now() < deadline, "对话一直没取消登记");
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(host::probe(&home.data).unwrap().pid, legacy.pid);
-    let new = ensure_current(&mut home);
-    assert_ne!(new.pid, legacy.pid);
     assert!(is_current(&new), "{new:?}");
 }
 
@@ -267,20 +235,4 @@ fn interrupted_records_survive_a_version_change() {
     let ids: Vec<_> = got.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, ["future", "s1"]);
     assert_eq!(got[1].vendor, Vendor::Claude);
-}
-
-/// 旧版守护进程不认的请求：客户端给出能看懂的原因，而不是「连接断了」。
-#[test]
-fn request_unknown_to_daemon_without_handshake_says_why() {
-    let mut home = Home::new("up-unknown");
-    launch(&mut home, &[(FAKE_PROTOCOL, "0")]);
-    // 旧版没有 Retire 这个请求，读不懂就关连接。
-    let err = host::request(&home.data, &Request::Retire).unwrap_err();
-    assert_ne!(err.kind(), ErrorKind::UnexpectedEof, "{err}");
-    assert!(err.to_string().contains("不认这个操作"), "{err}");
-    // 守护进程还在，旧版本来就有的请求照常。
-    assert!(matches!(
-        host::request(&home.data, &Request::Ping),
-        Ok(Response::Pong { .. })
-    ));
 }

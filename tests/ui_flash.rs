@@ -137,7 +137,7 @@ fn quota_bar_turns_yellow_then_red() {
             window_minutes: Some(10080),
             resets_at: None,
         }]);
-        app.quota.insert(Vendor::Codex, r);
+        app.quota.insert((Vendor::Codex, String::new()), r);
         let buf = render(app, W, H);
         let x = (0..W)
             .find(|&x| buf[(x, 0)].symbol() == "━")

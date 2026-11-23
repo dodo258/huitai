@@ -1,5 +1,6 @@
 //! 整段对话的只读滚动视图：在对话上按 `v`（或 `→`，搜索结果里也是 `→`）打开，盖住列表和预览两栏，
-//! 顶栏、底栏照旧。工具调用默认折成一行（`t` 展开），从搜索结果打开时高亮搜索词、`n`/`N` 在出现处之间跳。
+//! 顶栏、底栏照旧。工具调用默认折成一行（`t` 展开），从搜索结果打开时高亮搜索词、`n`/`N` 在出现处之间跳；
+//! `s` 把这条对话存成 Markdown（见 [`crate::export`]）。
 //! 全文由运行层读好喂进来（[`Reader::take_request`] / [`Reader::set`]），这里只管状态、按键和排版。
 
 use std::time::SystemTime;
@@ -34,6 +35,8 @@ pub enum Outcome {
     Open {
         here: bool,
     },
+    /// 存成 Markdown 文件。
+    Export,
     Quit,
 }
 
@@ -77,10 +80,7 @@ struct Layout {
 impl Reader {
     /// 打开 `entry` 的全文；`query` 是搜索词（不是从搜索结果打开就是空的）。没有搜索词时从最后看起。
     pub fn new(entry: Entry, query: &str) -> Self {
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .map(str::to_ascii_lowercase)
-            .collect();
+        let terms = crate::index::search_terms(query);
         Self {
             entry: Box::new(entry),
             data: None,
@@ -132,6 +132,7 @@ impl Reader {
                 };
             }
             KeyCode::Char('w') => return Outcome::Open { here: true },
+            KeyCode::Char('s') => return Outcome::Export,
             KeyCode::Up | KeyCode::Char('k') => self.scroll(-1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll(1),
             KeyCode::PageUp | KeyCode::Char('b') => self.scroll(-(page as isize)),
@@ -362,7 +363,7 @@ impl Reader {
         if self.layout.as_ref().is_some_and(|l| !l.hits.is_empty()) {
             keys.push(("n N", "下一处 / 上一处"));
         }
-        keys.extend([("⏎", "接着聊"), ("Esc", "返回")]);
+        keys.extend([("s", "存成 Markdown"), ("⏎", "接着聊"), ("Esc", "返回")]);
         let left = keys
             .into_iter()
             .flat_map(|(k, label)| [sp(k, bold(accent)), sp(format!(" {label}   "), fg(t.muted))])
@@ -511,26 +512,13 @@ fn layout(
     l
 }
 
-/// 一行字里搜索词（已转成小写英文字母）出现的地方换成 `hit` 样式（不分英文大小写），返回各段和有没有出现。
+/// 一行字里搜索词（[`crate::index::search_terms`]）出现的地方换成 `hit` 样式（和全文索引一样不分大小写、
+/// 不看变音），返回各段和有没有出现。
 fn highlight(text: &str, terms: &[String], base: Style, hit: Style) -> (Vec<Span<'static>>, bool) {
-    if terms.is_empty() {
-        return (vec![Span::styled(text.to_owned(), base)], false);
-    }
-    // 只换 ASCII 字母的大小写，字节位置不变，下标能直接用在原文上。
-    let lower = text.to_ascii_lowercase();
-    let mut marks: Vec<(usize, usize)> = Vec::new();
-    for term in terms.iter().filter(|t| !t.is_empty()) {
-        let mut from = 0;
-        while let Some(i) = lower[from..].find(term.as_str()) {
-            let s = from + i;
-            marks.push((s, s + term.len()));
-            from = s + term.len();
-        }
-    }
+    let marks = crate::index::term_marks(text, terms);
     if marks.is_empty() {
         return (vec![Span::styled(text.to_owned(), base)], false);
     }
-    marks.sort_unstable();
     let mut spans = Vec::new();
     let mut at = 0;
     for (s, e) in marks {

@@ -1,2 +1,0 @@
-{"uuid":"h00","parentUuid":null,"sessionId":"5e1c0a2b-3333-4aaa-8bbb-000000000003","timestamp":"2026-11-20T10:00:00.000Z","type":"system","cwd":"/Users/demo/projects/shop","version":"0.28.3","subtype":"session_source","systemPayload":{"sourceType":"agent-host"}}
-{"uuid":"h01","parentUuid":"h00","sessionId":"5e1c0a2b-3333-4aaa-8bbb-000000000003","timestamp":"2026-11-20T10:00:05.000Z","type":"user","cwd":"/Users/demo/projects/shop","version":"0.28.3","provenance":"real_user","message":{"role":"user","parts":[{"text":"内部编排"}]},"systemPayload":{"displayText":"内部编排"}}

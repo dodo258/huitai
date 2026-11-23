@@ -7,6 +7,8 @@
 //! 才是精确值，否则是头尾里看到的下限；要精确值调 [`Source::count_since`]（第一次读完整个文件、只解析候选行，
 //! 之后文件只是变长就只读新增部分），由 index 在后台补齐并缓存。
 
+mod account;
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
@@ -14,35 +16,55 @@ pub mod hermes;
 mod jsonl;
 pub mod kimi;
 pub mod live;
+pub mod moment;
 pub mod opencode;
 pub mod pi;
-pub mod qwen;
 mod sqlite;
 mod time;
 mod transcript;
 mod trash;
 mod window;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
-use crate::core::{Session, Vendor, VendorDirs};
+use crate::core::{Account, Config, EnvAssign, Session, Vendor, VendorDirs};
 
+pub use account::{AccountSource, DEFAULT_NAME, accounts, data_root, setting_dir};
+pub use antigravity::AntigravitySource;
 pub use claude::ClaudeSource;
 pub use codex::CodexSource;
 pub use gemini::GeminiSource;
 pub use hermes::HermesSource;
 pub use kimi::KimiSource;
+pub use moment::{Moment, PlanStep, StepStatus};
 pub use opencode::OpenCodeSource;
 pub use pi::PiSource;
-pub use qwen::QwenSource;
 pub use transcript::{Part, TRANSCRIPT_MAX_BYTES, Transcript};
 pub use trash::{Trash, TrashEntry, TrashedFile};
+
+/// 带话接着聊时，那句话怎么到 CLI 里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// CLI 起来就把话发出去了。
+    Sent,
+    /// 话填进了输入框，要在标签页里按回车才发出去。
+    Typed,
+    /// 带不进话：只恢复了对话，话要自己输入。
+    Manual,
+}
 
 /// 一家厂商的会话来源。
 pub trait Source: Send + Sync {
     fn vendor(&self) -> Vendor;
+
+    /// 哪个账号的（[`Account::key`]），默认账号是空串。只有 [`AccountSource`] 包过的才不是空串。
+    fn account(&self) -> &str {
+        ""
+    }
 
     /// 解析版本，见 [`parse_version`]。测试里的假来源可以改它。
     fn parse_version(&self) -> u32 {
@@ -58,6 +80,18 @@ pub trait Source: Send + Sync {
     /// 整段对话（只读滚动视图用）：消息、工具调用和返回按时间先后，每块截短；
     /// 文件太大只读最后 [`TRANSCRIPT_MAX_BYTES`]（[`Transcript::truncated`]）。
     fn load_transcript(&self, session: &Session) -> io::Result<Transcript>;
+
+    /// 「此刻」：在跑的工具、停下时的一句话、用时、计划、失败（见 [`moment`]）。只读文件尾部或最后几行。
+    /// 默认从整段对话推（只有消息和工具）；jsonl 几家只读尾部，并补上厂商自己记的轮次事件。
+    fn load_moment(&self, session: &Session) -> io::Result<Moment> {
+        Ok(moment::from_parts(self.load_transcript(session)?.parts))
+    }
+
+    /// 「此刻」重读的依据：[`Source::load_moment`] 读的这些文件大小或修改时间变了才重读。
+    /// 默认是会话文件和它旁边的 `-wal`；对话都在一个库里的几家给库和它的 WAL（见 [`with_wal`]）。
+    fn moment_files(&self, session: &Session) -> Vec<PathBuf> {
+        with_wal(&session.path)
+    }
 
     /// 精确的用户发言条数（会读完整个文件，按需调用）。
     fn count_messages(&self, session: &Session) -> io::Result<usize>;
@@ -85,8 +119,19 @@ pub trait Source: Send + Sync {
         cmd
     }
 
+    /// [`Source::resume_with_message_cmd`] 带的那句话到没到 CLI（R 续做按它报结果）。默认 CLI 起来就发出去了。
+    fn message_delivery(&self, _session: &Session) -> Delivery {
+        Delivery::Sent
+    }
+
     /// 在 `cwd` 新开一条对话的命令。
     fn new_cmd(&self, cwd: &Path) -> Command;
+
+    /// 这条对话是什么时候生成的（会话台认回它新建的对话用，见 [`created_at`]）。新建时定不了 id 的那几家
+    /// 从 id 或会话文件看得出就给；只看这条对话自己的 id 和文件，不看来源的目录。默认看不出，返回 `None`。
+    fn created_at(&self, _session: &Session) -> Option<SystemTime> {
+        None
+    }
 
     /// 删除：移进会话台回收站（或只隐藏），可用 [`Source::restore`] 恢复。
     fn trash(&self, session: &Session) -> io::Result<TrashEntry>;
@@ -121,6 +166,13 @@ pub trait Source: Send + Sync {
 /// 每家适配器的解析版本，见 [`crate::core::VendorInfo::parse_version`]（在 `core::vendor` 的表里改）。
 pub const fn parse_version(vendor: Vendor) -> u32 {
     vendor.info().parse_version
+}
+
+/// 一个文件和它旁边的 SQLite `-wal`（写进 WAL 时主库文件不动）。
+pub(crate) fn with_wal(path: &Path) -> Vec<PathBuf> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    vec![path.to_path_buf(), PathBuf::from(wal)]
 }
 
 /// 按文件组织的来源的整家扫描：[`Source::session_files`] 加 [`Source::read_files`]。
@@ -171,6 +223,9 @@ pub struct Scan {
     pub sessions: Vec<Session>,
     /// 读不了的文件或数据库，「路径: 原因」，给 `ai doctor` 和日志看。
     pub problems: Vec<String>,
+    /// 库里的对话（Hermes）给的正文修订号：厂商自己的 id（不带账号前缀）→ 修订号。原地改了正文（脱敏、改写）
+    /// 不动最后活动时间和发言数，索引靠它知道正文变了。没有修订号的不填。
+    pub revisions: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -215,12 +270,47 @@ impl Command {
 }
 
 /// 这家改过数据目录时，命令前面要带的 `CODEX_HOME='…' `（没改过是空串）：
-/// 守护进程起 CLI 用的环境来自第一次拉起它的终端，复制出去的命令也可能贴进别的终端，都不一定有这个变量。
+/// 守护进程起 CLI 用的环境来自第一次拉起它的终端，复制出去的命令也可能贴进别的终端，都不一定有这些变量。
+/// 这家每个改目录的变量都给定（[`VendorDirs::env_for`]）：要清的先 `env -u`，再设要设的，
+/// 如 `env -u OPENCODE_DB XDG_DATA_HOME='…' `。
 pub fn env_prefix(dirs: &VendorDirs, vendor: Vendor, home: &Path) -> String {
-    dirs.override_of(vendor, home)
-        .map_or_else(String::new, |(key, dir)| {
-            format!("{key}={} ", shell_quote(&dir.to_string_lossy()))
+    env_line(&VendorDirs::env_for(vendor, dirs.dir(vendor), home))
+}
+
+/// 这个账号的命令前面要带的目录变量（默认位置的账号是空串），见 [`env_prefix`]。
+pub fn account_env_prefix(account: &Account, home: &Path) -> String {
+    env_line(&account.env(home))
+}
+
+/// 一家有几个账号时默认账号的命令前缀：这家所有改目录的变量都清掉（`env -u OPENCODE_DB -u XDG_DATA_HOME `），
+/// 免得守护进程或登录 shell 里设着的哪一个把它带到别的账号。
+pub fn default_account_env_prefix(vendor: Vendor) -> String {
+    unset_line(vendor.info().dir_vars)
+}
+
+fn env_line(vars: &[EnvAssign]) -> String {
+    let unset: Vec<&str> = vars
+        .iter()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| *k)
+        .collect();
+    let set: String = vars
+        .iter()
+        .filter_map(|(k, v)| {
+            let v = v.as_ref()?;
+            Some(format!("{k}={} ", shell_quote(&v.to_string_lossy())))
         })
+        .collect();
+    format!("{}{set}", unset_line(&unset))
+}
+
+/// `env -u A -u B `；没有变量是空串。
+fn unset_line(vars: &[&str]) -> String {
+    if vars.is_empty() {
+        return String::new();
+    }
+    let flags: Vec<String> = vars.iter().map(|v| format!("-u {v}")).collect();
+    format!("env {} ", flags.join(" "))
 }
 
 fn shell_quote(s: &str) -> String {
@@ -285,26 +375,76 @@ fn affects_subdir_layout(root: &Path, path: &Path) -> bool {
     }
 }
 
-/// 本机各家的默认来源（`home` 是用户家目录；用环境变量改过数据目录的跟着改，见 `VendorDirs`）。
-/// 顺序和 [`Vendor::ALL`] 一致。
+/// 本机各家全部账号的来源（`home` 是用户家目录；账号怎么认见 [`local_accounts`]）。顺序和 [`Vendor::ALL`] 一致，
+/// 每家主账号在前。
 pub fn default_sources(home: &Path, trash: Trash) -> Vec<Box<dyn Source>> {
-    let dirs = VendorDirs::from_env(home);
-    Vendor::ALL
-        .into_iter()
-        .map(|v| -> Box<dyn Source> {
-            let dir = dirs.dir(v);
-            match v {
-                Vendor::Claude => Box::new(ClaudeSource::new(dir.join("projects"), trash.clone())),
-                Vendor::Codex => Box::new(CodexSource::new(dir, trash.clone())),
-                Vendor::Pi => Box::new(PiSource::new(dir.join("sessions"), trash.clone())),
-                Vendor::Hermes => Box::new(HermesSource::new(dir, trash.clone())),
-                Vendor::Kimi => Box::new(KimiSource::new(dir.join("sessions"), trash.clone())),
-                Vendor::Gemini => Box::new(GeminiSource::new(dir, trash.clone())),
-                Vendor::OpenCode => Box::new(OpenCodeSource::new(dir, trash.clone())),
-                Vendor::Qwen => Box::new(QwenSource::new(dir.join("projects"), trash.clone())),
-            }
+    sources_for(&local_accounts(home), trash)
+}
+
+/// 本机的账号：按当前进程的环境变量、工作目录和设置文件里手动加的账号，见 [`accounts`]。
+/// 设置文件读不了就只认环境变量和自动发现的。
+pub fn local_accounts(home: &Path) -> Vec<Account> {
+    let settings = Config::default_path()
+        .and_then(|p| Config::load(&p).ok())
+        .map(|c| c.accounts)
+        .unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
+    accounts(home, &cwd, |k| std::env::var_os(k), &settings)
+}
+
+/// 每个账号一个来源；不再支持的家（[`Vendor::listed`]）没有来源。
+pub fn sources_for(accounts: &[Account], trash: Trash) -> Vec<Box<dyn Source>> {
+    accounts
+        .iter()
+        .filter_map(|a| -> Option<Box<dyn Source>> {
+            let dir = a.dir.as_path();
+            let inner = adapter(a.vendor, dir, trash.clone().for_account(dir))?;
+            Some(if a.is_default() {
+                inner
+            } else {
+                Box::new(AccountSource::new(inner, a))
+            })
         })
         .collect()
+}
+
+/// 数据目录是 `dir` 的这家适配器（不包账号）；不再支持的家没有。
+fn adapter(vendor: Vendor, dir: &Path, trash: Trash) -> Option<Box<dyn Source>> {
+    let root = data_root(vendor, dir);
+    Some(match vendor {
+        Vendor::Claude => Box::new(ClaudeSource::new(root, trash)),
+        Vendor::Codex => Box::new(CodexSource::new(dir, trash)),
+        Vendor::Pi => Box::new(PiSource::new(root, trash)),
+        Vendor::Hermes => Box::new(HermesSource::new(dir, trash)),
+        Vendor::Kimi => Box::new(KimiSource::new(root, trash)),
+        Vendor::Gemini => Box::new(GeminiSource::new(dir, trash)),
+        Vendor::OpenCode => Box::new(OpenCodeSource::new(dir, trash)),
+        Vendor::Qwen => return None,
+        Vendor::Antigravity => Box::new(AntigravitySource::new(root, trash)),
+    })
+}
+
+/// 对话 `s` 是什么时候生成的：问它那家的适配器（[`Source::created_at`]）。各家只看这条对话自己的 id 和文件，
+/// 和账号目录、回收站无关，所以问的是一份不指向任何目录的适配器，调用方（认领）不用带着来源。
+pub fn created_at(s: &Session) -> Option<SystemTime> {
+    static BARE: OnceLock<Vec<Box<dyn Source>>> = OnceLock::new();
+    BARE.get_or_init(|| {
+        Vendor::ALL
+            .into_iter()
+            .filter_map(|v| adapter(v, Path::new(""), Trash::new("")))
+            .collect()
+    })
+    .iter()
+    .find(|src| src.vendor() == s.vendor)?
+    .created_at(s)
+}
+
+/// 这条对话的来源：同一家、同一个账号的那个。
+pub fn source_of<'a>(sources: &'a [Box<dyn Source>], s: &Session) -> Option<&'a dyn Source> {
+    sources
+        .iter()
+        .find(|src| src.vendor() == s.vendor && src.account() == s.account)
+        .map(|src| src.as_ref())
 }
 
 /// 有文件的厂商共用的「删除 = 移进回收站」。

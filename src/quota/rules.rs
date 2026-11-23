@@ -10,7 +10,7 @@ use crate::core::Vendor;
 /// 每家各自的有序渠道列表。`rules.json` 里按厂商的存储名（[`Vendor::key`]）分开写，没写的那家没有额度渠道。
 #[derive(Debug)]
 pub struct Rules {
-    by_vendor: [Vec<Channel>; Vendor::COUNT],
+    by_vendor: [Vec<Channel>; Vendor::SLOTS],
 }
 
 impl Rules {
@@ -24,7 +24,7 @@ impl Rules {
 
     fn parse(json: &str) -> serde_json::Result<Rules> {
         let mut doc: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json)?;
-        let mut by_vendor: [Vec<Channel>; Vendor::COUNT] = Default::default();
+        let mut by_vendor: [Vec<Channel>; Vendor::SLOTS] = Default::default();
         for v in Vendor::ALL {
             if let Some(list) = doc.remove(v.key()) {
                 by_vendor[v.index()] = serde_json::from_value(list)?;

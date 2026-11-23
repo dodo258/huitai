@@ -121,6 +121,18 @@ fn measure_real_dirs() {
             hits.len(),
             ms(t.elapsed())
         );
+        // 搜索结果行下的命中片段：界面只给一屏（最多 30 条）里正文命中的取，后台线程挨条读。
+        let screen: Vec<_> = hits.iter().take(30).filter(|h| h.in_body).collect();
+        let t = Instant::now();
+        let found = screen
+            .iter()
+            .filter(|h| matches!(index.snippet(&h.entry.session, q), Ok(Some(_))))
+            .count();
+        println!(
+            "    一屏命中片段: 取 {} 条、找到 {found} 条, {}",
+            screen.len(),
+            ms(t.elapsed())
+        );
     }
 
     let _ = std::fs::remove_dir_all(&data);

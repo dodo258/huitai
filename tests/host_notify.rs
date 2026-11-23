@@ -485,3 +485,33 @@ fn osc7501_blocked_does_not_alert_when_the_tab_is_in_front() {
     assert!(text.is_empty(), "在前台不该提醒：{text:?}");
     assert_eq!(board.notifier.state(&id), SessionState::Waiting);
 }
+
+/// 审计 v0.1.3 第 27 条：OpenCode 2.x 标签 A 等确认（根记录 blocked），三秒后标签 B 开工：只多一条带 B 的 id 的
+/// working，标签页上的扫光一直重画。灯要停在「刚做完」，等根记录改口 working 才变回在跑。
+#[test]
+fn osc7501_child_working_and_redraws_keep_the_root_blocked() {
+    let mut home = Home::new("n7501kids");
+    home.ensure_daemon();
+    let mut board = BoardLamps::subscribe(&home);
+    let id = start_detached(
+        &home,
+        "kids-1",
+        "printf ready; sleep 0.3; printf '\\033]7501;state=blocked:kind=permission:app=opencode\\033\\\\'; \
+         sleep 2.5; printf '\\033]7501;state=working:id=ses_b:app=opencode\\033\\\\'; \
+         i=0; while [ $i -lt 25 ]; do printf '\\033[1;1Hpulse'; sleep 0.1; i=$((i+1)); done; \
+         printf '\\033]0;pulse-done\\007'; sleep 0.3; \
+         printf '\\033]7501;state=working:app=opencode\\033\\\\'; sleep 30",
+    );
+    board.until("blocked 当响铃", |e| matches!(e, HostEvent::Bell { .. }));
+    assert_eq!(board.notifier.state(&id), SessionState::Done);
+    board.until("扫光画完", |e| matches!(e, HostEvent::Title { .. }));
+    assert_eq!(
+        board.notifier.state(&id),
+        SessionState::Done,
+        "别的标签页开工不能盖掉等确认"
+    );
+    board.until("根记录改口 working", |e| {
+        matches!(e, HostEvent::Output { .. })
+    });
+    assert_eq!(board.notifier.state(&id), SessionState::Running);
+}

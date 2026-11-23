@@ -61,7 +61,8 @@ struct Track {
     attached: bool,
     /// 标签页是否在前台；没接着或不知道时为 `None`。
     foreground: Option<bool>,
-    /// 最近一次提醒信号的时间，用来判断之后的输出是不是收尾重画。
+    /// 最近一次提醒信号或看过（接上、到前台、在会话台看过）的时间：之后 [`REDRAW_GRACE`] 内的输出是收尾重画
+    /// 或接上后按新窗口大小的重画，不算新一轮（否则回车打开一条答完的对话，重画一下 20 秒后又成了没看过）。
     last_signal: Option<Instant>,
     /// 在跑以来最近一次有输出（开跑时算一次），用来判断安静超时。
     last_output: Instant,
@@ -97,12 +98,13 @@ impl Track {
     }
 
     /// 用户看到了：未读的「刚做完」变成「等你回复」，这一轮不再提醒。
-    fn seen(&mut self) {
+    fn seen(&mut self, now: Instant) {
         // 在跑时没有待发提醒（开跑会清掉），什么也不用做。
         if self.state == SessionState::Running {
             return;
         }
         self.state = SessionState::Waiting;
+        self.last_signal = Some(now);
         self.pending = None;
         self.handled = true;
     }
@@ -185,7 +187,7 @@ impl Notifier {
             Activity::Attached => {
                 track.attached = true;
                 track.foreground = None;
-                track.seen();
+                track.seen(now);
             }
             Activity::Detached => {
                 track.attached = false;
@@ -194,10 +196,10 @@ impl Notifier {
             Activity::Focus(front) => {
                 track.foreground = Some(front);
                 if track.in_front() {
-                    track.seen();
+                    track.seen(now);
                 }
             }
-            Activity::Seen => track.seen(),
+            Activity::Seen => track.seen(now),
             // 上面已移除这条对话。
             Activity::Exited => {}
         }

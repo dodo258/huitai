@@ -2,8 +2,8 @@
 //!
 //! 每帧 = 1 字节类型 + 4 字节大端长度 + 负载。一条连接先握手：客户端发 `Hello`（自己的协议版本和程序版本），
 //! 守护进程回 `Hello`（它的版本、进程号、托管着几条对话，不接待时附上原因）；之后客户端发一个请求帧（`Q`），
-//! 守护进程回一个应答帧（`R`）。没有握手的旧客户端第一帧就是请求，新守护进程回 `Error`（[`OLD_CLIENT`]）；
-//! 没有握手的旧守护进程读不懂 `Hello` 直接关连接，客户端据此认出它，之后按旧协议说话（不发 `Hello`）。
+//! 守护进程回一个应答帧（`R`）。没有握手的旧客户端第一帧就是请求，新守护进程回 `Error`（[`OLD_CLIENT`]）。
+//! 握手早于第一个公开版（v0.1.0），发布出去的守护进程都会握手。
 //!
 //! 兼容规则：请求、应答、事件、记录的字段只加不改，新加的字段带 `#[serde(default)]`；读到不认识的字段忽略，
 //! 读到不认识的请求回 `Error`，不认识的事件跳过。协议有不兼容的改动才把 [`PROTOCOL`] 加一。
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{SessionId, Vendor};
 
-/// 协议版本。没有握手的旧版算 0。
+/// 协议版本。
 pub const PROTOCOL: u32 = 1;
 /// 守护进程还接待的最老客户端协议。
 pub const MIN_CLIENT_PROTOCOL: u32 = 1;
@@ -66,6 +66,34 @@ pub struct Build {
     /// 程序文件的修改时间（Unix 秒）；守护进程报的是它启动时的。
     #[serde(default)]
     pub built: u64,
+}
+
+impl Build {
+    /// 这一版的客户端认不认识 `vendor`。`host` 是守护进程自己：和它同版或更新的客户端什么都认识
+    /// （开发时版本号还没改，新加的厂商也照发）；比它旧的只认自己那一版已经有的厂商。
+    /// 守护进程据此只把客户端认识的厂商发给它：旧版解码到不认识的厂商会让整份应答失败。
+    pub fn knows(&self, vendor: Vendor, host: &Build) -> bool {
+        let at = |version: &str| Build {
+            version: version.to_owned(),
+            ..Build::default()
+        };
+        let mine = at(&self.version);
+        if !at(&host.version).newer_than(&mine) {
+            return true;
+        }
+        vendor_since(vendor).is_none_or(|since| !at(since).newer_than(&mine))
+    }
+}
+
+/// 这家从哪一版起有；`None` 是一开始就有的。新加一家时写它将随之发布的版本号。
+fn vendor_since(vendor: Vendor) -> Option<&'static str> {
+    match vendor {
+        Vendor::Claude | Vendor::Codex | Vendor::Pi => None,
+        Vendor::Hermes | Vendor::Kimi | Vendor::Gemini | Vendor::OpenCode | Vendor::Qwen => {
+            Some("0.1.3")
+        }
+        Vendor::Antigravity => Some("0.1.4"),
+    }
 }
 
 /// 守护进程对 `Hello` 的回答。
@@ -458,6 +486,22 @@ mod tests {
             serde_json::from_str::<Response>(&json).unwrap(),
             Response::Snapshot(snap)
         );
+    }
+
+    #[test]
+    fn older_clients_know_only_their_vendors() {
+        let at = |version: &str| Build {
+            protocol: PROTOCOL,
+            version: version.to_owned(),
+            ..Build::default()
+        };
+        let host = at("0.1.4");
+        assert!(at("0.1.2").knows(Vendor::Pi, &host));
+        assert!(!at("0.1.2").knows(Vendor::Kimi, &host));
+        assert!(at("0.1.3").knows(Vendor::Kimi, &host));
+        // 同版（开发时版本号还没改）和更新的客户端什么都认识。
+        assert!(at("0.1.2").knows(Vendor::Qwen, &at("0.1.2")));
+        assert!(at("0.2.0").knows(Vendor::Qwen, &host));
     }
 
     #[test]

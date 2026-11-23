@@ -1,4 +1,4 @@
-//! 「等你回复」汇总（`s`）：三家自己的对话里等你回复的排前、在跑的排后，选中、打开、`!`、换家、搜索、
+//! 「等你回复」汇总（`s`）：三家自己的对话按 要输入 > 失败 > 做完待看 > 在跑 排，选中、打开、`!`、换家、搜索、
 //! 状态变化时选中跟着走，以及渲染出来的样子。
 
 mod ui_support;
@@ -41,17 +41,17 @@ fn lists_waiting_first_then_running_across_vendors() {
     let mut app = demo_app(Vendor::Codex);
     press(&mut app, 's');
     assert!(app.board.is_some());
-    // 等你回复（含刚做完）在前、在跑在后，各自最近聊过的在前；三家混在一起。
+    // 等你回复在前，其次刚做完（还没看），在跑在后，各自最近聊过的在前；三家混在一起。
     assert_eq!(
         board_ids(&app),
         [
-            "p-blog-1", "c-shop-2", "c-blog-1", "c-shop-1", "x-api-1", "c-wt-1"
+            "c-blog-1", "p-blog-1", "c-shop-2", "c-shop-1", "x-api-1", "c-wt-1"
         ]
     );
     // 和顶栏「◐3 在跑 ◆3 等你」数的是同一批。
     assert_eq!(app.global_counts(), (3, 3));
     // 打开时停在第一条上，标签不换。
-    assert_eq!(selected(&app).as_deref(), Some("p-blog-1"));
+    assert_eq!(selected(&app).as_deref(), Some("c-blog-1"));
     assert_eq!(app.vendor, Vendor::Codex);
 }
 
@@ -74,7 +74,8 @@ fn leaves_out_background_and_stopped() {
 fn opens_the_selected_conversation_of_another_vendor() {
     let mut app = demo_app(Vendor::Claude);
     press(&mut app, 's');
-    // 第一条是 pi 的，会话台还停在 Claude 标签上。
+    // 第二条是 pi 的，会话台还停在 Claude 标签上。
+    app.key(key(KeyCode::Down));
     let effects = app.key(key(KeyCode::Enter));
     let [Effect::Open { entry, here: false }] = effects.as_slice() else {
         panic!("回车打开选中那条：{effects:?}");
@@ -82,7 +83,7 @@ fn opens_the_selected_conversation_of_another_vendor() {
     assert_eq!(entry.session.id.as_str(), "p-blog-1");
     assert_eq!(entry.session.vendor, Vendor::Pi);
     assert!(app.board.is_some(), "打开后汇总还开着，回来接着看下一条");
-    // ↓ 到第二条，c 复制的是它的恢复命令。
+    // ↓ 到第三条，c 复制的是它的恢复命令。
     app.key(key(KeyCode::Down));
     let effects = press(&mut app, 'c');
     let [Effect::CopyResume(e)] = effects.as_slice() else {
@@ -110,7 +111,7 @@ fn bang_cycles_waiting_ones_inside_the_board() {
         app.key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT));
         seen.push(selected(&app).unwrap());
     }
-    assert_eq!(seen, ["c-shop-2", "c-blog-1", "p-blog-1", "c-shop-2"]);
+    assert_eq!(seen, ["p-blog-1", "c-shop-2", "c-blog-1", "p-blog-1"]);
     assert!(app.board.is_some(), "! 不离开汇总");
     // 没有等你回复的：底栏说一句，选中不动。
     for id in ["p-blog-1", "c-shop-2", "c-blog-1"] {
@@ -124,6 +125,7 @@ fn bang_cycles_waiting_ones_inside_the_board() {
 fn selection_follows_the_conversation_when_its_state_changes() {
     let mut app = demo_app(Vendor::Claude);
     press(&mut app, 's');
+    app.key(key(KeyCode::Down));
     app.key(key(KeyCode::Down));
     assert_eq!(selected(&app).as_deref(), Some("c-shop-2"));
     // 回了它一句，它变成在跑，挪到后面那段：选中跟着它。
@@ -181,7 +183,7 @@ fn click_selects_and_double_click_opens() {
     let t0 = Instant::now();
     // 第一行是第一条（汇总没有钉住的组标题）。
     assert!(app.mouse(click(0), t0).is_empty());
-    assert_eq!(selected(&app).as_deref(), Some("p-blog-1"));
+    assert_eq!(selected(&app).as_deref(), Some("c-blog-1"));
     assert!(app.mouse(click(3), t0).is_empty());
     assert_eq!(selected(&app).as_deref(), Some("c-shop-1"));
     let effects = app.mouse(click(3), t0 + Duration::from_millis(100));
@@ -208,16 +210,22 @@ fn click_selects_and_double_click_opens() {
 fn renders_vendor_marks_projects_and_counts() {
     let mut app = demo_app(Vendor::Claude);
     press(&mut app, 's');
+    app.key(key(KeyCode::Down));
     load_preview(&mut app);
     let text = dump(&render(&mut app, W, H));
     let lines: Vec<&str> = text.lines().collect();
     assert!(lines[1].contains("等你回复和在跑的 · 各家"), "{}", lines[1]);
-    // 每行标题前是那家的标记，后面是项目名。
-    assert!(lines[2].contains("π RSS 初稿  blog"), "{}", lines[2]);
+    // 每行标题前是那家的标记，后面是项目名；状态灯在右边状态列。
+    let (title, status) = lines[2]
+        .split_once("✻ 给博客加 RSS 订阅  blog")
+        .unwrap_or_else(|| panic!("{}", lines[2]));
+    assert!(!title.contains('◆'), "{}", lines[2]);
+    assert!(status.contains('◆'), "{}", lines[2]);
+    assert!(lines[3].contains("π RSS 初稿  blog"), "{}", lines[3]);
     assert!(
-        lines[3].contains("✻ 把优惠券接口换成新版  shop"),
+        lines[4].contains("✻ 把优惠券接口换成新版  shop"),
         "{}",
-        lines[3]
+        lines[4]
     );
     assert!(
         lines[6].contains("◎ 给订单列表接口补单元测试  api"),

@@ -1,5 +1,5 @@
 //! 全文搜索：标题（含会话台里改的名字）和正文都能搜到；中文按子串、英文按词前缀；
-//! 内容变了重建、对话没了不再命中；只在当前那一家里搜。
+//! 内容变了重建、对话没了不再命中；只在当前那一家里搜，或各家一起搜（`search_all`）。
 
 mod index_common;
 
@@ -131,9 +131,9 @@ fn changed_content_is_reindexed_and_removed_sessions_stop_hitting() {
     assert_eq!(index.index_bodies(&mut || true).unwrap(), 0);
 }
 
-#[test]
-fn search_stays_inside_one_vendor_and_limit_applies() {
-    let env = setup("vendor");
+/// Claude 三条（见 [`setup`]）加 pi 一条「博客登录坏了」，正文都建好索引。
+fn claude_and_pi(name: &str) -> (Env, Index) {
+    let env = setup(name);
     let pi_root = env.root.join("pi/sessions/--Users-demo-projects-blog--");
     fs::create_dir_all(&pi_root).unwrap();
     fs::write(
@@ -141,6 +141,7 @@ fn search_stays_inside_one_vendor_and_limit_applies() {
         [
             r#"{"type":"session","version":3,"id":"p1","timestamp":"2026-11-20T10:00:00.000Z","cwd":"/Users/demo/projects/blog"}"#,
             r#"{"type":"message","id":"m1","timestamp":"2026-11-20T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"博客登录坏了"}],"timestamp":1763632801000}}"#,
+            r#"{"type":"message","id":"m2","timestamp":"2026-11-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"改好了跳转"}],"timestamp":1763632802000}}"#,
         ]
         .join("\n"),
     )
@@ -156,6 +157,12 @@ fn search_stays_inside_one_vendor_and_limit_applies() {
     .unwrap();
     index.refresh();
     index.index_bodies(&mut || true).unwrap();
+    (env, index)
+}
+
+#[test]
+fn search_stays_inside_one_vendor_and_limit_applies() {
+    let (_env, index) = claude_and_pi("vendor");
 
     assert_eq!(
         hit_ids(&index.search(Vendor::Claude, "登录", 50).unwrap()),
@@ -171,4 +178,129 @@ fn search_stays_inside_one_vendor_and_limit_applies() {
         1
     );
     assert_eq!(index.search(Vendor::Claude, "好的", 1).unwrap().len(), 1);
+}
+
+#[test]
+fn search_all_merges_vendors_titles_first_then_body_by_relevance() {
+    let (_env, index) = claude_and_pi("all");
+    let vendors =
+        |hits: &[Hit]| -> Vec<Vendor> { hits.iter().map(|h| h.entry.session.vendor).collect() };
+
+    // pi 那条标题命中排前，Claude 那条只在正文里命中排后。
+    let hits = index.search_all("登录", 50).unwrap();
+    assert_eq!(
+        hit_ids(&hits),
+        [("p1".to_owned(), true), ("login".to_owned(), false)]
+    );
+    assert_eq!(vendors(&hits), [Vendor::Pi, Vendor::Claude]);
+
+    // 两家都只在正文里命中：都在，各自标着正文命中。
+    let hits = index.search_all("跳转", 50).unwrap();
+    let mut ids: Vec<_> = hits.iter().map(|h| h.entry.session.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["login", "p1"]);
+    assert!(hits.iter().all(|h| h.in_body && !h.in_title));
+
+    // 条数上限对几家合起来算；一家里也搜得到的词各家一起搜不丢。
+    assert_eq!(index.search_all("登录", 1).unwrap().len(), 1);
+    assert_eq!(
+        hit_ids(&index.search_all("worktree", 50).unwrap()),
+        hit_ids(&index.search(Vendor::Claude, "worktree", 50).unwrap())
+    );
+    assert!(index.search_all("没出现过的词", 50).unwrap().is_empty());
+}
+
+#[test]
+fn body_hits_carry_a_snippet_and_title_only_hits_do_not() {
+    let env = setup("snippet");
+    let index = ready(&env);
+
+    // 「跳转」只在正文里：结果标着正文命中，读回的片段里有它，高亮落在它上面。
+    let hits = index.search(Vendor::Claude, "跳转", 50).unwrap();
+    assert_eq!(hit_ids(&hits), [("login".to_owned(), false)]);
+    assert!(hits[0].in_body);
+    let snip = index
+        .snippet(&hits[0].entry.session, "跳转")
+        .unwrap()
+        .expect("正文里有这个词");
+    assert_eq!(snip.text, "我修复了登录页面的跳转问题");
+    let marked: Vec<&str> = snip.marks.iter().map(|&(a, b)| &snip.text[a..b]).collect();
+    assert_eq!(marked, ["跳转"]);
+
+    // 英文前缀、不分大小写，和查看视图的高亮一样按子串标。
+    let hits = index.search(Vendor::Claude, "WORKTREE", 50).unwrap();
+    let snip = index
+        .snippet(&hits[0].entry.session, "WORKTREE")
+        .unwrap()
+        .unwrap();
+    assert_eq!(&snip.text[snip.marks[0].0..snip.marks[0].1], "worktree");
+
+    // 「结算」只在标题里：不标正文命中，界面不给它加那一行。
+    let hits = index.search(Vendor::Claude, "结算", 50).unwrap();
+    assert_eq!(hit_ids(&hits), [("cart".to_owned(), true)]);
+    assert!(!hits[0].in_body);
+}
+
+/// 审计 v0.1.4 第 23 条：停用账号留在缓存里的对话不占条数上限，挤不掉当前账号的正文结果。
+#[test]
+fn stale_account_rows_do_not_eat_the_limit() {
+    use huitai::core::Account;
+    use huitai::sources::AccountSource;
+
+    let env = Env::new("search-stale-account");
+    env.write_session(
+        "keep",
+        "看一下",
+        "这次只清了过期的缓存，别的都留着没动，顺手把日志也按天切开了。",
+    );
+    let other = Env::new("search-stale-account-b");
+    for i in 0..5 {
+        other.write_session(&format!("stale{i}"), "看一下", "缓存 缓存 缓存");
+    }
+    let trash = Trash::new(env.root.join("trash"));
+    let account = Account::new(Vendor::Claude, "乙", other.root.join("claude"), &env.root);
+    assert!(!account.key.is_empty(), "不在默认位置，是另一个账号");
+    let both = Index::open(
+        &env.data(),
+        vec![
+            Box::new(ClaudeSource::new(env.projects(), trash.clone())),
+            Box::new(AccountSource::new(
+                Box::new(ClaudeSource::new(other.projects(), trash.clone())),
+                &account,
+            )),
+        ],
+    )
+    .unwrap();
+    both.refresh();
+    both.index_bodies(&mut || true).unwrap();
+    assert_eq!(both.search(Vendor::Claude, "缓存", 50).unwrap().len(), 6);
+    drop(both);
+
+    // 设置里删了「乙」：它的对话留在缓存里，但不列、不搜，也不占 limit。
+    let index = Index::open(
+        &env.data(),
+        vec![Box::new(ClaudeSource::new(env.projects(), trash))],
+    )
+    .unwrap();
+    assert_eq!(
+        hit_ids(&index.search(Vendor::Claude, "缓存", 1).unwrap()),
+        [("keep".to_owned(), false)]
+    );
+}
+
+/// 审计 v0.1.4 第 24 条：全文索引去变音、不分大小写（`unicode61 remove_diacritics 2`），搜 `cafe` 命中只含
+/// `Café` 的正文；片段按同样的规则找，不能是空的。
+#[test]
+fn snippet_folds_diacritics_like_the_index() {
+    let env = Env::new("search-fold");
+    env.write_session("cafe", "看一下", "下午去 Café Lumière 坐坐");
+    let index = ready(&env);
+    let hits = index.search(Vendor::Claude, "cafe lumiere", 50).unwrap();
+    assert_eq!(hit_ids(&hits), [("cafe".to_owned(), false)]);
+    let snip = index
+        .snippet(&hits[0].entry.session, "cafe lumiere")
+        .unwrap()
+        .expect("索引命中了，片段也得找得到");
+    let marked: Vec<&str> = snip.marks.iter().map(|&(a, b)| &snip.text[a..b]).collect();
+    assert_eq!(marked, ["Café", "Lumière"]);
 }

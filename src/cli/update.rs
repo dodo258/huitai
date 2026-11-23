@@ -13,8 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::release;
-use crate::opener::exec;
+use crate::core::{exec, release};
 
 /// 记上次查的时间和查到的最新版本，在数据目录里。
 const CACHE_FILE: &str = "update-check.json";
@@ -189,6 +188,7 @@ fn curl(url: &str, timeout: Duration, out: Option<&Path>) -> Result<String, Stri
     exec::run(
         Path::new("/usr/bin/curl"),
         &args,
+        None,
         timeout + Duration::from_secs(5),
     )
     .map_err(|e| format!("下载 {url} 失败：{e}"))
@@ -325,6 +325,7 @@ fn sha256(path: &Path) -> Result<String, String> {
     let out = exec::run(
         Path::new("/usr/bin/shasum"),
         &["-a", "256", &file],
+        None,
         SHASUM_TIMEOUT,
     )
     .map_err(|e| format!("算校验和失败：{e}"))?;

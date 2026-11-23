@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use huitai::core::{SessionId, Vendor};
 use huitai::host::{
-    self, AttachMsg, Attachment, Daemon, EventStream, HostEvent, HostedInfo, Request, Response,
-    Screen, SpawnSpec,
+    self, AttachMsg, Attachment, Daemon, DaemonHandle, EventStream, HostEvent, HostedInfo, Request,
+    Response, Screen, SpawnSpec,
 };
 
 pub const WAIT: Duration = Duration::from_secs(10);
@@ -23,6 +23,8 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 /// 进程内的守护进程，数据目录在 /tmp 下（socket 路径不能太长）。drop 时结束所有对话、删目录。
 pub struct TestHost {
     pub dir: PathBuf,
+    /// 进程内接口（守护进程的提醒循环在测试里不跑，状态由测试自己设）。
+    pub handle: DaemonHandle,
 }
 
 impl TestHost {
@@ -34,8 +36,9 @@ impl TestHost {
         ));
         let _ = fs::remove_dir_all(&dir);
         let daemon = Daemon::bind(&dir).expect("守护进程监听失败");
+        let handle = daemon.handle();
         thread::spawn(move || daemon.run());
-        Self { dir }
+        Self { dir, handle }
     }
 
     pub fn request(&self, req: &Request) -> Response {

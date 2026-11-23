@@ -10,7 +10,10 @@
 //! 两套按 id 去重：同一个 id 取 `time_updated` 更晚的那套（一样晚取 2.x），预览、正文也从那套读。
 //! 子代理开的对话（`parent_id` 不空）、OpenCode 自己归档的（`time_archived`）、一句话都没说的不列；
 //! 这些按去重后胜出的那一行判断，新的那套里归档了，另一套里的旧副本也不列。
-//! 时间都是毫秒。只读打开（`sqlite3 -readonly`），从不写库。
+//! 1.x 撤销（`/undo`）不删消息，只在 `session.revert` 记下撤到哪条消息（`messageID`），这条和之后的都不显示
+//! （v1.19.6 `tui/src/routes/session/index.tsx`）：列表、计数、预览、整段都只看它之前的（[`live_v1`]）。
+//! 库里可能有按字节截断的汉字、JavaScript 截在 emoji 中间留下的孤立代理项：读出来只坏那个字（[`sqlite::text`]）。
+//! 时间都是毫秒。只读打开（见 `sqlite`），从不写库。
 //!
 //! - 恢复 `opencode <目录> -s <id>`（两版都认：1.x 的位置参数叫 project，2.x 叫 directory）。
 //! - 新建 `opencode <目录>`，不先定 id：1.x 的 `-s` 遇到不存在的 id 报错退出（`cli/tui/validate-session.ts`），
@@ -25,9 +28,10 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use super::jsonl;
-use super::sqlite::{self, Row};
+use super::sqlite::{self, Row, str_col};
 use super::{
-    Command, Part, PreviewMessage, Role, Scan, Source, Transcript, Trash, TrashEntry, transcript,
+    Command, Delivery, Part, PreviewMessage, Role, Scan, Source, Transcript, Trash, TrashEntry,
+    transcript,
 };
 use crate::core::{Session, SessionId, Vendor};
 
@@ -59,9 +63,13 @@ impl OpenCodeSource {
         sqlite::query(&self.db, sql)
     }
 
+    /// 库里的表名，加上 1.x `session` 表的列（`session.<列名>`，老库没有 `revert` 列）。
     fn tables(&self) -> io::Result<HashSet<String>> {
         Ok(self
-            .query("select name from sqlite_master where type = 'table'")?
+            .query(
+                "select name from sqlite_master where type = 'table' \
+                 union all select 'session.' || name as name from pragma_table_info('session')",
+            )?
             .iter()
             .filter_map(|r| str_col(r, "name").map(str::to_owned))
             .collect())
@@ -138,10 +146,111 @@ impl OpenCodeSource {
         }
     }
 
+    /// 最后 `n` 条有字的消息（新的在前），只带字：一轮里只调了工具的那几步再多也跳过去，
+    /// 工具的输入输出不读出来。
+    fn previews(&self, id: &str, n: usize) -> io::Result<Vec<Message>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        match self.locate(id)? {
+            Some(Schema::V1) => self.previews_v1(id, n),
+            Some(Schema::V2) => self.previews_v2(id, n),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn previews_v1(&self, id: &str, n: usize) -> io::Result<Vec<Message>> {
+        let msgs = self.query(&format!(
+            "select id, time_created, role from (select m.id, m.time_created, {role} as role from message m \
+             where m.session_id = '{id}' and {live} \
+             and exists (select 1 from part p where p.message_id = m.id and {text})) \
+             where role in ('user', 'assistant') order by time_created desc, id desc limit {n}",
+            role = field("m.data", "$.role"),
+            live = live_v1(&self.tables()?, "m"),
+            text = text_part_v1(),
+        ))?;
+        let ids = quoted_ids(&msgs);
+        let mut texts: HashMap<String, Vec<String>> = HashMap::new();
+        if !ids.is_empty() {
+            add_texts(
+                &mut texts,
+                self.query(&format!(
+                    "select p.message_id, {} as text from part p \
+                     where p.message_id in ({ids}) and {} order by p.message_id, p.id",
+                    field("p.data", "$.text"),
+                    text_part_v1(),
+                ))?,
+            );
+        }
+        Ok(text_messages(&msgs, "role", |r| {
+            texts.remove(str_col(r, "id")?)
+        }))
+    }
+
+    fn previews_v2(&self, id: &str, n: usize) -> io::Result<Vec<Message>> {
+        let split = self.tables()?.contains("session_part");
+        let split_text = if split {
+            format!(
+                "exists (select 1 from session_part p where p.message_id = m.id and {}) or ",
+                text_part_v2()
+            )
+        } else {
+            String::new()
+        };
+        let msgs = self.query(&format!(
+            "select m.id, m.type, m.time_created, case when m.type = 'user' then {user} end as text \
+             from session_message m where m.session_id = '{id}' and ( \
+             (m.type = 'user' and {user_said}) or \
+             (m.type = 'assistant' and ({split_text}exists (select 1 from {INLINE_V2} where {inline})))) \
+             order by m.seq desc limit {n}",
+            user = field("m.data", "$.text"),
+            user_said = nonblank(&field("m.data", "$.text")),
+            inline = inline_text_v2(),
+        ))?;
+        let assistant: Vec<Row> = msgs
+            .iter()
+            .filter(|r| str_col(r, "type") == Some("assistant"))
+            .cloned()
+            .collect();
+        let ids = quoted_ids(&assistant);
+        let mut texts: HashMap<String, Vec<String>> = HashMap::new();
+        if !ids.is_empty() {
+            // 拆出来的块在前，库里还留着的内联块接在后面（同 `messages_v2`）。
+            if split {
+                add_texts(
+                    &mut texts,
+                    self.query(&format!(
+                        "select p.message_id, {} as text from session_part p \
+                         where p.message_id in ({ids}) and {} order by p.message_id, p.ordinal",
+                        field("p.data", "$.text"),
+                        text_part_v2(),
+                    ))?,
+                );
+            }
+            add_texts(
+                &mut texts,
+                self.query(&format!(
+                    "select m.id as message_id, {} as text from session_message m, {INLINE_V2} \
+                     where m.id in ({ids}) and {} order by m.id, cast(j.key as integer)",
+                    field("j.value", "$.text"),
+                    inline_text_v2(),
+                ))?,
+            );
+        }
+        Ok(text_messages(&msgs, "type", |r| {
+            match str_col(r, "type")? {
+                "user" => Some(vec![str_col(r, "text")?.to_owned()]),
+                _ => texts.remove(str_col(r, "id")?),
+            }
+        }))
+    }
+
     fn messages_v1(&self, id: &str, limit: usize) -> io::Result<Vec<Message>> {
         let msgs = self.query(&format!(
-            "select id, time_created, json_extract(case when json_valid(data) then data end, '$.role') as role from message \
-             where session_id = '{id}' order by time_created desc, id desc limit {limit}"
+            "select m.id, m.time_created, {role} as role from message m \
+             where m.session_id = '{id}' and {live} order by m.time_created desc, m.id desc limit {limit}",
+            role = field("m.data", "$.role"),
+            live = live_v1(&self.tables()?, "m"),
         ))?;
         let ids = quoted_ids(&msgs);
         let mut parts: HashMap<String, Vec<Value>> = HashMap::new();
@@ -249,12 +358,10 @@ impl Source for OpenCodeSource {
         let Some(id) = sqlite::safe_id(session.id.as_str()) else {
             return Ok(Vec::new());
         };
-        // 一轮里工具调用的那几步没有字，多取一些再挑有字的。
         let mut out: Vec<PreviewMessage> = self
-            .messages(id, n.saturating_mul(4).max(n))?
+            .previews(id, n)?
             .into_iter()
             .filter_map(Message::preview)
-            .take(n)
             .map(jsonl::clip)
             .collect();
         out.reverse();
@@ -285,8 +392,10 @@ impl Source for OpenCodeSource {
         };
         let sql = match self.locate(id)? {
             Some(Schema::V1) => format!(
-                "select count(*) as n from message where session_id = '{id}' \
-                 and json_extract(case when json_valid(data) then data end, '$.role') = 'user'"
+                "select count(*) as n from message m where m.session_id = '{id}' \
+                 and {} = 'user' and {}",
+                field("m.data", "$.role"),
+                live_v1(&self.tables()?, "m"),
             ),
             Some(Schema::V2) => format!(
                 "select count(*) as n from session_message where session_id = '{id}' and type = 'user'"
@@ -318,8 +427,24 @@ impl Source for OpenCodeSource {
         cmd
     }
 
+    /// `--prompt` 两版不一样：2.x 模型就绪后自己提交，1.x（v1.19.6 `routes/session/index.tsx`）只填进输入框、
+    /// 要按回车。装的是哪版看这条对话在哪套表里（和读正文一样，见 [`OpenCodeSource::locate`]）：
+    /// 在 2.x 的表里就是 2.x 在写它；只在 1.x 的表里、或 1.x 那份更新，就是 1.x 在用。读不了库按 1.x 报。
+    fn message_delivery(&self, session: &Session) -> Delivery {
+        let schema =
+            sqlite::safe_id(session.id.as_str()).and_then(|id| self.locate(id).ok().flatten());
+        match schema {
+            Some(Schema::V2) => Delivery::Sent,
+            Some(Schema::V1) | None => Delivery::Typed,
+        }
+    }
+
     fn new_cmd(&self, cwd: &Path) -> Command {
         Command::new("opencode", &[&cwd.to_string_lossy()], cwd)
+    }
+
+    fn created_at(&self, session: &Session) -> Option<SystemTime> {
+        id_created(session.id.native(), session.last_active)
     }
 
     /// 只隐藏：对话在 OpenCode 自己的库里。
@@ -330,6 +455,11 @@ impl Source for OpenCodeSource {
 
     fn restore(&self, entry: &TrashEntry) -> io::Result<()> {
         self.trash.restore(entry)
+    }
+
+    /// 会话路径是空的：对话都在这个库里，看库和它的 WAL。
+    fn moment_files(&self, _session: &Session) -> Vec<PathBuf> {
+        super::with_wal(&self.db)
     }
 
     /// 监听库所在的目录（库文件可能还没建）。
@@ -370,26 +500,108 @@ fn list_sql(schema: Schema, tables: &HashSet<String>) -> Option<String> {
         Schema::V1 if has("session") && has("message") && has("part") => Some(format!(
             "select s.id, {dir} as directory, s.title, s.time_created, s.time_updated, \
              (select count(*) from message m where m.session_id = s.id \
-              and json_extract(case when json_valid(m.data) then m.data end, '$.role') = 'user') as users, \
-             (select json_extract(case when json_valid(p.data) then p.data end, '$.text') from message m join part p on p.message_id = m.id \
-              where m.session_id = s.id and json_extract(case when json_valid(m.data) then m.data end, '$.role') = 'user' \
-              and json_extract(case when json_valid(p.data) then p.data end, '$.type') = 'text' \
-              and coalesce(json_extract(case when json_valid(p.data) then p.data end, '$.synthetic'), 0) = 0 \
-              and coalesce(json_extract(case when json_valid(p.data) then p.data end, '$.ignored'), 0) = 0 \
+              and {role} = 'user' and {live}) as users, \
+             (select {text} from message m join part p on p.message_id = m.id \
+              where m.session_id = s.id and {role} = 'user' and {live} and {text_part} \
               order by m.time_created, m.id, p.id limit 1) as first, \
              s.parent_id, s.time_archived from session s",
-            dir = dir("s")
+            dir = dir("s"),
+            role = field("m.data", "$.role"),
+            live = live_v1(tables, "m"),
+            text = field("p.data", "$.text"),
+            text_part = text_part_v1(),
         )),
+        // 第一句取第一条有字的用户消息：第一条坏了（截断的 JSON）时用后面的。
         Schema::V2 if has("session_v2") && has("session_message") => Some(format!(
             "select s.id, {dir} as directory, s.title, s.time_created, s.time_updated, \
              (select count(*) from session_message m where m.session_id = s.id and m.type = 'user') as users, \
-             (select json_extract(case when json_valid(m.data) then m.data end, '$.text') from session_message m \
-              where m.session_id = s.id and m.type = 'user' order by m.seq limit 1) as first, \
+             (select {text} from session_message m \
+              where m.session_id = s.id and m.type = 'user' and {said} order by m.seq limit 1) as first, \
              s.parent_id, s.time_archived from session_v2 s",
-            dir = dir("s")
+            dir = dir("s"),
+            text = field("m.data", "$.text"),
+            said = nonblank(&field("m.data", "$.text")),
         )),
         _ => None,
     }
+}
+
+/// 1.x 消息 `m` 没被撤销（在它那条对话 `session.revert.messageID` 之前；上游按 id 排先后）。老库没有这一列时总是真。
+fn live_v1(tables: &HashSet<String>, m: &str) -> String {
+    if !tables.contains("session.revert") {
+        return "1".to_owned();
+    }
+    format!(
+        "not exists (select 1 from session r where r.id = {m}.session_id and {m}.id >= {})",
+        field("r.revert", "$.messageID")
+    )
+}
+
+/// `json` 这列（坏的 JSON 当 null，不让整句报错：SQLite 的 `and` 不保证先判 `json_valid`）里 `path` 的值。
+fn field(json: &str, path: &str) -> String {
+    format!("json_extract(case when json_valid({json}) then {json} end, '{path}')")
+}
+
+/// `expr` 去掉空白后不是空的。
+fn nonblank(expr: &str) -> String {
+    format!("trim(coalesce({expr}, ''), ' ' || char(9, 10, 13)) <> ''")
+}
+
+/// 1.x 里算字的块（同 [`block_v1`]：系统塞的、被忽略的、空白的不算），`p` 是 `part`。
+fn text_part_v1() -> String {
+    format!(
+        "{} = 'text' and coalesce({}, 0) = 0 and coalesce({}, 0) = 0 and {}",
+        field("p.data", "$.type"),
+        field("p.data", "$.synthetic"),
+        field("p.data", "$.ignored"),
+        nonblank(&field("p.data", "$.text"))
+    )
+}
+
+/// 2.x 拆出来的字块（data 里有 type 以它为准，没有看 `type` 列，同 `messages_v2`），`p` 是 `session_part`。
+fn text_part_v2() -> String {
+    format!(
+        "coalesce({}, p.type) = 'text' and {}",
+        field("p.data", "$.type"),
+        nonblank(&field("p.data", "$.text"))
+    )
+}
+
+/// 2.x 助手消息 `m` 里还内联在 `data.content` 的块，`j` 是一块。
+const INLINE_V2: &str = "json_each(case when json_valid(m.data) then m.data end, '$.content') j";
+
+fn inline_text_v2() -> String {
+    format!(
+        "{} = 'text' and {}",
+        field("j.value", "$.type"),
+        nonblank(&field("j.value", "$.text"))
+    )
+}
+
+/// 按 `message_id` 收下预览查询取出的字（`text` 列）。
+fn add_texts(texts: &mut HashMap<String, Vec<String>>, rows: Vec<Row>) {
+    for r in &rows {
+        if let (Some(m), Some(t)) = (str_col(r, "message_id"), str_col(r, "text")) {
+            texts.entry(m.to_owned()).or_default().push(t.to_owned());
+        }
+    }
+}
+
+/// 预览查询的结果拼成只有字块的消息：`role_col` 是角色列，`texts` 给每行的几段字（没有就不要这条）。
+fn text_messages(
+    rows: &[Row],
+    role_col: &str,
+    mut texts: impl FnMut(&Row) -> Option<Vec<String>>,
+) -> Vec<Message> {
+    rows.iter()
+        .filter_map(|r| {
+            Some(Message {
+                role: role_of(str_col(r, role_col)?)?,
+                at: millis(r.get("time_created")?),
+                blocks: texts(r)?.iter().filter_map(|t| text_block(t)).collect(),
+            })
+        })
+        .collect()
 }
 
 /// 一套表里的一行对话，去重以后再看 `listable`。
@@ -430,6 +642,7 @@ fn session_from_row(row: &Row) -> Option<Listed> {
         last_active,
         message_count: users,
         automatic: false,
+        account: String::new(),
     };
     Some(Listed {
         session,
@@ -585,16 +798,49 @@ fn quoted_ids(rows: &[Row]) -> String {
         .join(", ")
 }
 
-fn str_col<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
-    row.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+/// JSON 文本列（坏的 JSON 这一块跳过）。带孤立代理项转义（`\ud83d`）的 serde 不认，
+/// 把那个转义换成 U+FFFD 再解，其余正文照留（同 [`sqlite::text`] 的换法）。
+fn json_col(row: &Row, key: &str) -> Option<Value> {
+    let text = row.get(key)?.as_str()?;
+    serde_json::from_str(text)
+        .or_else(|_| serde_json::from_str(&mend_surrogates(text)))
+        .ok()
 }
 
-/// 存成 JSON 文本的列。
-fn json_col(row: &Row, key: &str) -> Option<Value> {
-    serde_json::from_str(row.get(key)?.as_str()?).ok()
+/// JSON 文本里不成对的 `\uD800`–`\uDFFF` 转义换成 `\ufffd`。`\\` 整个跳过，不会把字面的 `\u` 当转义。
+fn mend_surrogates(json: &str) -> String {
+    let b = json.as_bytes();
+    let hex4 = |at: usize| {
+        let h = std::str::from_utf8(b.get(at..at + 4)?).ok()?;
+        u16::from_str_radix(h, 16).ok()
+    };
+    let high = |u: u16| (0xD800..0xDC00).contains(&u);
+    let low = |u: u16| (0xDC00..0xE000).contains(&u);
+    let mut out = String::with_capacity(json.len());
+    let (mut last, mut i) = (0, 0);
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let Some(u) = (b.get(i + 1) == Some(&b'u')).then(|| hex4(i + 2)).flatten() else {
+            i += 2;
+            continue;
+        };
+        let paired = high(u) && b.get(i + 6..i + 8) == Some(b"\\u") && hex4(i + 8).is_some_and(low);
+        if paired {
+            i += 12;
+        } else if high(u) || low(u) {
+            out.push_str(&json[last..i]);
+            out.push_str("\\ufffd");
+            i += 6;
+            last = i;
+        } else {
+            i += 6;
+        }
+    }
+    out.push_str(&json[last..]);
+    out
 }
 
 /// 毫秒 → `SystemTime`。
@@ -730,6 +976,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir2);
     }
 
+    /// 审计 v0.1.3 第 04 条：`--prompt` 在 2.x 自己提交，1.x 只填进输入框。按这条对话在哪套表里报。
+    #[test]
+    fn message_delivery_follows_the_schema_that_owns_the_session() {
+        let (dir, src) = fixture_db("delivery", "");
+        let at = |id: &str| Session {
+            vendor: Vendor::OpenCode,
+            id: SessionId::from(id),
+            cwd: PathBuf::from("/work/api"),
+            path: PathBuf::new(),
+            title: None,
+            git_branch: None,
+            last_active: SystemTime::UNIX_EPOCH,
+            message_count: 1,
+            automatic: false,
+            account: String::new(),
+        };
+        for (id, want) in [
+            ("ses_e113ed23fffeV2onlyAbCdEfGh", Delivery::Sent),
+            ("ses_e115d56bfffeDupV2newerAbCd", Delivery::Sent),
+            ("ses_e114e147fffeDupV1newerAbCd", Delivery::Typed),
+            ("ses_e11a9a1ffffeV1onlyAbCdEfGh", Delivery::Typed),
+            ("ses_x' or 1", Delivery::Typed),
+        ] {
+            assert_eq!(src.message_delivery(&at(id)), want, "{id}");
+        }
+        // 读不了库（没装、路径不对）：按 1.x 报，宁可多叫人按一次回车。
+        let missing = OpenCodeSource::new(dir.join("nope/opencode.db"), Trash::new(dir.join("t")));
+        assert_eq!(
+            missing.message_delivery(&at("ses_e113ed23fffeV2onlyAbCdEfGh")),
+            Delivery::Typed
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn fallback_titles() {
         assert!(is_fallback_title("New session - 2026-11-22T13:30:15.123Z"));
@@ -753,6 +1033,7 @@ mod tests {
             last_active: SystemTime::UNIX_EPOCH,
             message_count: 1,
             automatic: false,
+            account: String::new(),
         };
         let cmd = src.resume_cmd(&s);
         assert_eq!(

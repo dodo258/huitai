@@ -285,3 +285,44 @@ fn missing_root_is_empty() {
     let scan = src.scan();
     assert!(scan.sessions.is_empty() && scan.problems.is_empty());
 }
+
+/// 只剩正文库的长对话：以前一次只能取最后 3000 项（sqlite3 命令行的输出有上限），超过的整段对话从中间开始。
+/// 现在全取到；正文累计超过读 rollout 同样的 32MB 上限时才从最新往前截，并标出截过。
+#[test]
+fn long_history_in_db_is_read_whole_up_to_the_byte_cap() {
+    let (root, src) = setup("codex-long-history", true);
+    let db = root.join("thread_history_1.sqlite");
+    build_db(
+        &db,
+        &format!(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < 3500) \
+             insert into thread_items select '{DB_NO_FILE}', 't9', 'm' || i, 100 + i, 1795173000000 + i, \
+             '{{\"type\":\"agentMessage\",\"id\":\"m' || i || '\",\"text\":\"第 ' || i || ' 步\"}}', 'agentMessage' from n;"
+        ),
+    );
+    let f = by_id(&src.scan().sessions, DB_NO_FILE);
+    let t = src.load_transcript(&f).unwrap();
+    assert!(!t.truncated);
+    assert_eq!(t.parts.len(), 3502, "库里两项加新写的 3500 项");
+    let text = |p: &huitai::sources::Part| match p {
+        huitai::sources::Part::Message(m) => m.text.clone(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(text(&t.parts[0]), "只有第一句话");
+    assert_eq!(text(&t.parts[3501]), "第 3500 步");
+
+    // 再写 40 项各 1MB 的：最新的那些放得进 32MB，更早的不读，标成截过。
+    build_db(
+        &db,
+        &format!(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < 40) \
+             insert into thread_items select '{DB_NO_FILE}', 't10', 'big' || i, 10000 + i, 1795174000000 + i, \
+             '{{\"type\":\"agentMessage\",\"id\":\"big' || i || '\",\"text\":\"' || i || printf('%.*c', 1048576, 'x') || '\"}}', \
+             'agentMessage' from n;"
+        ),
+    );
+    let t = src.load_transcript(&f).unwrap();
+    assert!(t.truncated);
+    assert!((30..40).contains(&t.parts.len()), "{}", t.parts.len());
+    assert!(text(t.parts.last().unwrap()).starts_with("40x"));
+}

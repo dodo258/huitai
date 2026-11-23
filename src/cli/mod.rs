@@ -1,7 +1,9 @@
-//! 命令入口：`ai`、`ai doctor`、`ai attach <id>`、`ai daemon`、`ai update`。
+//! 命令入口：`ai`、`ai doctor`、`ai attach <id>`、`ai export <id>`、`ai list`、`ai search <词>`、`ai daemon`、`ai update`。
 
 mod daemon;
 mod doctor;
+mod export;
+mod query;
 mod summon;
 mod update;
 
@@ -10,7 +12,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::core::{Config, SessionId};
+use crate::core::{Config, SessionId, Vendor};
 use crate::host;
 
 #[derive(Debug, Parser)]
@@ -22,12 +24,42 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub enum Command {
-    /// 检查三家 CLI、会话目录、额度渠道、终端和守护进程
+    /// 检查各家 CLI、会话目录、额度渠道、终端和守护进程
     Doctor,
     /// 在当前标签页接上一条托管对话（给新标签页用）
     Attach {
         /// 对话 id
         id: SessionId,
+    },
+    /// 把一条对话导出成 Markdown（不给 -o 就打到标准输出）
+    Export {
+        /// 对话 id
+        id: SessionId,
+        /// 存到这个文件（已有就覆盖）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// 列出对话（只读，不进界面）
+    ///
+    /// 最近的在前，一条一行：时间、厂商、账号、状态、项目、标题、id。读会话台上次扫到的索引，不扫描、不改文件。
+    List {
+        /// 只要这一家（claude、codex、pi、hermes、kimi、gemini、opencode、antigravity）
+        #[arg(long, value_name = "名", value_parser = query::parse_vendor)]
+        vendor: Option<Vendor>,
+        /// 输出 JSON 数组（字段见 README「命令行查询」）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 搜对话标题和正文（只读，不进界面）
+    ///
+    /// 结果和顺序同界面里按 / 搜；正文命中的，下一行缩进写命中的那段正文。读会话台上次扫到的索引，不扫描、不改文件。
+    Search {
+        /// 要搜的词（几个词用空格分开，每个都要命中）
+        #[arg(required = true, num_args = 1..)]
+        words: Vec<String>,
+        /// 输出 JSON 数组（字段见 README「命令行查询」）
+        #[arg(long)]
+        json: bool,
     },
     /// 启动守护进程（通常由 ai 自动拉起）
     Daemon,
@@ -39,6 +71,12 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match &cli.command {
         Some(Command::Attach { id }) => attach(id),
+        Some(Command::Export { id, output }) => export(id, output.as_deref()),
+        Some(Command::List { vendor, json }) => query("ai list", query::list(*vendor), *json, ""),
+        Some(Command::Search { words, json }) => {
+            let q = words.join(" ");
+            query("ai search", query::search(&q), *json, &q)
+        }
         Some(Command::Daemon) => daemon(),
         Some(Command::Doctor) => doctor(),
         Some(Command::Update) => update(),
@@ -74,6 +112,56 @@ fn attach(id: &SessionId) -> ExitCode {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {
             eprintln!("ai attach: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn export(id: &SessionId, output: Option<&std::path::Path>) -> ExitCode {
+    match export::run(id, output) {
+        Ok(Some(path)) => {
+            eprintln!("已存到 {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("ai export: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 打出 `ai list` / `ai search` 的结果。没有结果时 JSON 是 `[]`，纯文本什么都不打、在标准错误说一句。
+fn query(name: &str, rows: std::io::Result<Vec<query::Row>>, json: bool, words: &str) -> ExitCode {
+    use std::io::Write;
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{name}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let out = if json {
+        query::json(&rows)
+    } else {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        Ok(query::text(&rows, &home))
+    };
+    if rows.is_empty() && !json {
+        if words.is_empty() {
+            eprintln!("{name}: 没有对话");
+        } else {
+            eprintln!("{name}: 没搜到「{words}」");
+        }
+    }
+    match out.and_then(|o| std::io::stdout().lock().write_all(o.as_bytes())) {
+        Ok(()) => ExitCode::SUCCESS,
+        // 下游（head 之类）先关了管道：不算错。
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{name}: {e}");
             ExitCode::FAILURE
         }
     }
@@ -141,6 +229,54 @@ mod tests {
                 id: SessionId::from("abc-123")
             })
         );
+    }
+
+    #[test]
+    fn parses_export() {
+        assert_eq!(
+            parse(&["export", "abc-123"]).unwrap().command,
+            Some(Command::Export {
+                id: SessionId::from("abc-123"),
+                output: None
+            })
+        );
+        assert_eq!(
+            parse(&["export", "abc-123", "-o", "x.md"]).unwrap().command,
+            Some(Command::Export {
+                id: SessionId::from("abc-123"),
+                output: Some(PathBuf::from("x.md"))
+            })
+        );
+        assert!(parse(&["export"]).is_err());
+    }
+
+    #[test]
+    fn parses_list_and_search() {
+        assert_eq!(
+            parse(&["list"]).unwrap().command,
+            Some(Command::List {
+                vendor: None,
+                json: false
+            })
+        );
+        assert_eq!(
+            parse(&["list", "--vendor", "Kimi Code", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::List {
+                vendor: Some(Vendor::Kimi),
+                json: true
+            })
+        );
+        assert!(parse(&["list", "--vendor", "nope"]).is_err());
+        assert_eq!(
+            parse(&["search", "登录", "bug", "--json"]).unwrap().command,
+            Some(Command::Search {
+                words: vec!["登录".into(), "bug".into()],
+                json: true
+            })
+        );
+        assert!(parse(&["search"]).is_err());
     }
 
     #[test]

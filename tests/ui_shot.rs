@@ -27,6 +27,9 @@ use huitai::ui::app::SPINNER;
 
 const COLS: u16 = 132;
 const ROWS: u16 = 34;
+/// 首图单独的尺寸：宽到顶栏八家写得下全名，高到列表和预览刚好装满、下面不留空。
+const HERO_COLS: u16 = 144;
+const HERO_ROWS: u16 = 18;
 const CELL_W: u32 = 9;
 const CELL_H: u32 = 20;
 
@@ -330,24 +333,24 @@ const OPENCODE: &[Fake] = &[
     },
 ];
 
-const QWEN: &[Fake] = &[
+const ANTIGRAVITY: &[Fake] = &[
     Fake {
         project: "projects/shop",
-        title: "购物车数量改成可以直接输入",
-        mins: 55,
+        title: "下单接口加幂等",
+        mins: 70,
         turns: &[
             (
-                "购物车数量改成可以直接输入",
-                "数量框改成输入框了，输入 0 会删掉这件商品。",
+                "下单接口加幂等，重复点提交会下两单",
+                "按请求头里的幂等键去重，重复的直接回上次的结果。",
             ),
-            ("输入字母呢", "只收数字，别的字符直接忽略，补了 2 个测试。"),
+            ("键存多久", "存 24 小时，过期自动清掉，补了 3 个测试。"),
         ],
     },
     Fake {
-        project: "projects/api",
-        title: "接口限流",
-        mins: 60 * 30,
-        turns: &[("接口加个限流", "按 IP 每分钟 60 次，超了返回 429。")],
+        project: "projects/blog",
+        title: "RSS 输出全文",
+        mins: 60 * 50,
+        turns: &[("RSS 输出全文", "feed.xml 改成输出全文了。")],
     },
 ];
 
@@ -392,6 +395,39 @@ fn write_session(path: &Path, lines: &[String], f: &Fake) {
         .unwrap()
         .set_modified(end)
         .unwrap();
+}
+
+/// 一条 Gemini CLI 对话：`<数据目录>/tmp/<短名>/.project_root` + `chats/session-*.jsonl`（格式见 tests/fixtures/gemini）。
+fn write_gemini(home: &Path, data: &Path, slug: &str, id: &str, f: &Fake) {
+    let cwd = home.join(f.project);
+    fs::create_dir_all(&cwd).unwrap();
+    let ts = times(f);
+    let slug = data.join("tmp").join(slug);
+    fs::create_dir_all(&slug).unwrap();
+    fs::write(slug.join(".project_root"), cwd.to_string_lossy().as_bytes()).unwrap();
+    let mut lines = vec![format!(
+        r#"{{"sessionId":"{id}","projectHash":"h","startTime":"{}","lastUpdated":"{}","kind":"main"}}"#,
+        ts[0],
+        ts[ts.len() - 1]
+    )];
+    for (j, (q, a)) in f.turns.iter().enumerate() {
+        lines.push(format!(
+            r#"{{"id":"u{j}","timestamp":"{}","type":"user","content":[{{"text":{}}}]}}"#,
+            ts[j * 2],
+            json(q)
+        ));
+        lines.push(format!(
+            r#"{{"id":"g{j}","timestamp":"{}","type":"gemini","content":{}}}"#,
+            ts[j * 2 + 1],
+            json(a)
+        ));
+    }
+    lines.push(format!(r#"{{"$set":{{"summary":{}}}}}"#, json(f.title)));
+    write_session(
+        &slug.join(format!("chats/session-2026-11-20T10-00-{}.jsonl", &id[..8])),
+        &lines,
+        f,
+    );
 }
 
 /// 每轮的时间：最后一条在 `mins` 分钟前，往前每条隔 2 分钟。
@@ -472,6 +508,17 @@ fn fake_home(home: &Path) {
                 json(&cwd_s)
             ));
         }
+        // 第二条（实时预览那轮会响铃变成等你回复）停下时 Claude 写了一句总结：列表里它下面一行写这句。
+        if i == 1 {
+            lines.push(format!(
+                r#"{{"type":"system","subtype":"turn_duration","durationMs":372000,"timestamp":"{}","sessionId":"{id}"}}"#,
+                ts[ts.len() - 1]
+            ));
+            lines.push(format!(
+                r#"{{"type":"system","subtype":"away_summary","content":"优惠券接口换成 v2 了，等你确认要不要删旧接口。","timestamp":"{}","sessionId":"{id}"}}"#,
+                ts[ts.len() - 1]
+            ));
+        }
         let dir = home.join(".claude/projects").join(encode(&cwd));
         write_session(&dir.join(format!("{id}.jsonl")), &lines, f);
     }
@@ -505,6 +552,23 @@ fn fake_home(home: &Path) {
                 now_secs() + 86_400 * 3,
                 now_secs() + 3600
             ));
+        }
+        // 第一条（实时预览那轮在跑）有计划、正跑着测试；第二条（那轮会响铃）上一轮被打断（失败，红色）。
+        if i == 0 {
+            let plan = r#"{\"plan\":[{\"step\":\"读订单列表接口\",\"status\":\"completed\"},{\"step\":\"补空列表的测试\",\"status\":\"completed\"},{\"step\":\"补分页边界的测试\",\"status\":\"in_progress\"},{\"step\":\"跑全部测试\",\"status\":\"pending\"},{\"step\":\"更新接口文档\",\"status\":\"pending\"}]}"#;
+            lines.extend([
+                format!(
+                    r#"{{"type":"response_item","payload":{{"type":"function_call","name":"update_plan","arguments":"{plan}","call_id":"p1"}}}}"#
+                ),
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"p1","output":"Plan updated"}}"#.to_owned(),
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"cargo\",\"test\",\"-p\",\"orders\"]}","call_id":"c1"}}"#.to_owned(),
+            ]);
+        }
+        if i == 1 {
+            lines.push(
+                r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted","duration_ms":95000}}"#
+                    .to_owned(),
+            );
         }
         let name = format!("rollout-{}-{id}.jsonl", ts[0].replace(':', "-"));
         write_session(
@@ -644,36 +708,13 @@ fn fake_home(home: &Path) {
         write_session(&dir.join("agents/main/wire.jsonl"), &lines, f);
     }
 
-    // Gemini CLI：`~/.gemini/tmp/<短名>/.project_root` + `chats/session-*.jsonl`（格式见 tests/fixtures/gemini）。
+    // Gemini CLI：见 write_gemini。
     for (i, f) in GEMINI.iter().enumerate() {
-        let cwd = home.join(f.project);
-        fs::create_dir_all(&cwd).unwrap();
-        let id = uuid(0x600 + i);
-        let ts = times(f);
-        let slug = home.join(".gemini/tmp").join(format!("g{i}"));
-        fs::create_dir_all(&slug).unwrap();
-        fs::write(slug.join(".project_root"), cwd.to_string_lossy().as_bytes()).unwrap();
-        let mut lines = vec![format!(
-            r#"{{"sessionId":"{id}","projectHash":"h","startTime":"{}","lastUpdated":"{}","kind":"main"}}"#,
-            ts[0],
-            ts[ts.len() - 1]
-        )];
-        for (j, (q, a)) in f.turns.iter().enumerate() {
-            lines.push(format!(
-                r#"{{"id":"u{j}","timestamp":"{}","type":"user","content":[{{"text":{}}}]}}"#,
-                ts[j * 2],
-                json(q)
-            ));
-            lines.push(format!(
-                r#"{{"id":"g{j}","timestamp":"{}","type":"gemini","content":{}}}"#,
-                ts[j * 2 + 1],
-                json(a)
-            ));
-        }
-        lines.push(format!(r#"{{"$set":{{"summary":{}}}}}"#, json(f.title)));
-        write_session(
-            &slug.join(format!("chats/session-2026-11-20T10-00-{}.jsonl", &id[..8])),
-            &lines,
+        write_gemini(
+            home,
+            &home.join(".gemini"),
+            &format!("g{i}"),
+            &uuid(0x600 + i),
             f,
         );
     }
@@ -733,44 +774,54 @@ fn fake_home(home: &Path) {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Qwen Code：`~/.qwen/projects/<编码路径>/chats/<id>.jsonl`，记录靠 parentUuid 串起来（格式见 tests/fixtures/qwen）。
-    for (i, f) in QWEN.iter().enumerate() {
+    // Antigravity：`~/.gemini/antigravity-cli/conversation_summaries.db`，摘要表加全文表，正文按步的字节偏移切
+    // （格式见 tests/fixtures/antigravity）。用户第 4j 步、AI 第 4j+2 步。
+    let mut script = String::from(
+        "CREATE TABLE conversation_summaries (conversation_id text PRIMARY KEY, title text, \
+         last_modified_time datetime, workspace_uris text, last_user_input_step_index integer);\n\
+         CREATE VIRTUAL TABLE conversations_fts USING fts5(conversation_id UNINDEXED, \
+         chunk_index UNINDEXED, archived UNINDEXED, user_step_byte_offsets UNINDEXED, \
+         agent_step_byte_offsets UNINDEXED, title, user_body, agent_body);\n",
+    );
+    for (i, f) in ANTIGRAVITY.iter().enumerate() {
         let cwd = home.join(f.project);
         fs::create_dir_all(&cwd).unwrap();
-        let id = uuid(0x800 + i);
-        let ts = times(f);
-        let cwd_s = cwd.to_string_lossy();
-        let mut lines = vec![format!(
-            r#"{{"uuid":"q{i}-t","parentUuid":null,"sessionId":"{id}","timestamp":"{}","type":"system","subtype":"custom_title","cwd":{},"systemPayload":{{"customTitle":{},"titleSource":"auto"}}}}"#,
-            ts[0],
-            json(&cwd_s),
-            json(f.title)
-        )];
-        let mut parent = format!("q{i}-t");
+        let id = uuid(0x900 + i);
+        let uri = format!(r#"["file://{}"]"#, cwd.to_string_lossy());
+        let (mut ub, mut ab, mut uo, mut ao) = (String::new(), String::new(), vec![], vec![]);
         for (j, (q, a)) in f.turns.iter().enumerate() {
-            for (k, (kind, role, text)) in [("user", "user", q), ("assistant", "model", a)]
-                .iter()
-                .enumerate()
-            {
-                let uuid = format!("q{i}-{j}-{k}");
-                lines.push(format!(
-                    r#"{{"uuid":"{uuid}","parentUuid":"{parent}","sessionId":"{id}","timestamp":"{}","type":"{kind}","cwd":{},"message":{{"role":"{role}","parts":[{{"text":{}}}]}}}}"#,
-                    ts[j * 2 + k],
-                    json(&cwd_s),
-                    json(text)
-                ));
-                parent = uuid;
-            }
+            uo.push(format!("[{},{}]", j * 4, ub.len()));
+            ao.push(format!("[{},{}]", j * 4 + 2, ab.len()));
+            ub.push_str(&format!("{q}\n"));
+            ab.push_str(&format!("{a}\n"));
         }
-        write_session(
-            &home
-                .join(".qwen/projects")
-                .join(encode(&cwd))
-                .join(format!("chats/{id}.jsonl")),
-            &lines,
-            f,
-        );
+        script.push_str(&format!(
+            "INSERT INTO conversation_summaries VALUES ({}, {}, datetime({}, 'unixepoch') || '+00:00', {}, {});\n\
+             INSERT INTO conversations_fts VALUES ({0}, -1, 0, '', '', {1}, '', '');\n\
+             INSERT INTO conversations_fts VALUES ({0}, 0, 0, '[{}]', '[{}]', '', {}, {});\n",
+            sql(&id),
+            sql(f.title),
+            now_secs() - f.mins * 60,
+            sql(&uri),
+            f.turns.len() * 4 - 4,
+            uo.join(","),
+            ao.join(","),
+            sql(&ub),
+            sql(&ab),
+        ));
     }
+    let db = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let out = std::process::Command::new("/usr/bin/sqlite3")
+        .arg(&db)
+        .arg(&script)
+        .output()
+        .expect("建 Antigravity 库要 sqlite3（macOS 自带）");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Claude 状态栏缓存（额度第一渠道），这样不会去碰钥匙串和联网。
     let data = home.join("Library/Application Support/huitai");
@@ -781,6 +832,41 @@ fn fake_home(home: &Path) {
             r#"{{"rate_limits":{{"five_hour":{{"used_percentage":23.0,"resets_at":{}}},"seven_day":{{"used_percentage":41.0,"resets_at":{}}}}}}}"#,
             now_secs() + 3600,
             now_secs() + 86_400 * 4
+        ),
+    )
+    .unwrap();
+
+    // 余额：pi 的 auth.json 里一把编的 DeepSeek 密钥、models.json 里一把 Kimi Code 的和一条写成命令的（跳过）。
+    // 余额缓存预先写好并处在退避期：会话台直接用缓存，绝不拿这两把编的密钥去请求真接口。
+    fs::write(
+        home.join(".pi/agent/auth.json"),
+        r#"{"deepseek": {"type": "api_key", "key": "sk-fake-ui-shot"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".pi/agent/models.json"),
+        r#"{"providers": {"kimi-coding": {"apiKey": "sk-kimi-fake-ui-shot"}, "moonshotai-cn": {"apiKey": "!pass show moonshot"}}}"#,
+    )
+    .unwrap();
+    let at = format!(
+        r#"{{"secs_since_epoch": {}, "nanos_since_epoch": 0}}"#,
+        now_secs() - 180
+    );
+    let hold = now_secs() + 86_400;
+    // 缓存键是「来源#密钥指纹」：指纹 = SHA-256("huitai-balance-key:" + 密钥) 的前 16 位十六进制，
+    // 上面两把假密钥的指纹用 `printf 'huitai-balance-key:<密钥>' | shasum -a 256 | cut -c1-16` 算出。
+    fs::write(
+        data.join("balance.json"),
+        format!(
+            r#"{{"entries": {{
+                "pi:|auth.json · deepseek#d3758ae8eb51b60e": {{"provider": "deepseek", "at": {a}, "backoff_until": {hold},
+                    "result": {{"Ok": {{"at": {at}, "value": {{"money": {{"amounts": [{{"currency": "CNY", "amount": 36.42}}], "available": true}}}}}}}}}},
+                "pi:|models.json · kimi-coding#b5f2cd602db6a815": {{"provider": "kimi_code", "at": {a}, "backoff_until": {hold},
+                    "result": {{"Ok": {{"at": {at}, "value": {{"windows": [
+                        {{"label": "5 小时", "used_percent": 83.0, "window_minutes": 300, "resets_at": null}},
+                        {{"label": "周", "used_percent": 31.0, "window_minutes": null, "resets_at": null}}]}}}}}}}}
+            }}}}"#,
+            a = now_secs() - 180
         ),
     )
     .unwrap();
@@ -827,6 +913,8 @@ struct Run {
     last_output: Arc<Mutex<Instant>>,
     background: Rgb,
     foreground: Rgb,
+    cols: u16,
+    rows: u16,
 }
 
 /// 测试中途失败（等不到某段文字就 panic）时也要收掉 ai 进程，不然它占着一个 PTY 一直挂着。
@@ -841,10 +929,14 @@ impl Drop for Run {
 
 impl Run {
     fn start(home: &Path, light: bool) -> Run {
+        Run::start_sized(home, light, COLS, ROWS)
+    }
+
+    fn start_sized(home: &Path, light: bool, cols: u16, rows: u16) -> Run {
         let (mut m, mut s) = (-1, -1);
         let mut ws = libc::winsize {
-            ws_row: ROWS,
-            ws_col: COLS,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -869,8 +961,9 @@ impl Run {
             .env("COLORTERM", "truecolor")
             .env("LANG", "zh_CN.UTF-8")
             .env("SHELL", "/bin/zsh")
-            // 测试不联网：不查新版本。
+            // 测试不联网：不查新版本；万一还有别的 https 请求（余额缓存没生效之类），经一个关着的本机端口直接失败。
             .env("HUITAI_NO_UPDATE_CHECK", "1")
+            .env("https_proxy", "http://127.0.0.1:9")
             .current_dir(home.join("projects/shop"))
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -919,7 +1012,7 @@ impl Run {
         };
         let term = Term::new(
             Config::default(),
-            &Size(usize::from(COLS), usize::from(ROWS)),
+            &Size(usize::from(cols), usize::from(rows)),
             listener,
         );
         let term = Arc::new(Mutex::new((term, Processor::new())));
@@ -951,6 +1044,8 @@ impl Run {
             last_output,
             background,
             foreground,
+            cols,
+            rows,
         }
     }
 
@@ -1106,7 +1201,11 @@ impl Run {
         fs::write(dir.join(format!("{name}.html")), self.html()).unwrap();
         fs::write(
             dir.join(format!("{name}.size")),
-            format!("{},{}", u32::from(COLS) * CELL_W, u32::from(ROWS) * CELL_H),
+            format!(
+                "{},{}",
+                u32::from(self.cols) * CELL_W,
+                u32::from(self.rows) * CELL_H
+            ),
         )
         .unwrap();
         fs::write(dir.join(format!("{name}.txt")), self.text()).unwrap();
@@ -1183,6 +1282,22 @@ struct LiveHost(Child);
 impl LiveHost {
     fn start(home: &Path) -> Self {
         use huitai::core::Vendor;
+        let live = Self::bare(home);
+        let screen = home.join("live-screen.bin");
+        fs::write(&screen, LIVE_SCREEN).unwrap();
+        let command = format!("stty raw -echo; cat '{}'; sleep 600", screen.display());
+        live.host(
+            home,
+            uuid(0x100),
+            Vendor::Claude,
+            CLAUDE[0].project,
+            &command,
+        );
+        live
+    }
+
+    /// 只起守护进程，不托管对话。
+    fn bare(home: &Path) -> Self {
         use huitai::host::{self, Request};
         let child = Command::new(env!("CARGO_BIN_EXE_ai"))
             .arg("daemon")
@@ -1201,16 +1316,6 @@ impl LiveHost {
             assert!(Instant::now() < deadline, "守护进程没起来");
             thread::sleep(Duration::from_millis(20));
         }
-        let screen = home.join("live-screen.bin");
-        fs::write(&screen, LIVE_SCREEN).unwrap();
-        let command = format!("stty raw -echo; cat '{}'; sleep 600", screen.display());
-        live.host(
-            home,
-            uuid(0x100),
-            Vendor::Claude,
-            CLAUDE[0].project,
-            &command,
-        );
         live
     }
 
@@ -1251,6 +1356,17 @@ impl LiveHost {
         .collect();
         // attach 一次把假 CLI 启动起来，再关掉这个「标签页」（对话照跑）。
         drop(host::attach(&dir, &id, env, 100, 16).expect("attach"));
+    }
+
+    /// 像在标签页里看了一眼：连上再断开（刚做完的变成等你回复）。
+    fn peek(&self, home: &Path, id: String) {
+        let dir = home.join("Library/Application Support/huitai");
+        let env = [("HOME", home.to_str().unwrap()), ("TERM", "xterm-256color")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let id = huitai::core::SessionId::from(id);
+        drop(huitai::host::attach(&dir, &id, env, 100, 16).expect("attach"));
     }
 }
 
@@ -1387,18 +1503,31 @@ fn real_terminal_screenshots() {
     run.wait_for("补了 3 个测试");
     run.save(&out, "3d-opencode");
 
-    // Qwen Code：兰紫色印章和标签，和 pi 的紫、Kimi 的玫红分得开；没有额度渠道（启动目录 shop 里有它的对话）。
+    // Antigravity：黄绿色印章和标签，和 OpenCode 的青绿、Hermes 的黄铜分得开；没有额度渠道。
     run.send(b"\t");
-    run.wait_for("购物车数量改成可以直接输入");
-    run.wait_for("补了 2 个测试");
-    run.save(&out, "3e-qwen");
+    run.wait_for("下单接口加幂等");
+    run.wait_for("补了 3 个测试");
+    run.save(&out, "3f-antigravity");
     run.send(b"\t?");
     run.wait_for("任意键关闭");
     run.save(&out, "4-help");
     run.press(b"\x1b");
     run.send("/结算".as_bytes());
     run.wait_for("条 · ⏎ 打开");
+    // 正文也命中的结果下面那行命中片段是后台读回来的：等画面停下再截。
+    run.settle(Duration::from_millis(500));
     run.save(&out, "5-search");
+    // ⌃A 各家一起搜：换个几家都说过的词，每行前面标那家的标记；回到一家再按一次。
+    run.press(b"\x15");
+    run.send("测试".as_bytes());
+    run.wait_for("条 · ⏎ 打开");
+    run.press(b"\x01");
+    run.wait_for("搜索结果 · 各家");
+    run.wait_for("⌃A 只搜");
+    run.settle(Duration::from_millis(500));
+    run.save(&out, "5b-search-all");
+    run.press(b"\x01");
+    run.wait_for("⌃A 搜各家");
     run.press(b"\x1b");
     // b：显示后台对话（记进设置），截完再按一次藏回去，后面几张照常。
     run.send(b"b");
@@ -1440,6 +1569,19 @@ fn real_terminal_screenshots() {
     run.send(b"t");
     run.wait_for("npm run trace");
     run.save(&out, "19-reader-tools");
+    // s 存成 Markdown：落到临时 HOME 的 Downloads，状态栏写存到哪了。
+    run.send(b"s");
+    run.wait_for("已存到 ~/Downloads/");
+    run.save(&out, "19-reader-exported");
+    let saved: Vec<PathBuf> = fs::read_dir(home.join("Downloads"))
+        .expect("导出建了 Downloads")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let md = fs::read_to_string(&saved[0]).unwrap();
+    assert!(md.contains("结算页首屏要 3 秒"), "{md}");
+    assert!(md.contains("- 工具 "), "{md}");
     run.press(b"\x1b");
     run.wait_for("⏎ 接着聊   v 看全文");
     // 右键菜单：在「结算页首屏加载慢」那一行上右键（SGR 鼠标序列，坐标从 1 起）。
@@ -1452,6 +1594,13 @@ fn real_terminal_screenshots() {
     run.send(format!("\x1b[<2;12;{y}M\x1b[<2;12;{y}m").as_bytes());
     run.wait_for("在当前窗口打开");
     run.save(&out, "15-menu");
+    run.press(b"\x1b");
+    // $：各账号额度和余额（缓存里预先写好的，见 fake_home）。
+    run.send(b"$");
+    run.wait_for("额度和余额");
+    run.wait_for("¥36.42");
+    run.wait_for("跳过 pi 默认");
+    run.save(&out, "17-balance");
     run.press(b"\x1b");
     run.quit();
 
@@ -1474,6 +1623,17 @@ fn real_terminal_screenshots() {
     run.wait_for("购物车结算按钮点了没反应");
     run.wait_for("找到了");
     run.save(&out, "6-light");
+    // 只在正文里出现的词：结果行下面那行命中片段（预览里也有这个词，片段那行再出现一次）。
+    run.send("/usecheckout".as_bytes());
+    run.wait_for("1 条 · ⏎ 打开");
+    run.settle(Duration::from_millis(500));
+    let screen = run.text();
+    assert!(
+        screen.matches("useCheckout").count() >= 2,
+        "结果行下面要有命中片段：\n{screen}"
+    );
+    run.save(&out, "6a-light-search-body");
+    run.press(b"\x1b");
     // 浅色下的 Hermes 黄铜色：压暗一档，和「等你」的黄分开（项目组在第一轮已经展开，展开状态是记住的）。
     run.send(b"\t\t\t");
     run.wait_for("整理接口文档的目录结构");
@@ -1493,9 +1653,9 @@ fn real_terminal_screenshots() {
     run.wait_for("补了 3 个测试");
     run.save(&out, "6d-light-opencode");
     run.send(b"\t");
-    run.wait_for("购物车数量改成可以直接输入");
-    run.wait_for("补了 2 个测试");
-    run.save(&out, "6e-light-qwen");
+    run.wait_for("下单接口加幂等");
+    run.wait_for("补了 3 个测试");
+    run.save(&out, "6f-light-antigravity");
     run.quit();
 
     // 实时预览：守护进程托管第一条对话（假 CLI 画一屏后空闲），选中它时预览区显示它此刻的屏幕。
@@ -1511,12 +1671,14 @@ fn real_terminal_screenshots() {
         go.display()
     );
     daemon.host(&home, uuid(0x101), Vendor::Claude, CLAUDE[1].project, &bell);
+    // Codex 第二条：上一轮被打断，和 Claude 那条一起响铃停下（失败，红色）。
+    daemon.host(&home, uuid(0x201), Vendor::Codex, CODEX[1].project, &bell);
     let run = Run::start(&home, false);
     run.wait_for("此刻的画面");
     run.wait_for("Running…");
-    run.wait_for("4 在跑");
+    run.wait_for("5 在跑");
     fs::write(&go, "").unwrap();
-    run.wait_for("◆1 等你");
+    run.wait_for("◆2 等你");
     // 等「刚停下」那一下整行高亮淡完再截，不然看着像选中了两行。
     thread::sleep(huitai::ui::app::FLASH + Duration::from_millis(300));
     run.save(&out, "7-live");
@@ -1540,17 +1702,31 @@ fn real_terminal_screenshots() {
     run.wait_for("给登录页加验证码");
     run.save(&out, "11d-seal-opencode");
     run.send(b"\t");
-    run.wait_for("购物车数量改成可以直接输入");
-    run.save(&out, "11e-seal-qwen");
+    run.wait_for("下单接口加幂等");
+    run.save(&out, "11f-seal-antigravity");
     // !：跳到等你回复的那条，跨家换回 Claude。
     run.send(b"!");
     run.wait_for("· ◆ 等你回复");
     run.save(&out, "12-jump-waiting");
-    // s：三家等你回复和在跑的列在一起（等你的在前）。
+    // s：三家等你回复和在跑的列在一起，按 要输入 > 失败 > 做完待看 > 在跑 排；在跑和刚停的两行一条。
     run.send(b"s");
     run.wait_for("等你回复和在跑的 · 各家");
-    run.wait_for("等你 1 · 在跑 3");
+    run.wait_for("等你 2 · 在跑 3");
+    run.wait_for("失败 · 被打断");
+    run.wait_for("优惠券接口换成 v2 了");
+    run.wait_for("shell · cargo test -p orders");
     run.save(&out, "16-board");
+    // 选中在跑的那条 Codex：预览标题写跑了多久，消息上面是计划块。
+    let row = run
+        .text()
+        .lines()
+        .position(|l| l.contains("给订单列表接口补单元测试"))
+        .expect("汇总里有在跑的 Codex")
+        + 1;
+    run.send(format!("\x1b[<0;12;{row}M\x1b[<0;12;{row}m").as_bytes());
+    run.wait_for("计划 2/5");
+    run.wait_for("在跑 · ");
+    run.save(&out, "17-plan");
     run.send(b"\x1b");
     run.quit();
     drop(daemon);
@@ -1566,7 +1742,294 @@ fn real_terminal_screenshots() {
     run.quit();
     stop_daemon(&home);
 
+    // 多账号：设置里加了第二个 Claude 账号（~/.claude-work），它的对话混在同一个列表里按项目排，
+    // 每条标题后面暗色小字写账号名；设置里列出 Claude 的两个账号。单独一轮，前面的截图不受影响。
+    work_account(&home);
+    let run = Run::start(&home, false);
+    run.wait_for("对账脚本跑出来少了一笔");
+    run.wait_for("工作号");
+    run.save(&out, "22-accounts");
+    run.send(b",");
+    run.wait_for("默认 · 工作号");
+    run.save(&out, "22b-accounts-settings");
+    run.send(b"\x1b");
+    run.quit();
+    stop_daemon(&home);
+
+    // 首图（README、官网的 board-dark/board-light）：单独一轮，见 hero。
+    hero(&home, &out);
+
     println!("截图 HTML 写在 {}", out.display());
+}
+
+/// 第二个 Claude 账号：`~/.claude-work` 里 shop 项目一条对话，设置文件里起名「工作号」。
+fn work_account(home: &Path) {
+    let f = Fake {
+        project: "projects/shop",
+        title: "对账脚本跑出来少了一笔",
+        mins: 12,
+        turns: &[(
+            "对账脚本跑出来少了一笔，帮我看看",
+            "少的那笔是跨月退款：脚本按下单日期归月，退款按到账日期。改成都按到账日期后对上了。",
+        )],
+    };
+    let cwd = home.join(f.project);
+    let cwd_s = cwd.to_string_lossy();
+    let id = uuid(0x900);
+    let ts = times(&f);
+    let (q, a) = f.turns[0];
+    let lines = vec![
+        format!(
+            r#"{{"type":"custom-title","customTitle":{},"sessionId":"{id}"}}"#,
+            json(f.title)
+        ),
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":{}}},"uuid":"u0","timestamp":"{}","cwd":{},"sessionId":"{id}","entrypoint":"cli"}}"#,
+            json(q),
+            ts[0],
+            json(&cwd_s)
+        ),
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":{}}}]}},"uuid":"a0","timestamp":"{}","cwd":{},"sessionId":"{id}","entrypoint":"cli"}}"#,
+            json(a),
+            ts[1],
+            json(&cwd_s)
+        ),
+    ];
+    let dir = home.join(".claude-work/projects").join(encode(&cwd));
+    write_session(&dir.join(format!("{id}.jsonl")), &lines, &f);
+    let config = home.join("Library/Application Support/huitai/config.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        config,
+        r#"{"accounts":[{"vendor":"claude","name":"工作号","dir":"~/.claude-work"}]}"#,
+    )
+    .unwrap();
+}
+
+/// 首图里 Gemini CLI 第二个账号（`GEMINI_CLI_HOME=~/gemini-work`，设置里叫「工作号」）的两条对话：一条在跑、一条刚做完。
+const GEMINI_WORK: &[Fake] = &[
+    Fake {
+        project: "projects/shop",
+        title: "支付回调验签失败，查一下",
+        mins: 4,
+        turns: &[(
+            "支付回调验签一直失败，帮我查一下",
+            "签名是按原始请求体算的，框架先把 body 解析成 JSON 再序列化，字段顺序变了。",
+        )],
+    },
+    Fake {
+        project: "projects/shop",
+        title: "订单导出加按月筛选",
+        mins: 9,
+        turns: &[(
+            "订单导出加一个按月筛选",
+            "加好了，月份下拉默认本月，导出文件名带上月份。",
+        )],
+    },
+];
+
+/// 首图里默认账号多出的几条（shop 里两个账号的对话混在一起）。
+const GEMINI_HERO: &[Fake] = &[
+    Fake {
+        project: "projects/shop",
+        title: "商品图换成 WebP",
+        mins: 60 * 5,
+        turns: &[(
+            "商品图都换成 WebP，旧浏览器要能回退",
+            "换好了，用 picture 标签带 JPEG 回退，图片总量小了四成。",
+        )],
+    },
+    Fake {
+        project: "projects/blog",
+        title: "文章图片加说明文字",
+        mins: 60 * 28,
+        turns: &[(
+            "文章里的图片加上说明文字",
+            "用 figure 和 figcaption 包起来了，说明取自图片的 alt。",
+        )],
+    },
+    Fake {
+        project: "projects/api",
+        title: "接口加请求日志",
+        mins: 60 * 24 * 3,
+        turns: &[(
+            "每个请求记一行日志",
+            "记了方法、路径、状态码和耗时，慢于 1 秒的标黄。",
+        )],
+    },
+];
+
+/// 首图里在跑那条的画面（像 Gemini CLI 跑测试时的样子）。
+const GEMINI_SCREEN: &str = "\x1b[38;2;95;160;230m✦\x1b[0m \x1b[1mGemini CLI\x1b[0m  ~/projects/shop\r\n\
+    \r\n\
+    \x1b[2m>\x1b[0m 支付回调验签一直失败，帮我查一下\r\n\
+    \r\n\
+    ✦ 签名按原始 body 算，框架改了字段顺序。\r\n\
+    \x20 \x1b[32m✓\x1b[0m ReadFile src/pay/callback.ts\r\n\
+    \x20 \x1b[32m✓\x1b[0m Edit src/pay/callback.ts\r\n\
+    \x20 \x1b[38;2;95;160;230m⠼\x1b[0m Shell npm test -- pay\r\n\
+    \r\n\
+    \x1b[38;2;95;160;230m⠼ 正在跑测试…\x1b[0m \x1b[2m(esc to cancel, 12s)\x1b[0m\r\n";
+
+/// 首图：Gemini CLI 这一页，尺寸是 HERO_COLS×HERO_ROWS（不跟别的截图共用）。它没有额度渠道，顶栏写得下八家全名；
+/// 两个账号的对话混在一个列表里（每条标题后写账号名），状态有在跑、等你回复、刚做完，别家还有两条在跑、一条别处开着算进顶栏。
+/// 深浅各一张（`hero-dark`、`hero-light`），拷成 docs/images、site/img 的 board-dark.png、board-light.png。
+fn hero(home: &Path, out: &Path) {
+    use huitai::core::{Account, Vendor};
+    use huitai::host::{self, interrupt};
+
+    // 设置里写的是 GEMINI_CLI_HOME 的值（Gemini CLI 的家目录），数据在它下面的 .gemini/tmp。
+    let work = home.join("gemini-work/.gemini");
+    for (i, f) in GEMINI_WORK.iter().enumerate() {
+        write_gemini(home, &work, &format!("w{i}"), &uuid(0x950 + i), f);
+    }
+    for (i, f) in GEMINI_HERO.iter().enumerate() {
+        write_gemini(
+            home,
+            &home.join(".gemini"),
+            &format!("h{i}"),
+            &uuid(0x610 + i),
+            f,
+        );
+    }
+    // 设置：两家各加一个「工作号」；「等你」关掉慢闪，截图不会碰上暗的那半拍。
+    fs::write(
+        home.join("Library/Application Support/huitai/config.json"),
+        r#"{"blink_waiting":false,"accounts":[{"vendor":"claude","name":"工作号","dir":"~/.claude-work"},{"vendor":"gemini","name":"工作号","dir":"~/gemini-work"}]}"#,
+    )
+    .unwrap();
+    // 第二个账号的对话 id 带账号前缀（SessionId::in_account），托管时用同一个 id 列表才认得出。
+    let key = Account::key_for(Vendor::Gemini, &work.join("tmp"), home);
+    // 一直有输出（空格加退格，画面不变）才一直算在跑，不然安静 20 秒就当做完了。
+    let screen = home.join("hero-screen.bin");
+    fs::write(&screen, GEMINI_SCREEN).unwrap();
+    let busy = |file: &Path| {
+        format!(
+            "stty raw -echo; cat '{}'; while :; do sleep 1; printf ' \\b'; done",
+            file.display()
+        )
+    };
+    let (gemini_busy, quiet_busy) = (busy(&screen), busy(Path::new("/dev/null")));
+
+    // 桌面端开着一条 Claude 对话：顶栏多一个「●1 别处」（官网图例里有它）。做法同上面浅色那一轮。
+    let _desktop = KillOnDrop(
+        Command::new("/bin/bash")
+            .args([
+                "-c",
+                &format!("exec -a 'claude --resume {}' sleep 600", uuid(0x106)),
+            ])
+            .spawn()
+            .expect("起假的桌面端进程"),
+    );
+    // 会话台只从这一次连上以后的响铃知道谁停了，深浅两张各用一个新的守护进程从头来一遍。
+    for (light, name) in [(false, "hero-dark"), (true, "hero-light")] {
+        // 上一个守护进程退干净、清掉「被中断」的记录（不然会话台一打开就停在被中断组上）。
+        let dir = home.join("Library/Application Support/huitai");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host::request(&dir, &host::Request::Ping).is_ok() {
+            assert!(Instant::now() < deadline, "上一个守护进程没退出");
+            thread::sleep(Duration::from_millis(20));
+        }
+        for path in [
+            interrupt::running_path(&dir),
+            interrupt::interrupted_path(&dir),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+        let daemon = LiveHost::bare(home);
+        let go = home.join(format!("{name}-go"));
+        let bell = format!(
+            "stty raw -echo; while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\007'; sleep 600",
+            go.display()
+        );
+        let work_id =
+            |i: usize| huitai::core::SessionId::in_account(&key, &uuid(0x950 + i)).to_string();
+        daemon.host(
+            home,
+            work_id(0),
+            Vendor::Gemini,
+            GEMINI_WORK[0].project,
+            &gemini_busy,
+        );
+        daemon.host(
+            home,
+            uuid(0x100),
+            Vendor::Claude,
+            CLAUDE[0].project,
+            &quiet_busy,
+        );
+        daemon.host(
+            home,
+            uuid(0x200),
+            Vendor::Codex,
+            CODEX[0].project,
+            &quiet_busy,
+        );
+        daemon.host(
+            home,
+            work_id(1),
+            Vendor::Gemini,
+            GEMINI_WORK[1].project,
+            &bell,
+        );
+        daemon.host(home, uuid(0x600), Vendor::Gemini, GEMINI[0].project, &bell);
+        hero_shot(&daemon, home, out, light, name, &go);
+        drop(daemon);
+    }
+}
+
+/// 打开会话台切到 Gemini，等两条响铃、blog 那条看过一眼，截一张。
+fn hero_shot(daemon: &LiveHost, home: &Path, out: &Path, light: bool, name: &str, go: &Path) {
+    let run = Run::start_sized(home, light, HERO_COLS, HERO_ROWS);
+    // 先等列表读出来，不然 Tab 会在界面起来前被吞掉。
+    run.wait_for(CLAUDE[0].title);
+    for _ in 0..huitai::core::Vendor::ALL.len() {
+        if run.text().contains(GEMINI_WORK[0].title) {
+            break;
+        }
+        run.press(b"\t");
+    }
+    run.wait_for(GEMINI_WORK[0].title);
+    run.wait_for("正在跑测试");
+    run.wait_for("1 别处");
+    // 等响铃的两条还没出声时也算在跑。
+    run.wait_for("5 在跑");
+    // 两条一起响铃停下（没人看着，算刚做完），再像在标签页里看过一眼那样连上又断开 blog 那条：它变成等你回复。
+    fs::write(go, "").unwrap();
+    run.wait_for("3 在跑");
+    run.wait_for("◆2 等你");
+    daemon.peek(home, uuid(0x600));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(run.text().contains('✓') && run.text().matches('◆').count() >= 2) {
+        assert!(
+            Instant::now() < deadline,
+            "没等到刚做完和等你回复两种状态：\n{}",
+            run.text()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // 等「刚停下」那一下整行高亮淡完再截。
+    thread::sleep(huitai::ui::app::FLASH + Duration::from_millis(300));
+    assert_eq!(
+        run.text().matches("工作号").count(),
+        2,
+        "两条带账号名：\n{}",
+        run.text()
+    );
+    let text = run.text();
+    let top = text.lines().next().unwrap_or_default();
+    for v in huitai::core::Vendor::ALL {
+        assert!(
+            top.contains(&format!("{} {}", v.mark(), v.name())),
+            "顶栏要写下每家全名，{} 缩掉了：\n{text}",
+            v.name()
+        );
+    }
+    let blank = text.lines().filter(|l| l.trim().is_empty()).count();
+    assert!(blank <= 2, "首图不留大片空行（{blank} 行空）：\n{text}");
+    run.save(out, name);
+    run.quit();
 }
 
 /// 测试起的子进程：离开作用域（包括测试中途 panic）时杀掉并收尸。

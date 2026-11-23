@@ -2,12 +2,14 @@
 //!
 //! - 提醒：订阅自己的托管事件，喂一份 `Notifier`（全机只有这一份，会话台只算状态灯），按 `next_due` 定时取；
 //!   会话台开着且认 OSC 9/777 就交给它往自己标签页写，否则发系统通知。
+//! - 标签页标题：同一份 `Notifier` 算出的状态变了，告诉托管层改标题前缀（`◆等你 项目 · 厂商 · `）并重发一次。
 //! - 热键：主线程注册 `Config::hotkey` 并跑 Carbon 事件循环（热键事件只投到主线程），socket 接收循环在别的线程。
 //!
 //! 环境变量（测试和排查用，一律关掉会打扰人的东西）：
 //! - `HUITAI_NO_HOTKEY` 非空：不注册全局呼出键。
 //! - `HUITAI_NOTIFY_TO=<文件>`：系统通知不弹，改成往这个文件追加一行「标题<TAB>正文」。
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -15,12 +17,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::core::{Config, SessionId};
+use crate::core::{Config, SessionId, SessionState};
 use crate::host::{Daemon, DaemonHandle, HostEvent};
 use crate::hotkey::{self, HotKey};
-use crate::notify::{Desktop, Message, Notifier, SystemNotifier};
+use crate::notify::{Activity, Desktop, Message, Notifier, SystemNotifier};
 use crate::opener;
 
 use super::summon;
@@ -172,22 +174,37 @@ fn register_hotkey(config: &Config, handle: DaemonHandle) -> io::Result<hotkey::
     Ok(registration)
 }
 
-/// 托管事件（含标签页焦点）→ `Notifier`；到期的提醒交给会话台或系统通知。事件流断了（守护进程在退出）就返回。
+/// 有在跑的对话时最多隔这么久看一次安静超时（在跑的静了一阵就当这一轮停了，标签页标题跟着变）。
+const SETTLE_TICK: Duration = Duration::from_secs(1);
+
+/// 托管事件（含标签页焦点）→ `Notifier`；到期的提醒交给会话台或系统通知，状态变了改标签页标题。
+/// 事件流断了（守护进程在退出）就返回。
 pub fn alert_loop(events: &Receiver<HostEvent>, handle: &DaemonHandle, desktop: &dyn Desktop) {
     let mut notifier = Notifier::new();
+    let mut titles = Titles::default();
     loop {
-        let next = match notifier.next_due() {
+        let next = match titles.wake(notifier.next_due(), Instant::now()) {
             Some(due) => events.recv_timeout(due.saturating_duration_since(Instant::now())),
             None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
+        let mut changed = Vec::new();
         match next {
             Ok(event) => {
                 if let Some((id, activity)) = crate::ui::activity(event) {
+                    if activity == Activity::Exited {
+                        titles.forget(&id);
+                    } else {
+                        changed.push(id.clone());
+                    }
                     notifier.notify(id, activity, Instant::now());
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
+        }
+        changed.extend(notifier.settle(Instant::now()));
+        for id in changed {
+            titles.sync(&id, notifier.state(&id), |id, s| handle.set_status(id, s));
         }
         for alert in notifier.poll(Instant::now()) {
             let msg = Message::new(&alert, &label(handle, &alert.id));
@@ -201,7 +218,41 @@ pub fn alert_loop(events: &Receiver<HostEvent>, handle: &DaemonHandle, desktop: 
     }
 }
 
-/// 提醒标题：和标签页标题一样，「厂商标记 项目名 · CLI 设的标题」。
+/// 每条托管对话最近一次告诉托管层的状态：变了才再告诉（托管层随之重发一次标题）。
+#[derive(Debug, Default)]
+pub struct Titles {
+    shown: HashMap<SessionId, SessionState>,
+}
+
+impl Titles {
+    /// `state` 和上次告诉的不同就调 `tell` 并记下。
+    pub fn sync(
+        &mut self,
+        id: &SessionId,
+        state: SessionState,
+        tell: impl FnOnce(&SessionId, SessionState),
+    ) {
+        if self.shown.insert(id.clone(), state) != Some(state) {
+            tell(id, state);
+        }
+    }
+
+    /// 对话结束了。
+    pub fn forget(&mut self, id: &SessionId) {
+        self.shown.remove(id);
+    }
+
+    /// 下一次该醒的时间：到期的提醒，或有在跑的对话时 [`SETTLE_TICK`] 之后；都没有就一直等事件。
+    pub fn wake(&self, due: Option<Instant>, now: Instant) -> Option<Instant> {
+        let running = self.shown.values().any(|s| *s == SessionState::Running);
+        match (due, running.then(|| now + SETTLE_TICK)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// 提醒标题：「厂商标记 项目名 · CLI 设的标题」（不带状态，标签页标题前面才带）。
 fn label(handle: &DaemonHandle, id: &SessionId) -> String {
     handle.list().into_iter().find(|h| &h.id == id).map_or_else(
         || "会话台".to_owned(),
@@ -220,6 +271,41 @@ mod tests {
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| (*v).to_owned())
         }
+    }
+
+    #[test]
+    fn titles_tell_only_changes_and_tick_while_running() {
+        let mut titles = Titles::default();
+        let id = SessionId::from("a");
+        let mut told = Vec::new();
+        let now = Instant::now();
+        assert_eq!(titles.wake(None, now), None);
+        for s in [
+            SessionState::Running,
+            SessionState::Running,
+            SessionState::Done,
+            SessionState::Done,
+            SessionState::Waiting,
+        ] {
+            titles.sync(&id, s, |_, s| told.push(s));
+            if s == SessionState::Running {
+                assert_eq!(titles.wake(None, now), Some(now + SETTLE_TICK));
+                let soon = now + Duration::from_millis(10);
+                assert_eq!(titles.wake(Some(soon), now), Some(soon));
+            }
+        }
+        assert_eq!(
+            told,
+            [
+                SessionState::Running,
+                SessionState::Done,
+                SessionState::Waiting
+            ]
+        );
+        assert_eq!(titles.wake(None, now), None, "没有在跑的就不定时醒");
+        titles.forget(&id);
+        titles.sync(&id, SessionState::Waiting, |_, s| told.push(s));
+        assert_eq!(told.len(), 4, "结束后同一个 id 再来要重新告诉");
     }
 
     #[test]

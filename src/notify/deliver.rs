@@ -2,11 +2,10 @@
 //! 否则用系统通知兜底。
 
 use std::io::{self, Write};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::Alert;
+use crate::core::exec;
 
 /// 系统通知命令最多等这么久。
 const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -93,8 +92,9 @@ pub struct SystemNotifier;
 
 impl Desktop for SystemNotifier {
     fn show(&self, msg: &Message) -> io::Result<()> {
-        let mut child = Command::new("/usr/bin/osascript")
-            .args([
+        exec::run(
+            "/usr/bin/osascript",
+            &[
                 "-e",
                 "on run argv",
                 "-e",
@@ -102,32 +102,13 @@ impl Desktop for SystemNotifier {
                 "-e",
                 "end run",
                 "--",
-                &msg.title,
-                &msg.body,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let deadline = Instant::now() + SYSTEM_TIMEOUT;
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!("osascript 退出码 {status}")))
-                };
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "osascript 超过 5 秒没结束",
-                ));
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+                msg.title.as_str(),
+                msg.body.as_str(),
+            ],
+            None,
+            SYSTEM_TIMEOUT,
+        )
+        .map(drop)
     }
 }
 

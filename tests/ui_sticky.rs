@@ -121,14 +121,17 @@ fn expanded_headers_are_tinted_collapsed_ones_are_not() {
     let mut app = demo_app(Vendor::Claude);
     let buf = render(&mut app, W, 30);
     let list = app.areas.list;
+    let heights = app.line_heights();
     let l = app.list();
     let mut seen = (false, false);
     for (i, r) in l.rows.iter().enumerate().skip(l.offset) {
         let Row::Header(g) = *r else { continue };
-        if i == l.selected || i - l.offset >= usize::from(list.height) {
+        // 组标题画在它那几行的最后一行（上面可能空一行）。
+        let line = heights[l.offset..=i].iter().sum::<usize>() - 1;
+        if i == l.selected || line >= usize::from(list.height) {
             continue;
         }
-        let y = list.y + (i - l.offset) as u16;
+        let y = list.y + line as u16;
         let bg = buf[(list.x + 20, y)].bg;
         if app.folds.is_collapsed(&l.groups[g].key) {
             assert_eq!(bg, Theme::DARK.base, "收起的组标题不垫底色");

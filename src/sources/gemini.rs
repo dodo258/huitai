@@ -27,10 +27,13 @@ use std::time::SystemTime;
 use serde_json::{Map, Value};
 
 use super::jsonl::{self, str_field};
+use super::moment::{self, MOMENT_TAIL_BYTES};
 use super::time::parse_rfc3339;
 use super::transcript::{self, TRANSCRIPT_MAX_BYTES};
 use super::window::{self, PREVIEW_MAX_BYTES, Window};
-use super::{Command, Part, PreviewMessage, Role, Scan, Source, Transcript, Trash, TrashEntry};
+use super::{
+    Command, Moment, Part, PreviewMessage, Role, Scan, Source, Transcript, Trash, TrashEntry,
+};
 use crate::core::{Session, SessionId, Vendor};
 
 /// 旧版整份 `.json` 会话最多读多大（要整个读进内存解析）。
@@ -65,33 +68,17 @@ impl Source for GeminiSource {
     }
 
     fn load_transcript(&self, session: &Session) -> io::Result<Transcript> {
-        let (r, truncated) = if is_legacy(&session.path) {
-            (replay_file(&session.path, true)?, false)
-        } else {
-            let (buf, from_start) = window::read_tail_lines(&session.path, TRANSCRIPT_MAX_BYTES)?;
-            (replay_lines(window::lines(&buf), true), !from_start)
-        };
-        let mut parts = Vec::new();
-        for m in r.msgs.iter().map(|(_, m)| m) {
-            parts.extend(m.said().map(Part::Message));
-            for t in &m.tools {
-                parts.push(Part::ToolCall {
-                    name: t.name.clone(),
-                    input: t.input.clone(),
-                });
-                if let Some(text) = &t.output {
-                    parts.push(Part::ToolResult { text: text.clone() });
-                }
-            }
-        }
-        Ok(Transcript {
-            parts: parts.into_iter().map(transcript::clip).collect(),
-            truncated,
-        })
+        tail_transcript(&session.path, TRANSCRIPT_MAX_BYTES)
+    }
+
+    fn load_moment(&self, session: &Session) -> io::Result<Moment> {
+        Ok(moment::from_parts(
+            tail_transcript(&session.path, MOMENT_TAIL_BYTES)?.parts,
+        ))
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
-        Ok(replay_file(&session.path, false)?.users())
+        Ok(replay_file(&session.path, Keep::Count)?.users())
     }
 
     fn resume_cmd(&self, session: &Session) -> Command {
@@ -155,6 +142,33 @@ impl Source for GeminiSource {
         let projects = projects(&self.root);
         jsonl::par_map(paths, |p| read_session(&self.root, &projects, p))
     }
+}
+
+/// 整段对话的最后 `max` 字节（旧版整份 JSON 文件读全部）：消息和工具，回放过撤回、改写。
+fn tail_transcript(path: &Path, max: u64) -> io::Result<Transcript> {
+    let (r, truncated) = if is_legacy(path) {
+        (replay_file(path, Keep::Body)?, false)
+    } else {
+        let (buf, from_start) = window::read_tail_lines(path, max)?;
+        (replay_lines(window::lines(&buf), Keep::Body), !from_start)
+    };
+    let mut parts = Vec::new();
+    for m in r.msgs.iter().map(|(_, m)| m) {
+        parts.extend(m.said().map(Part::Message));
+        for t in &m.tools {
+            parts.push(Part::ToolCall {
+                name: t.name.clone(),
+                input: t.input.clone(),
+            });
+            if let Some(text) = &t.output {
+                parts.push(Part::ToolResult { text: text.clone() });
+            }
+        }
+    }
+    Ok(Transcript {
+        parts: parts.into_iter().map(transcript::clip).collect(),
+        truncated,
+    })
 }
 
 /// `session-*.jsonl`，或旧版的 `session-*.json`。
@@ -259,20 +273,30 @@ fn read_session(
         )
     })?;
 
-    let (head, tail, mtime) = if is_legacy(path) {
-        (replay_file(path, false)?, None, super::mtime_or_epoch(path))
+    let (head, tail, middle, mtime) = if is_legacy(path) {
+        let r = replay_file(path, Keep::Text)?;
+        (r, None, None, super::mtime_or_epoch(path))
     } else {
         let w = Window::read(path)?;
         if w.len == 0 {
             return Ok(None);
         }
-        let head = replay_lines(w.head_lines(), false);
-        let tail = (!w.whole).then(|| replay_lines(w.tail_lines(), false));
-        (head, tail, w.mtime)
+        let head = replay_lines(w.head_lines(), Keep::Text);
+        let tail = (!w.whole).then(|| replay_lines(w.tail_lines(), Keep::Text));
+        (head, tail, w.middle(), w.mtime)
     };
     let parts: Vec<&Replay> = tail.iter().chain([&head]).collect();
     // 元数据后写的覆盖先写的：先看尾部。
     let meta = |k: &str| parts.iter().find_map(|r| r.meta_str(k));
+    // 标题可能是在头尾之间没读的那段里起的（首句后 AI 输出了很多）：结尾没有就去中间找，再看开头。
+    let summary = match tail.as_ref().and_then(|r| r.meta_str("summary")) {
+        Some(t) => Some(t.to_owned()),
+        None => match middle {
+            Some(range) => middle_summary(path, range)?,
+            None => None,
+        }
+        .or_else(|| head.meta_str("summary").map(str::to_owned)),
+    };
 
     let Some(id) = meta("sessionId") else {
         return Ok(None);
@@ -282,8 +306,7 @@ fn read_session(
     }
     // 头尾不重叠，两段相加；大文件这是下限，精确值由 count_messages 补。
     let message_count = parts.iter().map(|r| r.users()).sum();
-    let title = meta("summary")
-        .map(str::to_owned)
+    let title = summary
         .or_else(|| {
             [Some(&head), tail.as_ref()]
                 .into_iter()
@@ -317,7 +340,24 @@ fn read_session(
         last_active,
         message_count,
         automatic: false,
+        account: String::new(),
     }))
+}
+
+/// 文件 `range` 这段里最后一条带标题的 `$set` 的标题。
+fn middle_summary(path: &Path, range: (u64, u64)) -> io::Result<Option<String>> {
+    let mut title = None;
+    window::rfind_line(path, range, br#""$set""#, |line| {
+        title = jsonl::parse(line)
+            .as_ref()
+            .and_then(|v| v.get("$set"))
+            .and_then(|set| str_field(set, "summary"))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
+        title.is_some()
+    })?;
+    Ok(title)
 }
 
 /// 最后 `n` 条消息。从文件尾往回读，读的范围从 256KB 起每次乘 4，最多 8MB；读到的那段照控制行回放。
@@ -331,12 +371,12 @@ fn last_messages(path: &Path, n: usize) -> io::Result<Vec<PreviewMessage>> {
         said.into_iter().skip(skip).map(jsonl::clip).collect()
     };
     if is_legacy(path) {
-        return Ok(take_last(replay_file(path, false)?));
+        return Ok(take_last(replay_file(path, Keep::Text)?));
     }
     let mut bytes = 256 * 1024;
     loop {
         let (buf, from_start) = window::read_tail_lines(path, bytes)?;
-        let r = replay_lines(window::lines(&buf), false);
+        let r = replay_lines(window::lines(&buf), Keep::Text);
         let found = r.msgs.iter().filter(|(_, m)| m.said().is_some()).count();
         if found >= n || from_start || bytes >= PREVIEW_MAX_BYTES {
             return Ok(take_last(r));
@@ -345,8 +385,8 @@ fn last_messages(path: &Path, n: usize) -> io::Result<Vec<PreviewMessage>> {
     }
 }
 
-fn replay_lines<'a>(lines: impl Iterator<Item = &'a [u8]>, body: bool) -> Replay {
-    let mut r = Replay::new(body);
+fn replay_lines<'a>(lines: impl Iterator<Item = &'a [u8]>, keep: Keep) -> Replay {
+    let mut r = Replay::new(keep);
     for v in lines.filter_map(jsonl::parse) {
         r.line(&v);
     }
@@ -354,8 +394,8 @@ fn replay_lines<'a>(lines: impl Iterator<Item = &'a [u8]>, body: bool) -> Replay
 }
 
 /// 整份文件回放。
-fn replay_file(path: &Path, body: bool) -> io::Result<Replay> {
-    let mut r = Replay::new(body);
+fn replay_file(path: &Path, keep: Keep) -> io::Result<Replay> {
+    let mut r = Replay::new(keep);
     if is_legacy(path) {
         if fs::metadata(path)?.len() > LEGACY_MAX_BYTES {
             return Err(io::Error::other("旧版会话文件超过 32MB，不读"));
@@ -380,17 +420,30 @@ struct Replay {
     meta: Map<String, Value>,
     msgs: Vec<(String, Msg)>,
     pos: HashMap<String, usize>,
-    /// 留工具调用（整段对话视图要）；扫描、计数、预览不留。
-    body: bool,
+    keep: Keep,
 }
 
+/// 回放时每条消息留多少。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// 只数用户发言：AI 的字不留，用户的字只留开头够判断是不是命令、注入的一小段。
+    Count,
+    /// 字都留（扫描、预览），工具调用不留。
+    Text,
+    /// 字和工具调用都留（整段对话视图）。
+    Body,
+}
+
+/// 计数时用户的话留开头几个字：够 [`is_ignored`] 判断（最长的前缀 `<session_context>` 17 个字）。
+const COUNT_PREFIX_CHARS: usize = 32;
+
 impl Replay {
-    fn new(body: bool) -> Self {
+    fn new(keep: Keep) -> Self {
         Self {
             meta: Map::new(),
             msgs: Vec::new(),
             pos: HashMap::new(),
-            body,
+            keep,
         }
     }
 
@@ -445,7 +498,7 @@ impl Replay {
 
     /// 新 id 接在最后；已有的 id 整条替换、位置不变。
     fn put(&mut self, id: &str, v: &Value) {
-        let m = Msg::new(v, self.body);
+        let m = Msg::new(v, self.keep);
         match self.pos.get(id) {
             Some(&i) => self.msgs[i].1 = m,
             None => {
@@ -511,9 +564,10 @@ impl Replay {
         let Some(&i) = str_field(u, "id").and_then(|id| self.pos.get(id)) else {
             return;
         };
+        let keep = self.keep;
         let m = &mut self.msgs[i].1;
         if let Some(c) = u.get("content") {
-            m.content = part_text(c);
+            m.content = m.text(c, keep);
         }
         for tc in u
             .get("toolCalls")
@@ -567,22 +621,36 @@ struct Tool {
 }
 
 impl Msg {
-    fn new(v: &Value, body: bool) -> Self {
+    fn new(v: &Value, keep: Keep) -> Self {
         let role = match str_field(v, "type") {
             Some("user") => Some(Role::User),
             Some("gemini") => Some(Role::Assistant),
             _ => None,
         };
         let tools = match v.get("toolCalls").and_then(Value::as_array) {
-            Some(calls) if body => calls.iter().map(Tool::new).collect(),
+            Some(calls) if keep == Keep::Body => calls.iter().map(Tool::new).collect(),
             _ => Vec::new(),
         };
-        Self {
+        let mut m = Self {
             role,
-            content: v.get("content").and_then(part_text),
-            display: v.get("displayContent").and_then(part_text),
+            content: None,
+            display: None,
             at: str_field(v, "timestamp").and_then(parse_rfc3339),
             tools,
+        };
+        m.content = v.get("content").and_then(|c| m.text(c, keep));
+        m.display = v.get("displayContent").and_then(|c| m.text(c, keep));
+        m
+    }
+
+    /// 这条消息该留的字：计数时 AI 的不留，用户的只留开头。
+    fn text(&self, content: &Value, keep: Keep) -> Option<String> {
+        match (keep, self.role) {
+            (Keep::Count, Some(Role::User)) => {
+                part_text(content).map(|t| t.chars().take(COUNT_PREFIX_CHARS).collect())
+            }
+            (Keep::Count, _) => None,
+            _ => part_text(content),
         }
     }
 
@@ -674,7 +742,7 @@ mod tests {
     use serde_json::json;
 
     fn replay(lines: &[Value]) -> Replay {
-        let mut r = Replay::new(true);
+        let mut r = Replay::new(Keep::Body);
         for l in lines {
             r.line(l);
         }
@@ -771,6 +839,34 @@ mod tests {
         assert_eq!(texts(&r), ["看 @a.md 里写了什么", "答"]);
     }
 
+    /// 审计 v0.1.3 第 17 条：只数条数时不把 AI 的正文留在内存里（以前 480 条 120 KB 的回复全留着，约 55 MiB），
+    /// 用户的话也只留判断命令、注入要的开头；回放（补丁改内容、回退）照常。
+    #[test]
+    fn counting_keeps_no_reply_text() {
+        let reply = "长".repeat(40_000);
+        let mut r = Replay::new(Keep::Count);
+        r.line(&user("u1", &format!("第一句 {reply}")));
+        for i in 0..50 {
+            r.line(&model(&format!("g{i}"), &reply));
+        }
+        r.line(&user("u2", "/compress"));
+        r.line(&json!({"$patch": {"id": "u2", "content": [{"text": format!("改成正常的话 {reply}")}]}}));
+        r.line(&user("u3", "<session_context>注入</session_context>"));
+        assert_eq!(r.users(), 2);
+        let kept: usize = r
+            .msgs
+            .iter()
+            .flat_map(|(_, m)| [&m.content, &m.display])
+            .flatten()
+            .map(String::len)
+            .sum();
+        assert!(kept <= 3 * COUNT_PREFIX_CHARS * 4, "留了 {kept} 字节");
+        // 扫描、预览照旧留全文。
+        let mut full = Replay::new(Keep::Text);
+        full.line(&model("g", &reply));
+        assert_eq!(full.msgs[0].1.content.as_deref(), Some(reply.as_str()));
+    }
+
     #[test]
     fn names_and_dirs() {
         assert!(is_session_name(OsStr::new(
@@ -799,6 +895,7 @@ mod tests {
             last_active: SystemTime::UNIX_EPOCH,
             message_count: 0,
             automatic: false,
+            account: String::new(),
         };
         let cmd = src.resume_with_message_cmd(&s, "-继续");
         assert_eq!(

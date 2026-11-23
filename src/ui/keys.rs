@@ -20,11 +20,11 @@ pub enum Action {
     Search,
     /// 跳到第 n 个项目（1–9）。
     Jump(u8),
-    /// 跳到下一条等你回复的对话（三家轮着找）。
+    /// 跳到下一条等你回复的对话（各家轮着找）。
     NextWaiting,
     /// 看整段对话（只读滚动视图）。
     Read,
-    /// 打开 / 关上「等你回复」汇总：三家等你回复和在跑的列在一起。
+    /// 打开 / 关上「等你回复」汇总：各家等你回复和在跑的列在一起。
     Board,
     /// 新标签页打开（已开着就切过去）。
     Open,
@@ -45,6 +45,8 @@ pub enum Action {
     Finder,
     GitStatus,
     Settings,
+    /// `$` 额度面板。
+    Balance,
     Help,
     Quit,
 }
@@ -57,6 +59,8 @@ pub fn halfwidth(c: char) -> char {
         '，' => ',',
         '！' => '!',
         '。' => '.',
+        // 中文输入法下 ⇧4 打出来的是 ￥。
+        '￥' | '＄' => '$',
         _ => c,
     }
 }
@@ -120,6 +124,7 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('f') => Action::Finder,
         KeyCode::Char('g') => Action::GitStatus,
         KeyCode::Char(',') => Action::Settings,
+        KeyCode::Char('$') => Action::Balance,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
@@ -257,8 +262,10 @@ pub const HELP: &[(&str, &[KeyHelp])] = &[
             k("←→ hl", "收起 / 展开"),
             k("b", "显示 / 隐藏后台对话"),
             k("/", "搜标题和正文"),
+            k("", "里面按 ⌃A 各家一起搜"),
             k("1-9", "跳到第几个项目"),
             k("v  →", "看整段对话（t 展开工具）"),
+            k("", "里面按 s 存成 Markdown"),
             k("!", "下一条等你回复的（跨家）"),
             k("s", "各家等你回复和在跑的"),
         ],
@@ -300,6 +307,7 @@ pub const HELP: &[(&str, &[KeyHelp])] = &[
         "其他",
         &[
             k(",", "设置"),
+            k("$", "各账号额度和余额"),
             k("q", "退出（后台对话不停）"),
             k("单击", "选中；组标题收起 / 展开"),
             k("", "顶栏 ◆ 跳到等你回复的"),

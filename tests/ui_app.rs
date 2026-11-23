@@ -235,6 +235,92 @@ fn kill_asks_first_and_only_for_hosted() {
     assert_eq!(app.status.as_deref(), Some("这条对话没有在后台跑"));
 }
 
+/// 搜索里 ⌃A 在「只搜当前这家」和「各家一起搜」之间切；各家的结果回车打开的是那条自己的家，
+/// Tab 换家回到只搜那家。
+#[test]
+fn ctrl_a_searches_every_vendor_and_back() {
+    let ctrl_a = || KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+    let mut app = demo_app(Vendor::Claude);
+    press(&mut app, '/');
+    // 还没输词：只切范围，不搜。
+    assert!(app.key(ctrl_a()).is_empty());
+    assert!(app.search.as_ref().unwrap().all);
+    assert!(app.key(ctrl_a()).is_empty());
+    assert!(
+        !app.search.as_ref().unwrap().all,
+        "默认只搜当前这家，再按切回"
+    );
+    press(&mut app, 'q');
+    assert_eq!(
+        app.key(ctrl_a()),
+        vec![Effect::Search {
+            vendor: None,
+            query: "q".into()
+        }],
+        "⌃A 是切换，不是往搜索框里打 a"
+    );
+    assert_eq!(app.search.as_ref().unwrap().query, "q");
+    assert_eq!(app.search_scope(), None);
+    // 只搜一家的旧结果丢掉；各家一起的收下。
+    app.set_hits(Vendor::Claude, "q", claude_entries());
+    assert!(app.search.as_ref().unwrap().hits.is_empty());
+    let mixed: Vec<_> = codex_entries()
+        .into_iter()
+        .take(1)
+        .chain(claude_entries().into_iter().take(1))
+        .map(|entry| huitai::index::Hit {
+            entry,
+            in_title: true,
+            in_body: false,
+        })
+        .collect();
+    app.set_search_hits(None, "q", mixed);
+    assert_eq!(app.search.as_ref().unwrap().hits.len(), 2);
+    // 第一条是 Codex 的：当前标签还是 Claude，回车打开的照样是那条 Codex 对话。
+    assert_eq!(app.vendor, Vendor::Claude);
+    match app.key(key(KeyCode::Enter)).as_slice() {
+        [Effect::Open { entry, .. }] => assert_eq!(entry.session.vendor, Vendor::Codex),
+        other => panic!("回车应打开选中的那条：{other:?}"),
+    }
+    // 打字照样各家一起搜。
+    assert_eq!(
+        press(&mut app, 'x'),
+        vec![Effect::Search {
+            vendor: None,
+            query: "qx".into()
+        }]
+    );
+    // Tab 换家：回到只搜换到的那家。
+    assert_eq!(
+        app.key(key(KeyCode::Tab)),
+        vec![Effect::Search {
+            vendor: Some(Vendor::Codex),
+            query: "qx".into()
+        }]
+    );
+    assert!(!app.search.as_ref().unwrap().all);
+    // 再切到各家，点当前这家的标签也回到只搜这家。
+    app.key(ctrl_a());
+    render(&mut app, 120, 30);
+    let (_, r) = *app
+        .areas
+        .tabs
+        .iter()
+        .find(|(v, _)| *v == Vendor::Codex)
+        .unwrap();
+    assert_eq!(
+        app.mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), r.x, 0),
+            Instant::now(),
+        ),
+        vec![Effect::Search {
+            vendor: Some(Vendor::Codex),
+            query: "qx".into()
+        }]
+    );
+    assert_eq!(app.search_scope(), Some(Vendor::Codex));
+}
+
 #[test]
 fn search_types_query_and_esc_returns() {
     let mut app = demo_app(Vendor::Claude);
@@ -242,7 +328,7 @@ fn search_types_query_and_esc_returns() {
     assert_eq!(
         press(&mut app, 'q'),
         vec![Effect::Search {
-            vendor: Vendor::Claude,
+            vendor: Some(Vendor::Claude),
             query: "q".into()
         }],
         "搜索框里 q 是字，不是退出"
@@ -252,7 +338,7 @@ fn search_types_query_and_esc_returns() {
     assert_eq!(
         app.key(key(KeyCode::Tab)),
         vec![Effect::Search {
-            vendor: Vendor::Codex,
+            vendor: Some(Vendor::Codex),
             query: "q".into()
         }]
     );
@@ -481,4 +567,53 @@ fn live_preview_follows_selected_running_session_and_stops_under_overlays() {
     app.key(key(KeyCode::Up));
     assert!(app.selected_entry().is_none());
     assert_eq!(app.live_target(), None);
+}
+
+/// 审计 v0.1.4 第 21 条：Antigravity 工作区为空或不是本机路径的对话没有项目目录，接不上：预览标成只能查看，
+/// 回车、w 都只给提示、不去开标签页；v 照样能看整段。
+#[test]
+fn conversation_without_a_local_workdir_is_view_only() {
+    let mut app = demo_app(Vendor::Antigravity);
+    let mut entries = antigravity_entries();
+    let mut remote = entries[0].clone();
+    remote.session.id = SessionId::from("a9e10000-3333-4aaa-8bbb-000000000003");
+    remote.session.cwd = std::path::PathBuf::new();
+    remote.session.title = Some("远程工作区里的对话".to_owned());
+    entries.push(remote);
+    app.set_entries(Vendor::Antigravity, entries);
+    // 没有目录的收在「零散」组里：碰到组标题就展开。
+    for _ in 0..20 {
+        if selected_id(&app).as_deref() == Some("a9e10000-3333-4aaa-8bbb-000000000003") {
+            break;
+        }
+        if app.selected_entry().is_none() {
+            app.key(key(KeyCode::Right));
+        }
+        app.key(key(KeyCode::Down));
+    }
+    select_id(&mut app, "a9e10000-3333-4aaa-8bbb-000000000003");
+    load_preview(&mut app);
+
+    assert!(app.key(key(KeyCode::Enter)).is_empty(), "回车不打开");
+    assert_eq!(app.status.as_deref(), Some(huitai::ui::app::VIEW_ONLY));
+    app.status = None;
+    assert!(press(&mut app, 'w').is_empty(), "w 也不打开");
+    assert_eq!(app.status.as_deref(), Some(huitai::ui::app::VIEW_ONLY));
+    assert!(
+        dump(&render(&mut app, 120, 30)).contains("只能查看"),
+        "预览标成只能查看"
+    );
+    press(&mut app, 'v');
+    assert!(app.reader.is_some(), "整段照样能看");
+
+    // 有目录的照常打开。
+    app.reader = None;
+    for _ in 0..20 {
+        app.key(key(KeyCode::Up));
+    }
+    select_id(&mut app, "a9e10000-1111-4aaa-8bbb-000000000001");
+    assert!(matches!(
+        app.key(key(KeyCode::Enter)).as_slice(),
+        [Effect::Open { .. }]
+    ));
 }

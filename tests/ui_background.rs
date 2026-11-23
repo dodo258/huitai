@@ -346,6 +346,58 @@ fn collapsed_header_shows_count_time_and_status() {
     );
 }
 
+/// 每个表头下面都有对应的内容，列靠右对齐：内容的右边和表头字的右边在同一列。
+/// 对话的状态灯就在「状态」列里；窄了省掉的列，表头和各行一起省，状态列一直在。
+#[test]
+fn every_column_header_has_content_under_it() {
+    let mut app = demo_app(Vendor::Claude);
+    let w = huitai::ui::text::width;
+    // 这一行里每个非空白字符的右边落在第几列。
+    let ends = |l: &str| -> Vec<usize> {
+        l.char_indices()
+            .filter(|(_, c)| !c.is_whitespace())
+            .map(|(i, c)| w(&l[..i + c.len_utf8()]))
+            .collect()
+    };
+    for width in [120, 70, 44, 36] {
+        let text = screen(&mut app, width);
+        let lines: Vec<&str> = text.lines().collect();
+        let head = lines[1];
+        assert!(head.contains("状态"), "状态列一直在（宽 {width}）\n{text}");
+        let mut shown = 0;
+        for label in ["状态", "后台", "对话", "最近"] {
+            let Some(at) = head.find(label) else { continue };
+            shown += 1;
+            let end = w(&head[..at + label.len()]);
+            assert!(
+                lines[2..].iter().any(|l| ends(l).contains(&end)),
+                "表头「{label}」下面空着（宽 {width}）\n{text}"
+            );
+        }
+        // 对话行的状态灯在状态列里、不在标题前面。
+        let row = lines
+            .iter()
+            .find(|l| l.contains("▎   购物车"))
+            .unwrap_or_else(|| panic!("宽 {width}\n{text}"));
+        let status_end = w(&head[..head.find("状态").unwrap() + "状态".len()]);
+        let light = row.find('◐').unwrap();
+        assert_eq!(
+            w(&row[..light + '◐'.len_utf8()]),
+            status_end,
+            "\n{head}\n{row}"
+        );
+        assert!(!row[..row.find("购物车").unwrap()].contains('◐'), "{row}");
+        // 省掉的列，各行也不画：展开的 shop 组标题右边只剩状态列（空着）时，不再写条数。
+        if !head.contains("对话") {
+            let shop = lines.iter().find(|l| l.contains("▾ shop")).unwrap();
+            assert!(!shop.trim_end().ends_with(" 3"), "宽 {width}：{shop}");
+        }
+        if width == 36 {
+            assert!(shown < 4, "窄的时候要省列\n{text}");
+        }
+    }
+}
+
 #[test]
 fn background_running_in_a_collapsed_group_is_mentioned() {
     let mut app = demo_app(Vendor::Claude);

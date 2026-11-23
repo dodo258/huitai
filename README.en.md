@@ -2,7 +2,7 @@
 
 # huitai `ai`
 
-Type `ai` in your terminal to see every Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Qwen Code conversation on this Mac, grouped by project. Press Enter to pick one back up. Close the window and it keeps running in the background.
+Type `ai` in your terminal to see every Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Antigravity conversation on this Mac, grouped by project. Press Enter to pick one back up. Close the window and it keeps running in the background.
 
 [![Release](https://img.shields.io/github/v/release/dodo258/huitai?label=release&color=16181D)](https://github.com/dodo258/huitai/releases/latest) [![License](https://img.shields.io/badge/license-MIT-16181D)](LICENSE) ![macOS](https://img.shields.io/badge/macOS-16181D?logo=apple&logoColor=white) ![Rust](https://img.shields.io/badge/Rust-16181D?logo=rust&logoColor=white)
 
@@ -12,7 +12,7 @@ Type `ai` in your terminal to see every Claude Code, Codex, pi, Hermes, Kimi Cod
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/images/board-light.png">
-  <img src="docs/images/board-dark.png" width="900" alt="huitai: conversations grouped by project on the left with status, background, count and last-active columns; the selected conversation's live screen on the right">
+  <img src="docs/images/board-dark.png" width="900" alt="huitai: tabs for all eight tools across the top (Claude, Codex, pi, Hermes, Kimi Code, Gemini, OpenCode, Antigravity); Gemini CLI conversations grouped by project on the left, two accounts mixed together and labelled by account name, some running, waiting for you or just done; the running one's live screen on the right">
 </picture>
 
 <sub>Screenshots use made-up data.</sub>
@@ -45,7 +45,7 @@ Or build from source (needs a recent stable Rust, `rustup update stable`):
 cargo install --locked --git https://github.com/dodo258/huitai
 ```
 
-**Requirements**: macOS (developed and tested on macOS 27 with Apple silicon; the Intel build is compiled but not tested on real hardware). Opening conversations in a new tab needs [Ghostty](https://ghostty.org) 1.3 or later, [Kaku](https://github.com/tw93/Kaku) or [cmux](https://cmux.com); other terminals open them in the current window (cmux does not support opening at login or ⌥Space opening a new board, because it refuses control from outside). Whichever of Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Qwen Code you have installed shows up. The CLIs can live anywhere on your PATH, and if you moved their data with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, huitai looks there too.
+**Requirements**: macOS (developed and tested on macOS 27 with Apple silicon; the Intel build is compiled but not tested on real hardware). Opening conversations in a new tab needs [Ghostty](https://ghostty.org) 1.3 or later, [Kaku](https://github.com/tw93/Kaku) or [cmux](https://cmux.com); other terminals open them in the current window (cmux does not support opening at login or ⌥Space opening a new board, because it refuses control from outside). Whichever of Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI and OpenCode you have installed shows up. The CLIs can live anywhere on your PATH, and if you moved their data with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, huitai looks there too.
 
 **Footprint**: about 27 MB of memory while the list is open and about 22 MB for the idle background daemon (measured on an Apple M4 Max); when nothing is running it does not redraw and uses almost no CPU.
 
@@ -59,7 +59,7 @@ Not sure everything is set up? Run `ai doctor`. It checks the three CLIs and the
 
 ## Everyday tasks
 
-**Find a conversation**: `Tab` switches tool, `↑↓` or `jk` moves, `←→` collapses or expands a project, Enter on a project goes straight to its first conversation, `1-9` jumps to a project. `/` searches titles and message text.
+**Find a conversation**: `Tab` switches tool, `↑↓` or `jk` moves, `←→` collapses or expands a project, Enter on a project goes straight to its first conversation, `1-9` jumps to a project. `/` searches titles and message text in the current tool; if you do not remember which tool it was, press `⌃A` while searching to search every tool at once (results are ranked together, each row marked with its tool, Enter opens it as usual), and press it again or `Tab` to another tool to go back to one tool.
 
 **Continue a conversation**: Enter opens it in a new tab; if it is already open, that tab comes to the front instead of a second one. Press `w` to chat in the current window; when the conversation ends you are back in the list.
 
@@ -73,9 +73,9 @@ Not sure everything is set up? Run `ai doctor`. It checks the three CLIs and the
 
 **Get deleted conversations back**: `d` moves a conversation to huitai's trash; nothing is really deleted (Codex conversations are only hidden). `u` restores the most recently deleted one for this tool; press it again to go further back.
 
-A header row tops the list: projects on the left, then columns for status, background conversations running, number of conversations, and when you last talked. Keys 1–9 jump to a project. Expanded project headers sit on a tinted band, and when you scroll into a long group its header stays pinned at the top, so you can always click it or press `←` to fold it. Projects you have not touched for a month fold into "long idle" at the bottom; press Enter to open it. The path at the bottom right opens in Finder when clicked.
+A header row tops the list: projects and conversation titles on the left, then columns for status (each conversation's status light, preceded by plan progress such as `2/5` when there is one; a collapsed project shows how many are running and whether any is waiting), background conversations running, number of conversations, and when you last talked. Every column is right-aligned under its header; in a narrow terminal the conversation count goes first, then background and last talked, the header drops them too, and the status column always stays. Keys 1–9 jump to a project. Expanded project headers sit on a tinted band, and when you scroll into a long group its header stays pinned at the top, so you can always click it or press `←` to fold it. Projects you have not touched for a month fold into "long idle" at the bottom; press Enter to open it. The path at the bottom right opens in Finder when clicked.
 
-Status lights in the list: a spinning green half-circle `◐` is running, `◆` is waiting for you (slowly blinking), `✓` just finished, `○` stopped. The moment a conversation stops running (done, or waiting for you) its whole row lights up and fades out over a couple of seconds; a collapsed project lights its header instead. Pale green means the conversation is open somewhere else (the desktop app, say): spinning while it works, still while it is just open; you are asked before opening it.
+Status lights in the list (in the status column): a spinning green half-circle `◐` is running, `◆` is waiting for you (slowly blinking), `✓` just finished and you have not looked yet (it turns into `◆` once you have), `✗` failed, `○` stopped. The moment a conversation stops running (done, or waiting for you) its whole row lights up and fades out over a couple of seconds; a collapsed project lights its header instead. Pale green means the conversation is open somewhere else (the desktop app, say): spinning while it works, still while it is just open; you are asked before opening it.
 
 Right after the seal, the top bar totals every tool: conversations huitai hosts that are running (`◐3 在跑`) or waiting for you (`◆1 等你`), and conversations open elsewhere (`●2 别处`); zeros are left out. Click the waiting count to jump to the next one waiting for you, or the elsewhere count to jump to the next one open elsewhere.
 
@@ -84,7 +84,7 @@ Right after the seal, the top bar totals every tool: conversations huitai hosts 
 - Type `ai` inside a project directory (or any subdirectory) and that project opens expanded.
 - `!` jumps to the next conversation waiting for you, across every tool; clicking `◆` in the top bar does the same. Clicking `●N 别处` in the top bar jumps to the next one open elsewhere, such as the desktop app.
 - `s` lists every conversation waiting for you or running, across every tool, with the waiting ones first, so you can see at a glance which ones are stuck; `Esc` goes back to the list.
-- `v` (or `→`) shows the whole conversation, read-only: it starts at the end, tool calls are folded into one line (`t` unfolds them), and when opened from search results the search words are highlighted and `n` jumps to the next one. Once you are sure it is the right one, `⏎` continues it.
+- `v` (or `→`) shows the whole conversation, read-only: it starts at the end, tool calls are folded into one line (`t` unfolds them), and when opened from search results the search words are highlighted and `n` jumps to the next one. Once you are sure it is the right one, `⏎` continues it. Press `s` to save the conversation as Markdown in `~/Downloads/<title>-<date>.md` (a number is added if the name is taken); the bottom bar shows where it went. The file starts with the title, tool, project and time, marks each message as yours or the AI's, and puts each tool call on one line.
 - `⌥Space` brings up huitai from anywhere. It works once the daemon is up, which happens the first time you open a conversation.
 - `c` copies the resume command (`cd 'dir' && claude --resume …`); paste it into any terminal to continue.
 - `x` ends a conversation running in the background.
@@ -114,10 +114,11 @@ Every action is a single key. The bottom bar shows the most common ones; `?` sho
 | | `↑↓` `jk` | Move |
 | | `←→` `hl` | Collapse / expand |
 | | `/` | Search titles and text |
+| | `⌃A` (while searching) | Search every tool / only this one |
 | | `1-9` | Jump to a project |
 | | `!` | Next conversation waiting for you (any tool) |
 | | `s` | Everything waiting for you or running, every tool in one list |
-| | `v` / `→` | Read the whole conversation (`t` unfolds tool calls) |
+| | `v` / `→` | Read the whole conversation (`t` unfolds tool calls, `s` saves it as Markdown) |
 | | `b` | Show / hide background conversations |
 | Open | `⏎` | Open in a new tab |
 | | `w` / `⌥⏎` | Open in the current window (`⌥⏎` needs Option as Alt) |
@@ -139,8 +140,36 @@ Every action is a single key. The bottom bar shows the most common ones; `?` sho
 | | `q` | Quit (background conversations keep running) |
 | Global | `⌥Space` | Bring up huitai |
 
-There are five commands: `ai` (the list), `ai doctor` (self-check), `ai update` (upgrade: runs `brew upgrade` for Homebrew installs, prints the command for cargo installs, and for downloaded builds verifies the new one before swapping it in; running conversations are not interrupted), `ai attach <id>` (used by new tabs, no need to remember it) and `ai daemon` (the background daemon, started automatically).
+There are eight commands: `ai` (the list), `ai doctor` (self-check), `ai list` and `ai search <words>` (list or search conversations without opening the UI, see "Command-line queries" below), `ai export <conversation id> [-o file]` (export one conversation as Markdown, printed to standard output without `-o`; the id is in the resume command `c` copies, and if several accounts have the same id it lists account-qualified ids to pick from), `ai update` (upgrade: runs `brew upgrade` for Homebrew installs, prints the command for cargo installs, and for downloaded builds verifies the new one before swapping it in; running conversations are not interrupted), `ai attach <id>` (used by new tabs, no need to remember it) and `ai daemon` (the background daemon, started automatically).
 
+## Command-line queries
+
+Print results without opening the UI, for pipes and scripts. Read-only: they read the index from the last time the list scanned, do not scan, change no files and do not start the daemon; a conversation you just started shows up after you open `ai` once. If `ai` has never been opened (no index yet) they say so ("还没有索引……先运行一次 ai") and exit non-zero.
+
+- `ai list [--vendor name] [--json]`: every conversation, newest first. `--vendor` keeps one vendor: `claude`, `codex`, `pi`, `hermes`, `kimi`, `gemini`, `opencode`, `antigravity` or the name shown in the top bar (case-insensitive).
+- `ai search <words…> [--json]`: search titles and bodies with the same results and order as `/` in the UI: vendor by vendor (top-bar order), title hits first within each, then body hits by relevance. Separate words with spaces; every word must match.
+
+Without `--json`, one aligned line per conversation: time, vendor, account, state (`托管中` or `-`), project, title, id. The id is last, so `ai list | awk '{print $NF}'` gets it; long projects and titles are truncated. For body hits, `ai search` adds the matching passage on the next line, indented four spaces. With no results nothing is printed to standard output and a note goes to standard error.
+
+With `--json` it prints a JSON array, `[]` when empty. The fields are a stable interface; new ones may be added, existing ones won't change:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | The conversation id huitai uses, accepted by `ai export <id>`; non-default accounts carry an `<account>:` prefix |
+| `vendor` | string | `claude`, `codex`, `pi`, `hermes`, `kimi`, `gemini`, `opencode`, `antigravity` |
+| `account` | string | Account display name; the default location under your home directory is「默认」 |
+| `project` | string | Project directory (absolute path) |
+| `title` | string | Title: the name you gave it in huitai, else the vendor's title, else the id |
+| `state` | string | `hosted`: huitai is hosting it and the CLI process is running; `stopped`: not |
+| `last_active` | string | Last activity, RFC 3339 in local time, e.g. `2026-11-23T10:59:02+08:00` |
+| `archived` | bool | Archived in huitai |
+| `automatic` | bool | Started by a script or background job (`claude -p`, `codex exec` and the like) |
+| `snippet` | string or `null` | `ai search` only: the matching passage (one line, at most 240 characters); `null` when only the title matched or the body could not be read |
+
+```sh
+ai list --vendor codex --json | jq -r '.[] | select(.state == "hosted") | .title'
+ai search deploy script | head
+```
 
 ## How it differs from Rex
 
@@ -149,7 +178,7 @@ There are five commands: `ai` (the list), `ai doctor` (self-check), `ai update` 
 | | huitai | Rex |
 |---|---|---|
 | What it is | One command, `ai`, inside the terminal you already use (Ghostty, Kaku, cmux, others) | A standalone terminal app that replaces your current terminal |
-| Which conversations | Every past Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Qwen Code conversation on this Mac, grouped by project, full-text searchable, resumed with Enter | Sessions opened in Rex; shows which Claude Code, Codex, OpenCode or pi session is working or waiting for you |
+| Which conversations | Every past Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Antigravity (`agy` and the Antigravity app) conversation on this Mac, grouped by project, full-text searchable, resumed with Enter | Sessions opened in Rex; shows which Claude Code, Codex, OpenCode or pi session is working or waiting for you |
 | Quota | Top bar shows Claude and Codex limit windows and pi's tokens today | Not mentioned in the official material |
 | Several machines | This Mac only | Its strength: connect to Rex servers on other machines; iOS and other clients are on the way |
 | Getting it | One-line install, MIT licensed | Join the mailing list and wait for an invite; free, no account needed |

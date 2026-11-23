@@ -57,18 +57,22 @@
 		--line: #dfded9;
 		--text: #3a3935;
 		--title: #141518;
-		--muted: #6f6d66;
-		--accent: #a84f32; /* theme.rs 的 #c0603f 压一档：浅底上链接、按键字要够 4.5:1 */
+		--muted: #66645d; /* 顶栏、命令块（#e9e9e6）上也够 4.5:1 */
+		--accent: #9c472b; /* theme.rs 的 #c0603f 压两档：浅底和悬停底（#dfded9）上链接、按键字都要够 4.5:1 */
 		--stamp: #c0603f;  /* 印章是标志，保持和界面截图里一样 */
 		--running: #2e8f4c;
 		--waiting: #a8740f;
 		--done: #16808f;
-		--stopped: #9d9b94;
+		--stopped: #6f6d66; /* 对比表「没有」那格是字，要读得清 */
 		--elsewhere: #5e9a6f;
 	}
 }
 
 * { box-sizing: border-box; }
+
+p, dd, li { text-wrap: pretty; }
+.swipe { display: none; }
+:lang(en) .lead, :lang(en) .intro, :lang(en) .pick { max-width: 34em; } /* 英文约 75 字一行 */
 
 html { -webkit-text-size-adjust: 100%; }
 
@@ -128,7 +132,7 @@ kbd {
 	gap: var(--s4);
 	height: 48px;
 }
-.top .stamp { font-size: 15px; }
+.top .stamp { font-size: 15px; background: var(--accent); } /* 小字印章：浅色下 #c0603f 底只有 3.5:1 */
 .top .name { font-family: var(--mono); color: var(--title); font-size: var(--fs-mono); }
 .top nav {
 	margin-left: auto;
@@ -364,4 +368,7 @@ h2 {
 	.foot .path { margin-left: 0; }
 	.legend li:first-child { flex-basis: 100%; }
 	.tag br { display: none; }
+	.shot a { display: block; overflow-x: auto; }
+	.shot img { min-width: 785px; }
+	.swipe { display: inline; }
 }

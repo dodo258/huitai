@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::exec;
+use super::CLI_TIMEOUT;
 use super::{GhosttyOpener, Opened, Opener, TabHandle};
+use crate::core::exec;
 use crate::sources::Command;
 
 /// cmux 装在默认位置时的命令行工具。
@@ -98,8 +99,7 @@ impl CmuxOpener {
     }
 
     fn cmux(&self, args: &[String]) -> io::Result<String> {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        exec::run(&self.cli, &args, exec::TIMEOUT)
+        exec::run(&self.cli, args, None, CLI_TIMEOUT)
     }
 }
 

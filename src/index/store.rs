@@ -29,13 +29,19 @@ pub(crate) const DB_NAME: &str = "index.sqlite";
 const SCHEMA_VERSION: i64 = 1;
 
 /// 后加的列：表、列、定义。旧版写入时不填，取默认值 0，新版当作没读过。
-const ADDED_COLUMNS: [(&str, &str, &str); 6] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 9] = [
     ("sessions", "parser", "integer not null default 0"),
     ("files", "parser", "integer not null default 0"),
     ("sessions", "tally_pos", "integer"),
     ("sessions", "tally_users", "integer"),
     ("sessions", "tally_digest", "integer"),
     ("sessions", "body_parts", "integer not null default 0"),
+    // 哪个账号的（`Account::key`，默认账号是空串）：同一家几个账号各扫各的，删没了的只删自己账号的。
+    ("sessions", "account", "text not null default ''"),
+    ("files", "account", "text not null default ''"),
+    // 这个文件上次读出的对话 id（读出来不是对话时为空）：一条对话由几个文件读出时，没了其中一个，
+    // 靠它找到同一条对话的其余文件重读。
+    ("files", "session", "text"),
 ];
 
 const SCHEMA: &str = "
@@ -54,6 +60,7 @@ create table sessions(
     tally_users integer,
     tally_digest integer,
     body_parts integer not null default 0,
+    account text not null default '',
     unique(vendor, id)
 );
 create index sessions_file on sessions(file);
@@ -62,7 +69,9 @@ create table files(
     vendor text not null,
     mtime_ns integer not null,
     len integer not null,
-    parser integer not null default 0
+    parser integer not null default 0,
+    account text not null default '',
+    session text
 );
 create virtual table body using fts5(
     vendor,
@@ -122,8 +131,8 @@ pub(crate) fn check(conn: &Connection) -> Result<(), String> {
 fn schema_ok(conn: &Connection) -> rusqlite::Result<()> {
     for sql in [
         "select rid, vendor, id, file, data, last_active_ms, key, body_key, exact_count, parser, \
-         tally_pos, tally_users, tally_digest, body_parts from sessions limit 0",
-        "select path, vendor, mtime_ns, len, parser from files limit 0",
+         tally_pos, tally_users, tally_digest, body_parts, account from sessions limit 0",
+        "select path, vendor, mtime_ns, len, parser, account, session from files limit 0",
         "select rowid, vendor, text from body limit 0",
     ] {
         conn.prepare(sql)?;
@@ -158,25 +167,36 @@ fn millis(t: SystemTime) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// 缓存里一个会话文件的记录：上次读时的状态，和读它的解析版本。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 缓存里一个会话文件的记录：上次读时的状态、读它的解析版本和读出的对话 id。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Seen {
     pub stamp: Stamp,
     pub parser: u32,
+    pub session: Option<String>,
 }
 
 /// 对话内容的「版本」：变了就要重建它的全文索引。带上解析版本（解析规则改了正文也要重取），
-/// 会话文件在就带上文件的 mtime 和大小。
-pub(crate) fn content_key(s: &Session, parser: u32) -> String {
+/// 会话文件在就带上文件的 mtime 和大小；库里的对话有正文修订号（[`crate::sources::Scan::revisions`]）就带上它，
+/// 原地改了正文也算变了。
+pub(crate) fn content_key(s: &Session, parser: u32, revision: Option<u64>) -> String {
     let file = Stamp::of(&s.path).map_or_else(
         |_| "-".to_owned(),
         |st| format!("{}:{}", st.mtime_ns, st.len),
     );
-    format!(
+    let mut key = format!(
         "p{parser}:{}:{}:{file}",
         millis(s.last_active),
         s.message_count
-    )
+    );
+    if let Some(r) = revision {
+        key += &format!(":r{r}");
+    }
+    key
+}
+
+/// 存进 `sessions.data` 的样子。
+pub(crate) fn session_data(s: &Session) -> io::Result<String> {
+    serde_json::to_string(s).map_err(io::Error::other)
 }
 
 /// 缓存里的一条对话。
@@ -224,6 +244,41 @@ pub(crate) fn open(dir: &Path) -> io::Result<Connection> {
         }
         other => other.map_err(sql_err),
     }
+}
+
+/// 只读打开缓存库（`ai list`、`ai search` 用）：不建、不重建、不补列。库还没有时报 `NotFound`，
+/// 表结构版本不对、读要用的表或列不在时报 `InvalidData`，都请用户先开一次会话台。
+pub(crate) fn open_read_only(dir: &Path) -> io::Result<Connection> {
+    let path = dir.join(DB_NAME);
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("还没有索引（{}）", path.display()),
+        ));
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(sql_err)?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(sql_err)?;
+    let version: i64 = conn
+        .query_row("pragma user_version", [], |r| r.get(0))
+        .map_err(sql_err)?;
+    // 只查读列表、搜索要用的列：旧版 `ai` 建的库缺后加的列（[`ADDED_COLUMNS`]）照样能读。
+    let readable = [
+        "select rid, vendor, data, last_active_ms, key, body_key, exact_count from sessions limit 0",
+        "select rowid, vendor, text from body limit 0",
+    ]
+    .iter()
+    .all(|sql| conn.prepare(sql).is_ok());
+    if version != SCHEMA_VERSION || !readable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("索引是别的版本建的（{}）", path.display()),
+        ));
+    }
+    Ok(conn)
 }
 
 /// 删掉 `dir` 里的缓存库（含 WAL）。调用前先关掉所有连接。
@@ -314,12 +369,14 @@ pub(crate) fn rows(conn: &Connection, vendor: Vendor) -> io::Result<Vec<Row>> {
 /// 全文命中的对话行号，按相关度排序。`query` 是 `text::fts_query` 生成的查询（几个词用 `AND` 连起来）。
 ///
 /// 一条对话的正文可能分成几段（几行），FTS5 的 `AND` 只在同一行里判断：每个词单独查、各自按对话合并，
-/// 每个词都命中的对话才算，相关度取各词在这条对话里最好的那段相加。
+/// 每个词都命中的对话才算，相关度取各词在这条对话里最好的那段相加。`keep` 为假的行（账号停用了的）
+/// 在排序、限量之前去掉，不占 `limit` 的名额。`vendor` 为 `None` 时各家一起搜。
 pub(crate) fn search_body(
     conn: &Connection,
-    vendor: Vendor,
+    vendor: Option<Vendor>,
     query: &str,
     limit: usize,
+    keep: impl Fn(i64) -> bool,
 ) -> io::Result<Vec<i64>> {
     let mut st = conn
         .prepare_cached(&format!(
@@ -329,7 +386,10 @@ pub(crate) fn search_body(
     let terms = and_terms(query);
     let mut found: HashMap<i64, (usize, f64)> = HashMap::new();
     for term in &terms {
-        let q = format!("vendor : {} AND text : ({term})", vendor_key(vendor));
+        let q = match vendor {
+            Some(v) => format!("vendor : {} AND text : ({term})", vendor_key(v)),
+            None => format!("text : ({term})"),
+        };
         let rows = st
             .query_map([q], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
             .map_err(sql_err)?;
@@ -342,7 +402,7 @@ pub(crate) fn search_body(
     }
     let mut hits: Vec<(i64, f64)> = found
         .into_iter()
-        .filter(|(_, (n, _))| *n == terms.len())
+        .filter(|(rid, (n, _))| *n == terms.len() && keep(*rid))
         .map(|(rid, (_, rank))| (rid, rank))
         .collect();
     // rank 越小越相关；同分按行号，结果稳定。
@@ -373,12 +433,18 @@ fn and_terms(query: &str) -> Vec<&str> {
     out
 }
 
-/// 一家的会话文件上次读时的状态和解析版本。
-pub(crate) fn stamps(conn: &Connection, vendor: Vendor) -> io::Result<HashMap<PathBuf, Seen>> {
+/// 一家一个账号的会话文件上次读时的状态和解析版本。
+pub(crate) fn stamps(
+    conn: &Connection,
+    vendor: Vendor,
+    account: &str,
+) -> io::Result<HashMap<PathBuf, Seen>> {
     let mut st = conn
-        .prepare_cached("select path, mtime_ns, len, parser from files where vendor = ?1")
+        .prepare_cached(
+            "select path, mtime_ns, len, parser, session from files where vendor = ?1 and account = ?2",
+        )
         .map_err(sql_err)?;
-    st.query_map([vendor_key(vendor)], |r| {
+    st.query_map(params![vendor_key(vendor), account], |r| {
         Ok((
             PathBuf::from(r.get::<_, String>(0)?),
             Seen {
@@ -387,6 +453,7 @@ pub(crate) fn stamps(conn: &Connection, vendor: Vendor) -> io::Result<HashMap<Pa
                     len: r.get(2)?,
                 },
                 parser: r.get(3)?,
+                session: r.get(4)?,
             },
         ))
     })
@@ -395,16 +462,35 @@ pub(crate) fn stamps(conn: &Connection, vendor: Vendor) -> io::Result<HashMap<Pa
     .map_err(sql_err)
 }
 
-/// 一家现有对话的内容版本和解析版本：id → (key, parser)。
-pub(crate) fn keys(
+/// 缓存里一条对话上次写入的样子，见 [`known`]。
+pub(crate) struct Known {
+    /// 内容版本（[`content_key`]）。
+    pub key: String,
+    pub parser: u32,
+    /// 整条 `Session` 的 JSON（[`Tx::upsert`] 写的）。
+    pub data: String,
+}
+
+/// 一家一个账号现有的对话：id → 上次写入的内容版本、解析版本和元数据。
+pub(crate) fn known(
     conn: &Connection,
     vendor: Vendor,
-) -> io::Result<HashMap<String, (String, u32)>> {
+    account: &str,
+) -> io::Result<HashMap<String, Known>> {
     let mut st = conn
-        .prepare_cached("select id, key, parser from sessions where vendor = ?1")
+        .prepare_cached(
+            "select id, key, parser, data from sessions where vendor = ?1 and account = ?2",
+        )
         .map_err(sql_err)?;
-    st.query_map([vendor_key(vendor)], |r| {
-        Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+    st.query_map(params![vendor_key(vendor), account], |r| {
+        Ok((
+            r.get(0)?,
+            Known {
+                key: r.get(1)?,
+                parser: r.get(2)?,
+                data: r.get(3)?,
+            },
+        ))
     })
     .map_err(sql_err)?
     .collect::<Result<_, _>>()
@@ -423,19 +509,25 @@ impl<'c> Tx<'c> {
         self.0.commit().map_err(sql_err)
     }
 
-    /// 写入或更新一条对话（`parser` 版本读的）；行号不变，全文索引留着，内容版本变了由全文索引那一步重建。
-    /// 缓存里这条是更新的解析版本写的就不动。
-    pub(crate) fn upsert(&self, s: &Session, file: Option<&Path>, parser: u32) -> io::Result<()> {
-        let data = serde_json::to_string(s).map_err(io::Error::other)?;
+    /// 写入或更新一条对话（`parser` 版本读的，`revision` 是库里的正文修订号）；行号不变，全文索引留着，
+    /// 内容版本变了由全文索引那一步重建。缓存里这条是更新的解析版本写的就不动。
+    pub(crate) fn upsert(
+        &self,
+        s: &Session,
+        file: Option<&Path>,
+        parser: u32,
+        revision: Option<u64>,
+    ) -> io::Result<()> {
+        let data = session_data(s)?;
         let file = file.map(|f| f.to_string_lossy().into_owned());
         self.0
             .prepare_cached(
-                "insert into sessions(vendor, id, file, data, last_active_ms, key, parser)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "insert into sessions(vendor, id, file, data, last_active_ms, key, parser, account)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  on conflict(vendor, id) do update set
                    file = excluded.file, data = excluded.data,
                    last_active_ms = excluded.last_active_ms, key = excluded.key,
-                   parser = excluded.parser
+                   parser = excluded.parser, account = excluded.account
                  where sessions.parser <= excluded.parser",
             )
             .and_then(|mut st| {
@@ -445,8 +537,9 @@ impl<'c> Tx<'c> {
                     file,
                     data,
                     millis(s.last_active),
-                    content_key(s, parser),
-                    parser
+                    content_key(s, parser, revision),
+                    parser,
+                    s.account
                 ])
             })
             .map(drop)
@@ -468,12 +561,19 @@ impl<'c> Tx<'c> {
         )
     }
 
-    /// 删掉这一家里不在 `keep` 里、解析版本不超过 `upto` 的对话（整家重扫的来源用）。
-    pub(crate) fn retain(&self, vendor: Vendor, keep: &[&str], upto: u32) -> io::Result<usize> {
+    /// 删掉这一家这个账号里不在 `keep` 里、解析版本不超过 `upto` 的对话（整家重扫的来源用）。
+    pub(crate) fn retain(
+        &self,
+        vendor: Vendor,
+        account: &str,
+        keep: &[&str],
+        upto: u32,
+    ) -> io::Result<usize> {
         let keep = serde_json::to_string(keep).map_err(io::Error::other)?;
         self.delete_where(
-            "vendor = ?1 and id not in (select value from json_each(?2)) and parser <= ?3",
-            params![vendor_key(vendor), keep, upto],
+            "vendor = ?1 and account = ?4 and id not in (select value from json_each(?2)) \
+             and parser <= ?3",
+            params![vendor_key(vendor), keep, upto, account],
         )
     }
 
@@ -508,19 +608,22 @@ impl<'c> Tx<'c> {
         Ok(())
     }
 
-    /// 记下会话文件这次读时的状态（`parser` 版本读的）；缓存里是更新的版本记的就不动。
+    /// 记下会话文件这次读时的状态（`parser` 版本读的）和读出的对话 id；缓存里是更新的版本记的就不动。
     pub(crate) fn set_stamp(
         &self,
         vendor: Vendor,
+        account: &str,
         path: &Path,
-        st: Stamp,
+        (st, session): (Stamp, Option<&str>),
         parser: u32,
     ) -> io::Result<()> {
         self.0
             .prepare_cached(
-                "insert into files(path, vendor, mtime_ns, len, parser) values (?1, ?2, ?3, ?4, ?5)
+                "insert into files(path, vendor, mtime_ns, len, parser, account, session)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  on conflict(path) do update set vendor = excluded.vendor,
-                   mtime_ns = excluded.mtime_ns, len = excluded.len, parser = excluded.parser
+                   mtime_ns = excluded.mtime_ns, len = excluded.len, parser = excluded.parser,
+                   account = excluded.account, session = excluded.session
                  where files.parser <= excluded.parser",
             )
             .and_then(|mut s| {
@@ -529,7 +632,9 @@ impl<'c> Tx<'c> {
                     vendor_key(vendor),
                     st.mtime_ns,
                     st.len,
-                    parser
+                    parser,
+                    account,
+                    session
                 ])
             })
             .map(drop)
@@ -685,6 +790,7 @@ mod tests {
             last_active: UNIX_EPOCH,
             message_count: count,
             automatic: false,
+            account: String::new(),
         }
     }
 
@@ -713,8 +819,8 @@ mod tests {
         let mut other = session(1);
         other.id = SessionId::from("b");
         let tx = Tx::begin(&mut conn).unwrap();
-        tx.upsert(&session(1), None, 1).unwrap();
-        tx.upsert(&other, None, 1).unwrap();
+        tx.upsert(&session(1), None, 1, None).unwrap();
+        tx.upsert(&other, None, 1, None).unwrap();
         tx.commit().unwrap();
 
         // a：第 0 段 alpha，追加一段 bravo；b：只有 alpha。正文建好的也重新拿出来写。
@@ -744,15 +850,20 @@ mod tests {
         };
         let q = r#""alpha"* AND "bravo"*"#;
         assert_eq!(
-            search_body(&conn, Vendor::Claude, q, 10).unwrap(),
+            search_body(&conn, Some(Vendor::Claude), q, 10, |_| true).unwrap(),
             [rid("a")]
         );
-        let mut both = search_body(&conn, Vendor::Claude, r#""alpha"*"#, 10).unwrap();
+        let mut both =
+            search_body(&conn, Some(Vendor::Claude), r#""alpha"*"#, 10, |_| true).unwrap();
         both.sort();
         let mut want = vec![rid("a"), rid("b")];
         want.sort();
         assert_eq!(both, want);
-        assert!(search_body(&conn, Vendor::Pi, q, 10).unwrap().is_empty());
+        assert!(
+            search_body(&conn, Some(Vendor::Pi), q, 10, |_| true)
+                .unwrap()
+                .is_empty()
+        );
         drop(conn);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -768,27 +879,30 @@ mod tests {
         let stamp = |len| Stamp { mtime_ns: 1, len };
 
         let tx = Tx::begin(&mut conn).unwrap();
-        tx.upsert(&session(5), Some(file), 3).unwrap();
-        tx.set_stamp(Vendor::Claude, file, stamp(50), 3).unwrap();
+        tx.upsert(&session(5), Some(file), 3, None).unwrap();
+        tx.set_stamp(Vendor::Claude, "", file, (stamp(50), None), 3)
+            .unwrap();
         tx.commit().unwrap();
 
         let tx = Tx::begin(&mut conn).unwrap();
         assert_eq!(tx.remove_file_sessions(file, None, 2).unwrap(), 0);
-        assert_eq!(tx.retain(Vendor::Claude, &[], 2).unwrap(), 0);
-        tx.upsert(&session(1), Some(file), 2).unwrap();
-        tx.set_stamp(Vendor::Claude, file, stamp(10), 2).unwrap();
+        assert_eq!(tx.retain(Vendor::Claude, "", &[], 2).unwrap(), 0);
+        tx.upsert(&session(1), Some(file), 2, None).unwrap();
+        tx.set_stamp(Vendor::Claude, "", file, (stamp(10), None), 2)
+            .unwrap();
         tx.commit().unwrap();
 
         let kept = rows(&conn, Vendor::Claude).unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].session.message_count, 5);
-        let seen = stamps(&conn, Vendor::Claude).unwrap()[file];
+        let seen = stamps(&conn, Vendor::Claude, "").unwrap()[file].clone();
         assert_eq!((seen.stamp, seen.parser), (stamp(50), 3));
 
         // 同版本、更新的版本照常覆盖。
         let tx = Tx::begin(&mut conn).unwrap();
-        tx.upsert(&session(7), Some(file), 3).unwrap();
-        tx.set_stamp(Vendor::Claude, file, stamp(70), 4).unwrap();
+        tx.upsert(&session(7), Some(file), 3, None).unwrap();
+        tx.set_stamp(Vendor::Claude, "", file, (stamp(70), None), 4)
+            .unwrap();
         tx.commit().unwrap();
         assert_eq!(
             rows(&conn, Vendor::Claude).unwrap()[0]
@@ -796,7 +910,7 @@ mod tests {
                 .message_count,
             7
         );
-        assert_eq!(stamps(&conn, Vendor::Claude).unwrap()[file].parser, 4);
+        assert_eq!(stamps(&conn, Vendor::Claude, "").unwrap()[file].parser, 4);
         drop(conn);
         let _ = fs::remove_dir_all(&dir);
     }

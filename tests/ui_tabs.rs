@@ -36,7 +36,7 @@ fn missing_vendor_is_hidden_and_skipped() {
     app.set_entries(Vendor::Kimi, Vec::new());
     app.set_entries(Vendor::Gemini, Vec::new());
     app.set_entries(Vendor::OpenCode, Vec::new());
-    app.set_entries(Vendor::Qwen, Vec::new());
+    app.set_entries(Vendor::Antigravity, Vec::new());
     app.hide_missing(|v| {
         !matches!(
             v,
@@ -45,7 +45,7 @@ fn missing_vendor_is_hidden_and_skipped() {
                 | Vendor::Kimi
                 | Vendor::Gemini
                 | Vendor::OpenCode
-                | Vendor::Qwen
+                | Vendor::Antigravity
         )
     });
     assert_eq!(app.shown, vec![Vendor::Claude, Vendor::Codex]);

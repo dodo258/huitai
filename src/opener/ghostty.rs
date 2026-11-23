@@ -3,10 +3,10 @@
 //! 值一律经 `on run argv` 传进脚本，不拼进脚本文本，项目路径、标题里有引号也不会出事。
 
 use std::io;
-use std::path::Path;
 
-use super::exec;
+use super::CLI_TIMEOUT;
 use super::{Opened, Opener, TabHandle};
+use crate::core::exec;
 use crate::sources::Command;
 
 const OSASCRIPT: &str = "/usr/bin/osascript";
@@ -79,8 +79,7 @@ impl GhosttyOpener {
 }
 
 fn osascript(args: &[String]) -> io::Result<String> {
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    exec::run(Path::new(OSASCRIPT), &args, exec::TIMEOUT)
+    exec::run(OSASCRIPT, args, None, CLI_TIMEOUT)
         .map_err(|e| io::Error::new(e.kind(), format!("Ghostty AppleScript 失败: {e}")))
 }
 

@@ -4,19 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>会话台 ai · 终端里的 AI 对话台</title>
-<meta name="description" content="在终端里敲 ai，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。macOS，MIT 开源。">
+<meta name="description" content="在终端里敲 ai，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Antigravity 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。macOS，MIT 开源。">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#1d1e23" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#e9e9e6" media="(prefers-color-scheme: light)">
 <meta property="og:type" content="website">
 <meta property="og:title" content="会话台 ai">
-<meta property="og:description" content="在终端里敲 ai，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。">
-<meta property="og:image" content="https://huitai.agentq.cc/img/board-dark.png?v=79ec7763">
+<meta property="og:description" content="在终端里敲 ai，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Antigravity 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。">
+<meta property="og:image" content="https://huitai.agentq.cc/img/board-dark.png?v=28b16c68">
 <meta property="og:locale" content="zh_CN">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="alternate" hreflang="en" href="en/index.html">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23d97757'/%3E%3Ctext x='16' y='23.5' font-size='21' font-weight='700' text-anchor='middle' fill='%231d1e23' font-family='PingFang SC,sans-serif'%3E%E4%BC%9A%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=bbe2c063">
+<link rel="stylesheet" href="style.css?v=0343660a">
 </head>
 <body>
 
@@ -36,25 +36,25 @@
 		<div class="wrap">
 			<h1><span class="stamp">会话台</span><code>ai</code></h1>
 			<p class="tag">终端里敲 <code>ai</code>，各家 AI 的对话按项目列出来。<br>回车接着聊，关掉窗口照样在后台跑。</p>
-			<p class="lead">本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 装了哪家就列哪家。它是装在终端里的命令行工具，不是终端，也不用 tmux：你照样用自己的 Ghostty、Kaku 或别的终端。</p>
+			<p class="lead">本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Antigravity 装了哪家就列哪家。它是装在终端里的命令行工具，不是终端，也不用 tmux：你照样用自己的 Ghostty、Kaku 或别的终端。</p>
 			<div class="cmd">
 				<code>curl -fsSL https://github.com/dodo258/huitai/releases/latest/download/install.sh | sh</code>
 				<button class="copy" type="button" data-done="已复制">复制</button>
 			</div>
-			<p class="note">按芯片下载预编译的 <code>ai</code>，SHA256 对上才放进 <code>~/.local/bin</code>，不用 sudo。只支持 macOS。<a href="https://github.com/dodo258/huitai">GitHub 上看源码</a></p>
+			<p class="note">按芯片下载预编译的 <code>ai</code>，SHA256 对上才放进 <code>~/.local/bin</code>，不用 sudo。只支持 macOS；回车在新标签页打开要 Ghostty 1.3 以上或 Kaku，别的终端在当前窗口打开。<a href="https://github.com/dodo258/huitai">GitHub 上看源码</a></p>
 		</div>
 	</section>
 
 	<section class="shot">
 		<div class="wrap">
-			<a href="img/board-dark.png?v=79ec7763" aria-label="看原尺寸截图">
+			<a href="img/board-dark.png?v=28b16c68" aria-label="看原尺寸截图">
 				<picture>
-					<source media="(prefers-color-scheme: light)" srcset="img/board-light.png?v=a82c482d">
-					<img src="img/board-dark.png?v=79ec7763" width="2376" height="1360" alt="会话台：左边按项目列出对话，表头写着状态、后台、对话、最近；右边是选中对话此刻的画面">
+					<source media="(prefers-color-scheme: light)" srcset="img/board-light.png?v=ab7d0923">
+					<img src="img/board-dark.png?v=28b16c68" width="2592" height="720" alt="会话台：顶栏是八家的标签（Claude、Codex、pi、Hermes、Kimi Code、Gemini、OpenCode、Antigravity）；左边按项目列出 Gemini CLI 的对话，默认账号和工作号混在一起、标着账号名，有在跑、等你回复、刚做完；右边是在跑那条此刻的画面">
 				</picture>
 			</a>
 			<ul class="legend">
-				<li>截图用的是假数据。</li>
+				<li>截图用的是假数据<span class="swipe">，可以左右滑动看</span>。</li>
 				<li><b class="running">◐</b>在跑</li>
 				<li><b class="waiting">◆</b>等你回复</li>
 				<li><b class="done">✓</b>刚做完</li>
@@ -187,7 +187,7 @@
 
 <footer class="foot">
 	<div class="wrap">
-		<span>v0.1.3</span>
+		<span>v0.1.4</span>
 		<a href="https://github.com/dodo258/huitai/blob/main/LICENSE">MIT 许可</a>
 		<a href="https://github.com/dodo258/huitai">GitHub</a>
 		<a href="https://github.com/dodo258/huitai/issues">提问题</a>

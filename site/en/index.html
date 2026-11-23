@@ -4,19 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>huitai · ai — your AI conversations, in the terminal</title>
-<meta name="description" content="Type ai in your terminal to see every Claude Code, Codex and pi conversation on this Mac, grouped by project. Press Enter to pick one back up; close the window and it keeps running. macOS, MIT licensed.">
+<meta name="description" content="Type ai in your terminal to see every Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Antigravity conversation on this Mac, grouped by project. Press Enter to pick one back up; close the window and it keeps running. macOS, MIT licensed.">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#1d1e23" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#e9e9e6" media="(prefers-color-scheme: light)">
 <meta property="og:type" content="website">
 <meta property="og:title" content="huitai · ai">
-<meta property="og:description" content="Type ai in your terminal to see every Claude Code, Codex and pi conversation on this Mac, grouped by project. Press Enter to pick one back up; close the window and it keeps running.">
-<meta property="og:image" content="https://huitai.agentq.cc/img/board-dark.png?v=79ec7763">
+<meta property="og:description" content="Type ai in your terminal to see every Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Antigravity conversation on this Mac, grouped by project. Press Enter to pick one back up; close the window and it keeps running.">
+<meta property="og:image" content="https://huitai.agentq.cc/img/board-dark.png?v=28b16c68">
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="alternate" hreflang="zh-CN" href="../index.html">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23d97757'/%3E%3Ctext x='16' y='23.5' font-size='21' font-weight='700' text-anchor='middle' fill='%231d1e23' font-family='PingFang SC,sans-serif'%3E%E4%BC%9A%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="../style.css?v=bbe2c063">
+<link rel="stylesheet" href="../style.css?v=0343660a">
 </head>
 <body>
 
@@ -35,26 +35,26 @@
 	<section class="hero">
 		<div class="wrap">
 			<h1><span class="stamp" lang="zh-CN" title="huitai">会话台</span><code>ai</code></h1>
-			<p class="tag">Type <code>ai</code> to see every AI conversation on this Mac, grouped by project.<br>Enter picks one back up. Close the window and it keeps running.</p>
-			<p class="lead">Lists whichever of Claude Code, Codex and pi you have installed. huitai is a command-line tool that lives in your terminal. It is not a terminal and it does not use tmux: you keep Ghostty, Kaku or whatever you already use. The interface is in Simplified Chinese.</p>
+			<p class="tag">Type <code>ai</code> to see every AI conversation on this Mac, grouped by project. <br>Enter picks one back up. Close the window and it keeps running.</p>
+			<p class="lead">Lists whichever of Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Antigravity you have installed. huitai is a command-line tool that lives in your terminal. It is not a terminal and it does not use tmux: you keep Ghostty, Kaku or whatever you already use. The interface is in Simplified Chinese.</p>
 			<div class="cmd">
 				<code>curl -fsSL https://github.com/dodo258/huitai/releases/latest/download/install.sh | sh</code>
 				<button class="copy" type="button" data-done="Copied">Copy</button>
 			</div>
-			<p class="note">Downloads the prebuilt <code>ai</code> for your chip, checks its SHA256 and puts it in <code>~/.local/bin</code>. No sudo. macOS only. <a href="https://github.com/dodo258/huitai">Source on GitHub</a></p>
+			<p class="note">Downloads the prebuilt <code>ai</code> for your chip, checks its SHA256 and puts it in <code>~/.local/bin</code>. No sudo. macOS only. Opening in a new tab needs Ghostty 1.3+ or Kaku; other terminals open it in the current window. <a href="https://github.com/dodo258/huitai">Source on GitHub</a></p>
 		</div>
 	</section>
 
 	<section class="shot">
 		<div class="wrap">
-			<a href="../img/board-dark.png?v=79ec7763" aria-label="Full-size screenshot">
+			<a href="../img/board-dark.png?v=28b16c68" aria-label="Full-size screenshot">
 				<picture>
-					<source media="(prefers-color-scheme: light)" srcset="../img/board-light.png?v=a82c482d">
-					<img src="../img/board-dark.png?v=79ec7763" width="2376" height="1360" alt="huitai: conversations grouped by project on the left with status, background, count and last-active columns; the selected conversation's live screen on the right">
+					<source media="(prefers-color-scheme: light)" srcset="../img/board-light.png?v=ab7d0923">
+					<img src="../img/board-dark.png?v=28b16c68" width="2592" height="720" alt="huitai: tabs for all eight tools across the top (Claude, Codex, pi, Hermes, Kimi Code, Gemini, OpenCode, Antigravity); Gemini CLI conversations grouped by project on the left, two accounts mixed together and labelled by account name, some running, waiting for you or just done; the running one's live screen on the right">
 				</picture>
 			</a>
 			<ul class="legend">
-				<li>Screenshots use made-up data.</li>
+				<li>Screenshots use made-up data<span class="swipe">; swipe sideways to see all of it</span>.</li>
 				<li><b class="running">◐</b>running</li>
 				<li><b class="waiting">◆</b>waiting for you</li>
 				<li><b class="done">✓</b>just finished</li>
@@ -70,7 +70,7 @@
 			<dl class="rows">
 				<div>
 					<dt>Find</dt>
-					<dd>Conversations from all three tools in one place, grouped by project, newest first, with search over titles and message text. Type <code>ai</code> inside a project directory and that project opens expanded.</dd>
+					<dd>Conversations from every tool in one place, grouped by project, newest first, with search over titles and message text. Type <code>ai</code> inside a project directory and that project opens expanded.</dd>
 					<dd class="keys"><span><kbd>Tab</kbd> switch tool</span><span><kbd>/</kbd> search</span></dd>
 				</div>
 				<div>
@@ -110,7 +110,7 @@
 			<dl class="rows">
 				<div>
 					<dt>Read-only</dt>
-					<dd>Reads the three tools' session files on this Mac and never changes their configuration (<code>~/.claude/settings.json</code>, <code>~/.codex/config.toml</code>, <code>~/.pi/agent/</code>). The only thing that moves their files is delete, which goes to huitai's trash and can be undone.</dd>
+					<dd>Reads each tool's session files on this Mac and never changes their configuration (<code>~/.claude/settings.json</code>, <code>~/.codex/config.toml</code>, <code>~/.pi/agent/</code>). The only thing that moves their files is delete, which goes to huitai's trash and can be undone.</dd>
 				</div>
 				<div>
 					<dt>Nothing uploaded</dt>
@@ -158,7 +158,7 @@
 			<div class="compare">
 				<div class="head"><span></span><span>huitai</span><span>Rex</span></div>
 				<div><span class="k">What it is</span><p data-who="huitai">One command, <code>ai</code>, inside the terminal you already use</p><p data-who="Rex">A standalone terminal app that replaces your current one</p></div>
-				<div><span class="k">Which conversations</span><p data-who="huitai">Every past Claude Code, Codex and pi conversation on this Mac, grouped by project, searchable, resumed with Enter</p><p data-who="Rex">Sessions opened in Rex; shows which Claude Code, Codex, OpenCode or pi session is working or waiting</p></div>
+				<div><span class="k">Which conversations</span><p data-who="huitai">Every past Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Antigravity (<code>agy</code> and the Antigravity app) conversation on this Mac, grouped by project, searchable, resumed with Enter</p><p data-who="Rex">Sessions opened in Rex; shows which Claude Code, Codex, OpenCode or pi session is working or waiting</p></div>
 				<div><span class="k">Quota</span><p data-who="huitai">Claude and Codex limit windows and pi's tokens today in the top bar</p><p data-who="Rex" class="none">Not mentioned in the official material</p></div>
 				<div><span class="k">Several machines</span><p data-who="huitai">This Mac only</p><p data-who="Rex">Its strength: connect to Rex servers on other machines; iOS and other clients are on the way</p></div>
 				<div><span class="k">Getting it</span><p data-who="huitai">One-line install, MIT licensed</p><p data-who="Rex">Join the mailing list and wait for an invite; free, no account</p></div>

@@ -122,7 +122,7 @@ fn chinese_text_opens_search_with_it() {
     assert_eq!(
         effects,
         vec![Effect::Search {
-            vendor: Vendor::Claude,
+            vendor: Some(Vendor::Claude),
             query: "结".to_owned()
         }]
     );
@@ -132,7 +132,7 @@ fn chinese_text_opens_search_with_it() {
     assert_eq!(
         effects,
         vec![Effect::Search {
-            vendor: Vendor::Claude,
+            vendor: Some(Vendor::Claude),
             query: "结算".to_owned()
         }]
     );
@@ -350,7 +350,12 @@ fn right_click_on_project_header_lists_project_actions() {
 #[test]
 fn right_click_on_running_conversation_offers_kill() {
     let mut app = demo_app(Vendor::Claude);
-    let y = line_of(&mut app, "◐ 购物车结算按钮");
+    // 列表里那一行：标题加右边状态列的转圈（预览区也有这个标题，但不带转圈）。
+    let screen = dump(&render(&mut app, W, H));
+    let y = screen
+        .lines()
+        .position(|l| l.contains("购物车结算按钮") && l.contains('◐'))
+        .unwrap_or_else(|| panic!("{screen}")) as u16;
     right_click(&mut app, 8, y);
     assert!(matches!(
         app.overlay,

@@ -1,5 +1,7 @@
 //! 输出扫描：PTY 输出原样放行，只改写 OSC 0/1/2 标题（加前缀），并认出 BEL、OSC 9、OSC 777 通知、
 //! OSC 7501 程序状态（Hermes、OpenCode v2 发）和 Gemini CLI 的「✋ Action Required」等待标题。
+//! OSC 7501 只看根记录（不带 `id` 的报告）：带 `id` 的是 CLI 里某个子任务（OpenCode 2.x 每个标签页一条），
+//! 不代表整个进程，见 [`Scanner::cli_blocked`]。
 //!
 //! 流式处理：序列被拆在两次读里也能认。只有标题序列在结束前会被暂扣（上限 [`MAX_HELD`] 字节，
 //! 超了就原样放出、不再改写），其余字节一律立即原样输出。
@@ -28,8 +30,9 @@ pub enum Signal {
     Status(Status),
 }
 
-/// OSC 7501 里会话台关心的状态（`idle`、`clear` 和不认识的不报）。
+/// OSC 7501 根记录里会话台关心的状态（`idle`、`clear` 和不认识的不报）。
 /// 格式：`ESC ] 7501 ; key=value:key=value… ST`，`state` 必有，例 `state=blocked:kind=permission:app=hermes`。
+/// 规范：<https://www.superlogical.com/rex/docs/build/program-status>（没有 `id` 的报告写根记录，键重复取最后一个）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     /// 在跑。
@@ -72,7 +75,7 @@ enum State {
         ps: Option<u32>,
         note: Vec<u8>,
     },
-    /// DCS/APC/PM/SOS：原样放行到 ST，里面的 BEL 不算响铃。
+    /// DCS/APC/PM/SOS：原样放行到 ST，里面的 BEL 不算响铃、`ESC ESC` 不算 ESC（tmux 透传）。
     StringSeq,
     StringSeqEsc,
 }
@@ -83,6 +86,10 @@ pub struct Scanner {
     held: Vec<u8>,
     /// 上一次 CLI 设的标题是 Gemini 的等待标题：同一个标题重发不再报。
     title_waiting: bool,
+    /// OSC 7501 根记录现在的状态；`idle`、`clear` 或还没报过是 `None`。
+    program: Option<Status>,
+    /// 已经放出去的字节停在哪儿，决定能不能在这里插一条标题序列。
+    tail: Tail,
 }
 
 impl Scanner {
@@ -93,14 +100,38 @@ impl Scanner {
             state: State::Ground,
             held: Vec::new(),
             title_waiting: false,
+            program: None,
+            tail: Tail::default(),
         }
+    }
+
+    /// 换前缀（标签页标题的状态变了）。之后 CLI 设的标题用新前缀；暂扣着、还没结束的标题也用新的。
+    pub fn set_prefix(&mut self, prefix: &str) {
+        self.prefix = prefix.as_bytes().to_vec();
     }
 
     /// 处理一段输出：改写后的字节追加到 `out`，认出的信号追加到 `signals`。
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>, signals: &mut Vec<Signal>) {
+        let start = out.len();
         for &b in input {
             self.byte(b, out, signals);
         }
+        for &b in &out[start..] {
+            self.tail.push(b);
+        }
+    }
+
+    /// 已经放出去的字节停在一个完整的地方（不在转义序列、字符串序列或一个 UTF-8 字符的中间）：
+    /// 这时在输出里插一条完整的标题序列，不会打断 CLI 的任何字节。暂扣着的字节还没放出去，不影响。
+    pub fn at_boundary(&self) -> bool {
+        self.tail.clean()
+    }
+
+    /// CLI 用 OSC 7501 根记录说它在等你（blocked），还没改口（working/done/error/idle/clear）。
+    /// 这期间的输出不算在跑：OpenCode 2.x 一个标签页等确认时，别的标签页开工会一直重画（标签页上的扫光
+    /// 每秒 20 帧），根记录照样是 blocked。
+    pub fn cli_blocked(&self) -> bool {
+        self.program == Some(Status::Blocked)
     }
 
     fn byte(&mut self, b: u8, out: &mut Vec<u8>, signals: &mut Vec<Signal>) {
@@ -193,7 +224,7 @@ impl Scanner {
             State::OscOtherEsc { ps, note } => match b {
                 b'\\' => {
                     out.push(b);
-                    finish_note(ps, &note, signals);
+                    self.finish_note(ps, &note, signals);
                     State::Ground
                 }
                 // 又一个 ESC：先不放，交给 `Esc` 状态和后面的字节一起放（它会补上这个 ESC）。
@@ -213,11 +244,11 @@ impl Scanner {
                     State::StringSeq
                 }
             }
+            // `ESC ESC` 是透传里转义过的一个 ESC（tmux 的规则），后面的 `\` 不算 ST，里面的标题也不改写。
             State::StringSeqEsc => {
                 out.push(b);
                 match b {
                     b'\\' => State::Ground,
-                    ESC => State::StringSeqEsc,
                     _ => State::StringSeq,
                 }
             }
@@ -254,7 +285,7 @@ impl Scanner {
             }
             BEL => {
                 out.push(b);
-                finish_note(ps, &note, signals);
+                self.finish_note(ps, &note, signals);
                 State::Ground
             }
             CAN | SUB => {
@@ -268,6 +299,39 @@ impl Scanner {
                 }
                 State::OscOther { ps, note }
             }
+        }
+    }
+
+    fn finish_note(&mut self, ps: Option<u32>, note: &[u8], signals: &mut Vec<Signal>) {
+        let text = String::from_utf8_lossy(note);
+        match ps {
+            // OSC 9;<数字>;… 是 ConEmu 的进度条等子命令，不是通知。
+            Some(9) if !is_conemu_subcommand(&text) => signals.push(Signal::Notify {
+                title: None,
+                body: text.into_owned(),
+            }),
+            Some(777) => {
+                let mut parts = text.splitn(3, ';');
+                if parts.next() == Some("notify") {
+                    let title = parts.next().map(str::to_owned).filter(|t| !t.is_empty());
+                    let body = parts.next().unwrap_or_default().to_owned();
+                    signals.push(Signal::Notify { title, body });
+                }
+            }
+            Some(7501) => {
+                let (Some(state), true) = parse_report(&text) else {
+                    return;
+                };
+                match (state, status_of(state)) {
+                    (_, Some(status)) => {
+                        self.program = Some(status);
+                        signals.push(Signal::Status(status));
+                    }
+                    ("idle" | "clear", None) => self.program = None,
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -294,40 +358,124 @@ impl Scanner {
     }
 }
 
+/// 跟着放出去的字节走的极简终端解析：只为知道停在哪儿，不认具体序列。
+#[derive(Debug, Default)]
+struct Tail {
+    state: TailState,
+    /// 当前 UTF-8 字符还差几个续字节。
+    utf8_left: u8,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TailState {
+    #[default]
+    Ground,
+    Esc,
+    /// `ESC` 加中间字节（如 `ESC ( B`），等结束字节。
+    EscInter,
+    /// `ESC [` 之后，等结束字节（0x40–0x7E）。
+    Csi,
+    /// OSC 的正文，到 BEL 或 ST。
+    Osc,
+    OscEsc,
+    /// DCS/APC/PM/SOS 的正文，只到 ST：里面的 BEL 是数据（tmux 透传 `ESC P tmux; ESC ESC ] … BEL ESC \`
+    /// 里内层 OSC 的 BEL 之后外层还没完）。
+    Dcs,
+    DcsEsc,
+}
+
+impl Tail {
+    fn clean(&self) -> bool {
+        self.state == TailState::Ground && self.utf8_left == 0
+    }
+
+    fn push(&mut self, b: u8) {
+        use TailState::*;
+        if matches!(b, CAN | SUB) {
+            self.state = Ground;
+            self.utf8_left = 0;
+            return;
+        }
+        self.state = match self.state {
+            Ground => {
+                if b == ESC {
+                    self.utf8_left = 0;
+                    Esc
+                } else {
+                    self.utf8_left = match b {
+                        0x80..=0xbf => self.utf8_left.saturating_sub(1),
+                        0xc0..=0xdf => 1,
+                        0xe0..=0xef => 2,
+                        0xf0..=0xf7 => 3,
+                        _ => 0,
+                    };
+                    Ground
+                }
+            }
+            Esc => match b {
+                b'[' => Csi,
+                b']' => Osc,
+                b'P' | b'_' | b'^' | b'X' => Dcs,
+                ESC => Esc,
+                0x20..=0x2f => EscInter,
+                _ => Ground,
+            },
+            EscInter => match b {
+                0x20..=0x2f => EscInter,
+                ESC => Esc,
+                _ => Ground,
+            },
+            Csi => match b {
+                0x40..=0x7e => Ground,
+                ESC => Esc,
+                _ => Csi,
+            },
+            Osc => match b {
+                BEL => Ground,
+                ESC => OscEsc,
+                _ => Osc,
+            },
+            OscEsc => match b {
+                b'\\' => Ground,
+                ESC => OscEsc,
+                _ => Osc,
+            },
+            Dcs => match b {
+                ESC => DcsEsc,
+                _ => Dcs,
+            },
+            // `ESC ESC` 是透传里转义过的一个 ESC（tmux 的规则），后面的 `\` 不算 ST。
+            DcsEsc => match b {
+                b'\\' => Ground,
+                _ => Dcs,
+            },
+        };
+    }
+}
+
 fn parse_ps(digits: &[u8]) -> Option<u32> {
     std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
-fn finish_note(ps: Option<u32>, note: &[u8], signals: &mut Vec<Signal>) {
-    let text = String::from_utf8_lossy(note);
-    match ps {
-        // OSC 9;<数字>;… 是 ConEmu 的进度条等子命令，不是通知。
-        Some(9) if !is_conemu_subcommand(&text) => signals.push(Signal::Notify {
-            title: None,
-            body: text.into_owned(),
-        }),
-        Some(777) => {
-            let mut parts = text.splitn(3, ';');
-            if parts.next() == Some("notify") {
-                let title = parts.next().map(str::to_owned).filter(|t| !t.is_empty());
-                let body = parts.next().unwrap_or_default().to_owned();
-                signals.push(Signal::Notify { title, body });
-            }
+/// OSC 7501 一条报告：`state`（没有是 `None`）和是不是写根记录（没有 `id` 键）。查询（`?`）没有 `state`。
+/// 键值两边的空白去掉，没有 `=` 或键为空的跳过，键重复取最后一个（规范「Syntax」节）。
+fn parse_report(text: &str) -> (Option<&str>, bool) {
+    let mut state = None;
+    let mut root = true;
+    for pair in text.split(':') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "state" => state = Some(value.trim()),
+            "id" => root = false,
+            _ => {}
         }
-        Some(7501) => {
-            if let Some(status) = parse_status(&text) {
-                signals.push(Signal::Status(status));
-            }
-        }
-        _ => {}
     }
+    (state, root)
 }
 
-/// OSC 7501 正文里的 `state=`。查询（`?` 开头）和其余状态不算。
-fn parse_status(text: &str) -> Option<Status> {
-    let state = text
-        .split(':')
-        .find_map(|pair| pair.strip_prefix("state="))?;
+fn status_of(state: &str) -> Option<Status> {
     match state {
         "working" => Some(Status::Working),
         "blocked" => Some(Status::Blocked),
@@ -527,6 +675,69 @@ mod tests {
         assert_eq!(scan(input), (input.to_vec(), vec![]));
     }
 
+    /// OpenCode 2.x（program-status.ts）：A 等确认时根记录是 blocked（只有它一个时就是 A 的那条，不带 id）；
+    /// 三秒后 B 开工，根记录没变不重发，只发一条带 B 的 id 的 working。子记录不能盖掉根记录。
+    #[test]
+    fn osc7501_child_records_do_not_override_the_root() {
+        let mut s = Scanner::new(PREFIX);
+        let (mut out, mut sig) = (Vec::new(), Vec::new());
+        s.feed(
+            b"\x1b]7501;state=blocked:kind=permission:app=opencode:title=QQ\x1b\\\x1b]7501;state=blocked:kind=permission:id=ses_a:app=opencode\x1b\\",
+            &mut out,
+            &mut sig,
+        );
+        assert_eq!(sig, vec![Signal::Status(Status::Blocked)], "只报根记录");
+        assert!(s.cli_blocked());
+        let child = b"\x1b]7501;state=working:id=ses_b:app=opencode:title=Qg\x1b\\";
+        let (mut out, mut sig) = (Vec::new(), Vec::new());
+        s.feed(child, &mut out, &mut sig);
+        assert_eq!(out, child.to_vec(), "原样放行");
+        assert_eq!(sig, vec![], "子记录的 working 不报");
+        assert!(s.cli_blocked(), "根记录还是 blocked");
+        // A 答完：根记录改成 working（B 还在跑，working 只剩一条时也不带 id）。
+        s.feed(
+            b"\x1b]7501;state=working:app=opencode\x07",
+            &mut out,
+            &mut sig,
+        );
+        assert_eq!(sig, vec![Signal::Status(Status::Working)]);
+        assert!(!s.cli_blocked());
+    }
+
+    #[test]
+    fn osc7501_idle_and_clear_end_blocked_and_last_key_wins() {
+        let mut s = Scanner::new(PREFIX);
+        let (mut out, mut sig) = (Vec::new(), Vec::new());
+        for (input, blocked) in [
+            (&b"\x1b]7501;state=blocked\x07"[..], true),
+            (b"\x1b]7501;state=idle:app=hermes\x07", false),
+            (b"\x1b]7501; state = blocked \x07", true),
+            (b"\x1b]7501;state=clear\x07", false),
+            (b"\x1b]7501;state=blocked:state=done\x07", false),
+            (b"\x1b]7501;state=blocked\x07", true),
+            // 不认识的状态、`id=` 为空（不合语法，规范说整条忽略）都不改根记录。
+            (b"\x1b]7501;state=paused\x07", true),
+            (b"\x1b]7501;state=idle:id=\x07", true),
+        ] {
+            s.feed(input, &mut out, &mut sig);
+            assert_eq!(
+                s.cli_blocked(),
+                blocked,
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        assert_eq!(
+            sig,
+            vec![
+                Signal::Status(Status::Blocked),
+                Signal::Status(Status::Blocked),
+                Signal::Status(Status::Done),
+                Signal::Status(Status::Blocked),
+            ]
+        );
+    }
+
     #[test]
     fn gemini_action_required_title_means_waiting_once() {
         let input = "\x1b]0;✦  Working… (demo)\x07\x1b]0;✋  Action Required (demo)\x07\x1b]0;✋  Action Required (demo)\x07\x1b]0;◇  Ready (demo)\x07\x1b]2;✋ Action Required\x1b\\";
@@ -562,5 +773,36 @@ mod tests {
             sig,
             vec![Signal::Title("fix Action Required banner".into())]
         );
+    }
+
+    #[test]
+    fn boundary_is_only_where_the_emitted_bytes_are_whole() {
+        // 每一段喂完后，已放出的字节是不是停在完整的地方。
+        let steps: [(&[u8], bool); 12] = [
+            (b"plain", true),
+            (b"\x1b[3", false),
+            (b"1m", true),
+            (b"\xe4\xb8", false),
+            (b"\xad", true),
+            (b"\x1b(", false),
+            (b"B", true),
+            (b"\x1b]8;;http://x", false),
+            (b"\x07", true),
+            (b"\x1bPq#0", false),
+            (b"\x1b\\", true),
+            // 标题序列整段暂扣、还没放出去：放出去的停在它前面，是完整的。
+            (b"\x1b]2;half", true),
+        ];
+        let mut s = Scanner::new("P ");
+        for (input, whole) in steps {
+            let (mut out, mut sig) = (Vec::new(), Vec::new());
+            s.feed(input, &mut out, &mut sig);
+            assert_eq!(s.at_boundary(), whole, "喂完 {input:?}");
+        }
+        s.set_prefix("Q ");
+        let (mut out, mut sig) = (Vec::new(), Vec::new());
+        s.feed(b"\x07", &mut out, &mut sig);
+        assert_eq!(out, b"\x1b]2;Q half\x07", "暂扣着的标题用新前缀");
+        assert!(s.at_boundary());
     }
 }

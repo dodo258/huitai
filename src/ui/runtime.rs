@@ -2,11 +2,11 @@
 //! 把 [`Effect`] 落到 index / opener / host / quota / sources 的接口上。
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
-use std::ffi::CStr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{CStr, OsStr};
 use std::io::{self, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, Stdio};
+use std::process::Command as Process;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -24,25 +25,39 @@ use ratatui::crossterm::terminal::{
     supports_keyboard_enhancement,
 };
 
-use crate::core::{Config, QuotaReading, Session, SessionId, SessionState, Vendor, VendorDirs};
+use crate::core::{Account, Config, QuotaReading, Session, SessionId, SessionState, Vendor, exec};
+use crate::export;
 use crate::host::client::BoardItem;
 use crate::host::{
     self, BoardInfo, HostEvent, HostedInfo, Request, Response, RunRecord, ScreenSnapshot, Snapshot,
     SpawnSpec,
 };
 use crate::ime::{Switcher, Tis};
-use crate::index::{self, Entry, Index, Update};
+use crate::index::{self, Entry, Index, Snippet, Update};
 use crate::notify::{self, Activity, Desktop, Message, Notifier, OscKind, SystemNotifier};
 use crate::opener::{
     self, InlineOpener, KakuOpener, LoginItem, Opener, Outcome, Tabs, Terminal as Term,
 };
 use crate::quota;
-use crate::sources::{self, Command, Source, Transcript, Trash, hermes, kimi, opencode};
+use crate::sources::{self, Command, Delivery, Moment, Source, Transcript, Trash};
 
 use super::app::{App, Effect, Preview};
-use super::text::{project_label, resume_line, truncate};
+use super::claims::{
+    Bound, Claims, Hosted, NewSession, TEMP_PREFIX, hosted_alias, is_new_since, load_claims,
+    native_hosted, native_owners, save_claims, temp_started, time_pairs,
+};
+use super::text::{project_label, resume_line, tilde, truncate};
 use super::theme::Theme;
 use super::view;
+
+mod jobs;
+mod workers;
+
+use jobs::{Job, job_worker};
+use workers::{
+    balance_worker, forward, host_watcher, live_worker, moment_worker, preview_worker,
+    procs_worker, quota_worker, seen_worker, snippet_worker, system_alert, transcript_worker,
+};
 
 /// 预览读几条消息。
 const PREVIEW_MESSAGES: usize = 8;
@@ -50,6 +65,8 @@ const PREVIEW_MESSAGES: usize = 8;
 const SEARCH_LIMIT: usize = 300;
 /// 当前那家额度多久重读一次。
 const QUOTA_EVERY: Duration = Duration::from_secs(60);
+/// 余额多久读一次（和每把密钥的缓存时长一样，见 `quota/rules.json` 的 `balance.cache_minutes`）。
+const BALANCE_EVERY: Duration = Duration::from_secs(5 * 60);
 /// 多久看一次本机进程（认出桌面端、别的终端开着的对话）。
 const PROCS_EVERY: Duration = Duration::from_secs(5);
 /// 守护进程没在跑时多久再试着连一次。
@@ -60,10 +77,10 @@ const HOSTED_POLL: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(120);
 /// 相对时间多久刷新一次。
 const CLOCK: Duration = Duration::from_secs(30);
-/// 新建时定不了 id 的那几家（Codex、Hermes），新对话的临时托管 id 是 `new-<存储名>-<毫秒时间戳>`。
-const TEMP_PREFIX: &str = "new-";
 /// 实时预览多久取一次画面。
 const LIVE_EVERY: Duration = Duration::from_millis(500);
+/// 一条对话的「此刻」最多多久读一次（会话文件变了才读）。
+const MOMENT_EVERY: Duration = Duration::from_secs(15);
 /// 按 R 重开被中断的对话时带进去的第一句话（方案「中断恢复」节）。
 pub const CONTINUE_MESSAGE: &str =
     "继续上次没做完的事。先检查现场（比如有没有执行到一半的命令），再接着做。";
@@ -74,15 +91,25 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 enum Msg {
     Index(Update),
     Preview(SessionId, Preview),
+    /// 一条对话的「此刻」读到了。
+    Moment(SessionId, Moment),
     /// 整段对话读到了：哪条、读的时候它的最后时间、全文。
     Transcript(SessionId, SystemTime, Result<Transcript, String>),
+    /// 一条搜索结果的命中片段（查询词、哪条、片段；没找到或读不了是 `None`）。
+    Snippet(String, SessionId, Option<Snippet>),
     /// 实时预览取到的新画面；`None` 表示这条取不到了（已退出、守护进程不在）。
     Live(SessionId, Option<ScreenSnapshot>),
-    Quota(Vendor, QuotaReading),
+    /// 一个账号（厂商、账号短名）的额度。
+    Quota(Vendor, String, QuotaReading),
+    /// 余额和订阅额度（全部密钥）。
+    Balance(quota::BalanceReport),
     Hosted(Vec<HostedInfo>),
+    /// 收到没见过的 id 起了进程（别的会话台新建的）后补取的托管列表：只补认得的，不重新同步状态。
+    Learned(Vec<HostedInfo>),
     /// 守护进程记着的被中断对话（全部重报）。
     Interrupted(Vec<RunRecord>),
-    Host(HostEvent),
+    /// 守护进程的事件和收到它的时刻（会话台交出终端时主循环晚些才处理，认领要用真实时刻）。
+    Host(HostEvent, SystemTime),
     /// 连上的守护进程比当前程序旧（之后的 `Hosted` 记成它托管着的对话）。
     OldHost(bool),
     HostGone,
@@ -92,23 +119,6 @@ enum Msg {
     Update(String),
     /// 本机进程参数里带着的会话 id（见 [`procs_worker`]）。
     Procs(HashSet<SessionId>),
-}
-
-/// 交给动作线程的活。
-enum Job {
-    Open(Box<Entry>),
-    New(Vendor, PathBuf),
-    RestoreTabs,
-    ResumeInterrupted(Vec<Entry>),
-    Dismiss(SessionId),
-    /// 列表里被中断的这条已经在它自己的 id 下重新跑起来了：把守护进程用别的 id（临时 id）记的那条被中断记录清掉。
-    Restarted(SessionId),
-    Kill(SessionId),
-    Trash(Box<Entry>),
-    Untrash(Vendor),
-    Finder(PathBuf),
-    Git(PathBuf),
-    Copy(Box<Entry>),
 }
 
 /// 查有没有新版：返回要提示的版本号。在后台线程里调，可能联网（由 `cli` 给）。
@@ -132,7 +142,9 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
         None => (Config::default(), None),
     };
     let index = Index::open_default()?;
+    let accounts = sources::local_accounts(&home);
     let mut app = App::new(home.clone(), launch_dir, config);
+    app.set_accounts(accounts.clone());
     app.autostart = LoginItem::default_location().is_some_and(|l| l.is_enabled());
     app.set_expanded_projects(index.expanded_projects());
     app.set_projects(index.projects());
@@ -145,15 +157,18 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
         }
     }
     app.written = index::recent_writes(app.lists.iter().flat_map(|l| &l.entries), app.now);
-    // 没装的那家（数据目录不在）不显示标签。
-    let dirs = VendorDirs::from_env(&home);
-    app.hide_missing(|v| dirs.of(v).1.exists());
+    // 没装的那家（哪个账号的数据目录都不在）不显示标签。
+    app.hide_missing(|v| installed(&accounts, v));
     app.status = config_problem
         .or(list_problem)
         .or_else(|| index.problems().first().cloned());
 
     let theme = Theme::detect();
-    let ctx = Ctx::new(home, data_dir, index.clone())?;
+    let ctx = Ctx::new(home, data_dir, index.clone())?.with_accounts(accounts);
+    match load_claims(&ctx.data_dir, SystemTime::now()) {
+        Ok(bound) => *lock(&ctx.claims) = Claims::restore(bound),
+        Err(e) => app.status = Some(format!("认领记录没读到（新建的对话先不认领）：{e}")),
+    }
     let alert_kind = std::env::var("TERM_PROGRAM")
         .ok()
         .and_then(|t| notify::osc_kind(&t));
@@ -162,9 +177,12 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
     let (_background, updates) = index.start();
     forward(updates, tx.clone(), Msg::Index);
     let previews = preview_worker(ctx.clone(), tx.clone());
+    let moments = moment_worker(ctx.clone(), tx.clone());
     let transcripts = transcript_worker(ctx.clone(), tx.clone());
+    let snippets = snippet_worker(index.clone(), tx.clone());
     let live = live_worker(ctx.data_dir.clone(), tx.clone());
     let quotas = quota_worker(tx.clone());
+    let balances = balance_worker(ctx.accounts.clone(), tx.clone());
     procs_worker(tx.clone());
     let seen = seen_worker(ctx.data_dir.clone());
     let away = Arc::new(Mutex::new(false));
@@ -178,7 +196,7 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
         });
     }
     let jobs = job_worker(ctx.clone(), index.clone(), tx);
-    let _ = quotas.send(app.vendor);
+    let _ = quotas.send(app.quota_account());
 
     let mut ime = Switcher::new(Tis, app.config.auto_ascii_input);
     let mut tui = Tui::enter()?;
@@ -198,31 +216,27 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
         notifier: Notifier::new(),
         alert_kind,
         away,
-        last_selected: None,
         previews,
+        moments,
+        moment_sent: Vec::new(),
+        frame: None,
         transcripts,
+        snippets,
         live,
         live_sent: None,
         quotas,
+        balances,
         seen,
         jobs,
         rx,
         stopped: Vec::new(),
+        hosted: Vec::new(),
     };
     let result = lp.run(&mut tui);
     // 正常退出和出错退出都切回原来的输入源。
     let _ = lp.ime.leave();
     drop(tui);
     result
-}
-
-/// 一条托管在临时 id 下的新对话（新建时定不了 id 的那几家，见 `VendorInfo::presets_new_id`）。
-#[derive(Debug, Clone)]
-struct NewSession {
-    vendor: Vendor,
-    cwd: PathBuf,
-    /// 新建那一刻这个项目里已有的这家对话（这些肯定不是新建的那条）；守护进程报来的旧对话不知道，是空的。
-    existing: HashSet<SessionId>,
 }
 
 /// 动作要用的环境：会话来源（拼恢复/新建命令、读预览、回收站）、数据目录、自己的路径。
@@ -234,29 +248,52 @@ struct Ctx {
     terminal: Term,
     /// 会话台新建、托管在临时 id 下的对话：临时 id → 厂商、项目目录和新建那一刻这个项目里已有的这家对话。
     known: Arc<Mutex<HashMap<SessionId, NewSession>>>,
+    /// 临时 id 认领到列表里的哪条（主循环攒证据、动作线程打开时查）。
+    claims: Arc<Mutex<Claims>>,
     /// 列表里的被中断对话 → 守护进程记它用的 id（会话台新建的 Codex 对话是临时 id，其余相同）。
     interrupted: Arc<Mutex<HashMap<SessionId, SessionId>>>,
     /// 取项目显示名（标签页标题前缀）。
     index: Index,
+    /// 本机各家的账号（每家主账号在前），见 `sources::local_accounts`。
+    accounts: Arc<Vec<Account>>,
 }
 
 impl Ctx {
     fn new(home: PathBuf, data_dir: PathBuf, index: Index) -> io::Result<Self> {
         Ok(Self {
+            accounts: Arc::new(sources::local_accounts(&home)),
             home,
             data_dir,
             index,
             exe: std::env::current_exe()?,
             terminal: Term::current(),
             known: Arc::default(),
+            claims: Arc::default(),
             interrupted: Arc::default(),
         })
+    }
+
+    fn with_accounts(mut self, accounts: Vec<Account>) -> Self {
+        self.accounts = Arc::new(accounts);
+        self
     }
 
     fn sources(&self) -> io::Result<Vec<Box<dyn Source>>> {
         let trash = Trash::default_location()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "取不到回收站位置"))?;
-        Ok(sources::default_sources(&self.home, trash))
+        Ok(sources::sources_for(&self.accounts, trash))
+    }
+
+    /// 这家这个账号（[`Account::key`]）。
+    fn account(&self, vendor: Vendor, key: &str) -> Option<&Account> {
+        self.accounts
+            .iter()
+            .find(|a| a.vendor == vendor && a.key == key)
+    }
+
+    /// 托管 id 是 `id` 的对话的命令前面要带的目录变量（账号从 id 的前缀认），见 [`env_prefix_of`]。
+    fn env_prefix(&self, vendor: Vendor, id: &SessionId) -> String {
+        env_prefix_of(&self.accounts, vendor, id.split_account().0, &self.home)
     }
 
     /// 项目在标签页标题、托管标题前缀里的名字：起过显示名用显示名。
@@ -277,7 +314,8 @@ impl Ctx {
         mut cmd: Command,
     ) -> io::Result<Command> {
         if vendor == Vendor::Claude
-            && let Some(settings) = quota::claude_settings(cwd)
+            && let Some(account) = self.account(vendor, id.split_account().0)
+            && let Some(settings) = quota::claude_settings(account, cwd)
         {
             // 会话台启动的 Claude 带上状态栏注入，额度读数才有第一渠道（见 quota 模块）。
             // 放在最前面：带话恢复时那句话要留在最后当位置参数。
@@ -289,11 +327,7 @@ impl Ctx {
             vendor,
             project: self.label(cwd),
             cwd: cwd.to_path_buf(),
-            command: format!(
-                "{}{}",
-                sources::env_prefix(&VendorDirs::from_env(&self.home), vendor, &self.home),
-                cmd.shell_line()
-            ),
+            command: format!("{}{}", self.env_prefix(vendor, id), cmd.shell_line()),
         };
         match host::client::request(&self.data_dir, &Request::Spawn(spec))? {
             Response::Ok => Ok(opener::attach_command(&self.exe, id, cwd)),
@@ -331,6 +365,7 @@ fn interrupted_list(dir: &Path) -> io::Result<Vec<RunRecord>> {
     }
 }
 
+/// 这家的主账号的来源（新建对话用）：来源按账号排，每家主账号在前。
 fn source_for(sources: &[Box<dyn Source>], v: Vendor) -> io::Result<&dyn Source> {
     sources
         .iter()
@@ -339,19 +374,50 @@ fn source_for(sources: &[Box<dyn Source>], v: Vendor) -> io::Result<&dyn Source>
         .ok_or_else(|| io::Error::other(format!("没有 {v} 的会话来源")))
 }
 
+/// 这条对话所在账号的来源。
+fn source_of<'a>(sources: &'a [Box<dyn Source>], s: &Session) -> io::Result<&'a dyn Source> {
+    sources::source_of(sources, s).ok_or_else(|| {
+        io::Error::other(format!(
+            "没有 {} 这个账号的会话来源（账号删掉了？）",
+            s.vendor
+        ))
+    })
+}
+
+/// 本机这家有没有装（哪个账号的数据目录在）。
+fn installed(accounts: &[Account], v: Vendor) -> bool {
+    accounts.iter().any(|a| a.vendor == v && a.dir.exists())
+}
+
+/// 账号 `key` 的命令前面要带的目录变量：非默认账号带 `VAR=目录`；默认账号在这家只有一个账号时不带
+/// （老样子，命令短），有几个账号时把这家所有改目录的变量都 `env -u` 清掉（OpenCode 连 `XDG_DATA_HOME`），
+/// 免得守护进程或登录 shell 里设着的哪一个把它带到别的账号。
+/// 找不到账号（设置里删了）就按默认账号算。
+fn env_prefix_of(accounts: &[Account], vendor: Vendor, key: &str, home: &Path) -> String {
+    match accounts.iter().find(|a| a.vendor == vendor && a.key == key) {
+        Some(a) if !a.is_default() => sources::account_env_prefix(a, home),
+        _ if accounts.iter().filter(|a| a.vendor == vendor).count() > 1 => {
+            sources::default_account_env_prefix(vendor)
+        }
+        _ => String::new(),
+    }
+}
+
 /// 恢复一条已有对话：登记托管，返回 attach 命令。
 fn register_resume(ctx: &Ctx, sources: &[Box<dyn Source>], s: &Session) -> io::Result<Command> {
-    let cmd = source_for(sources, s.vendor)?.resume_cmd(s);
+    let cmd = source_of(sources, s)?.resume_cmd(s);
     ctx.register(&s.id, s.vendor, &s.cwd, cmd)
 }
 
 /// 守护进程记的被中断对话对到列表里的哪条：返回「列表里的会话 id → 守护进程用的 id」。
-/// 多数就是同一个 id；会话台新建的 Codex 对话记的是临时 id，只认回「同一项目、id 在那次进程启动之后才生成、
-/// 不是别的被中断对话」的唯一一条（见 [`is_new_since`]）。认出不止一条、一条都没有、或同一条被几条记录认领，
-/// 都不列：宁可不列，也不能把「继续」发给别的对话。
+/// 多数就是同一个 id；会话台新建、记的是临时 id 的，只认回它认领过的那条（[`Claims`]，光按时间对得上不算），
+/// 且那条还得是同一项目、id 在那次进程启动之后才生成、不是别的被中断对话（见 [`is_new_since`]）。
+/// 没认领过、或同一条被几条记录认领，都不列：宁可不列，也不能把「继续」发给别的对话。
+/// v0.1.3 记的原生 id 按 [`native_owners`] 对：工作账号下那条带前缀的 id 也认得回来，对不上唯一一条不列。
 fn resolve_interrupted<'a>(
     records: &[RunRecord],
     entries_of: impl Fn(Vendor) -> &'a [Entry],
+    bound: &HashMap<SessionId, Bound>,
 ) -> HashMap<SessionId, SessionId> {
     let recorded: HashSet<&SessionId> = records.iter().map(|r| &r.id).collect();
     let mut out = HashMap::new();
@@ -359,6 +425,17 @@ fn resolve_interrupted<'a>(
     let mut claims: HashMap<SessionId, Vec<SessionId>> = HashMap::new();
     for r in records {
         let entries = entries_of(r.vendor);
+        if native_hosted(&r.id) {
+            // 自己（带账号前缀）的 id 另有记录的另有其主，不算。
+            let others = entries
+                .iter()
+                .map(|e| &e.session)
+                .filter(|s| s.id == r.id || !recorded.contains(&s.id));
+            if let [one] = native_owners(&r.id, r.vendor, &r.cwd, others).as_slice() {
+                out.insert(one.id.clone(), r.id.clone());
+            }
+            continue;
+        }
         if entries.iter().any(|e| e.session.id == r.id) {
             out.insert(r.id.clone(), r.id.clone());
             continue;
@@ -368,10 +445,13 @@ fn resolve_interrupted<'a>(
         };
         // 记录里的进程启动时间（秒，向下取整）比新建时刻更紧：这次跑的那条 id 一定在它之后生成。
         let since = started.max(SystemTime::UNIX_EPOCH + Duration::from_secs(r.started_at));
-        let mut found = entries.iter().filter(|e| {
-            !recorded.contains(&e.session.id) && is_new_since(&e.session, &r.cwd, since, None)
-        });
-        if let (Some(e), None) = (found.next(), found.next()) {
+        let Some(b) = bound.get(&r.id) else {
+            continue;
+        };
+        if let Some(e) = entries.iter().find(|e| e.session.id == b.real)
+            && !recorded.contains(&e.session.id)
+            && is_new_since(&e.session, &r.id, &r.cwd, since, None)
+        {
             claims
                 .entry(e.session.id.clone())
                 .or_default()
@@ -386,10 +466,58 @@ fn resolve_interrupted<'a>(
     out
 }
 
-/// 被中断的对话带那句话重开：登记托管（命令带 [`CONTINUE_MESSAGE`]），返回 attach 命令。
-fn register_continue(ctx: &Ctx, sources: &[Box<dyn Source>], s: &Session) -> io::Result<Command> {
-    let cmd = source_for(sources, s.vendor)?.resume_with_message_cmd(s, CONTINUE_MESSAGE);
-    ctx.register(&s.id, s.vendor, &s.cwd, cmd)
+/// 被中断的对话带那句话重开：登记托管（命令带 [`CONTINUE_MESSAGE`]），返回 attach 命令和那句话到没到 CLI。
+fn register_continue(
+    ctx: &Ctx,
+    sources: &[Box<dyn Source>],
+    s: &Session,
+) -> io::Result<(Command, Delivery)> {
+    let source = source_of(sources, s)?;
+    let cmd = source.resume_with_message_cmd(s, CONTINUE_MESSAGE);
+    let delivery = source.message_delivery(s);
+    Ok((ctx.register(&s.id, s.vendor, &s.cwd, cmd)?, delivery))
+}
+
+/// R 的结果：开了几个、话到没到（按家说要按回车还是要自己输入）、没打开的第一条原因。
+fn resume_report(opened: &[(Vendor, Delivery)], failed: &[String]) -> String {
+    let vendors = |want: Delivery| {
+        let mut names: Vec<&str> = Vec::new();
+        for (v, d) in opened {
+            if *d == want && !names.contains(&v.name()) {
+                names.push(v.name());
+            }
+        }
+        (
+            opened.iter().filter(|(_, d)| *d == want).count(),
+            names.join("、"),
+        )
+    };
+    let (sent, _) = vendors(Delivery::Sent);
+    let (typed, typed_by) = vendors(Delivery::Typed);
+    let (manual, manual_by) = vendors(Delivery::Manual);
+    let n = opened.len();
+    let head = if typed + manual == 0 {
+        match failed {
+            [] => return format!("已在 {n} 个新标签页接着做"),
+            _ => format!("接着做了 {n} 个"),
+        }
+    } else {
+        let mut parts = Vec::new();
+        if sent > 0 {
+            parts.push(format!("{sent} 个接着做了"));
+        }
+        if typed > 0 {
+            parts.push(format!("{typed} 个话已填好、要按回车（{typed_by}）"));
+        }
+        if manual > 0 {
+            parts.push(format!("{manual} 个带不进话、要自己输入（{manual_by}）"));
+        }
+        format!("开了 {n} 个新标签页：{}", parts.join("，"))
+    };
+    match failed.first() {
+        None => head,
+        Some(first) => format!("{head}，{} 个没打开：{first}", failed.len()),
+    }
 }
 
 /// 新对话：Claude、pi 用 `--session-id` 指定会话 id，托管 id 就是将来列表里那条的 id，
@@ -408,6 +536,10 @@ fn register_new(
         .unwrap_or_default()
         .as_millis();
     let (id, cmd) = new_session_command(v, base, millis, random_uuid()?);
+    // 新对话开在主账号里：托管 id 带上主账号的前缀，和它将来在列表里的 id 一致；临时 id 也带，
+    // 几个账号同时新建的临时 id 不会撞，也只认回同一个账号里的对话（见 [`is_new_since`]）。
+    let primary = ctx.accounts.iter().find(|a| a.vendor == v);
+    let id = SessionId::in_account(primary.map_or("", |a| a.key.as_str()), id.as_str());
     if !v.info().presets_new_id {
         let new = NewSession {
             vendor: v,
@@ -460,135 +592,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// 打开一条对话时它实际托管在哪个 id 下。
-#[derive(Debug, PartialEq, Eq)]
-enum Hosted {
-    /// 用它自己的 id（没托管就新登记）。
-    Own,
-    /// 它就是会话台新建、托管在这个临时 id 下的 Codex 对话。
-    Alias(SessionId),
-    /// 它可能是会话台新建、还在跑的 Codex 对话，但确认不了是哪条（或是不是）。
-    Ambiguous,
-}
-
-/// Codex 会话 id 是 UUIDv7（本机 0.171 实测），开头 48 位是生成它的毫秒时间；不是 v7 的返回 `None`。
-fn codex_id_created(id: &SessionId) -> Option<SystemTime> {
-    let b = id.as_str().as_bytes();
-    let dashes = [8, 13, 18, 23].iter().all(|&i| b.get(i) == Some(&b'-'));
-    if b.len() != 36 || !dashes || b[14] != b'7' {
-        return None;
-    }
-    let hex: Vec<u8> = b[..13].iter().copied().filter(|&c| c != b'-').collect();
-    if !hex.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    let ms = u64::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?;
-    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
-}
-
-/// 对话生成时刻（新建时定不了 id 的那几家）：Codex、Hermes 从 id 看出，Kimi Code 的 id 看不出、读它的
-/// `state.json`。Hermes 的 id 只精确到秒，取那一秒的最后一刻，免得同一秒里稍晚新建的那条被当成新建之前就有的。
-/// 看不出的返回 `None`。
-fn id_created(s: &Session) -> Option<SystemTime> {
-    match s.vendor {
-        Vendor::Codex => codex_id_created(&s.id),
-        Vendor::Hermes => hermes::id_created(s.id.as_str()).map(|t| t + Duration::from_millis(999)),
-        Vendor::Kimi => kimi::created_at(&s.path),
-        Vendor::OpenCode => opencode::id_created(s.id.as_str(), s.last_active),
-        Vendor::Claude | Vendor::Pi | Vendor::Gemini | Vendor::Qwen => None,
-    }
-}
-
-/// `s` 会不会是 `since` 那一刻在项目 `cwd` 里新建的对话：同一项目、id 是那之后才生成的
-/// （新建之前就有的对话，不管后来在别处聊没聊，都不可能是它），且不在新建那一刻已有的对话 `existing` 里。
-/// id 看不出生成时间的一律不认。
-fn is_new_since(
-    s: &Session,
-    cwd: &Path,
-    since: SystemTime,
-    existing: Option<&HashSet<SessionId>>,
-) -> bool {
-    s.cwd == cwd
-        && id_created(s).is_some_and(|c| c >= since)
-        && !existing.is_some_and(|e| e.contains(&s.id))
-}
-
-/// Codex 新对话托管在临时 id 下；它写出会话记录后列表里出现的是真实 id。
-/// 一条不在托管里的对话，只有同时满足这两条才认作那个临时 id、接到那个进程上（不再起第二个 `codex resume`）：
-/// 在跑的临时 id 里只有一个可能是它（见 [`is_new_since`]），且列表里（`listed`，这家的全部对话）
-/// 除它以外没有别的对话也可能是那个临时 id。可能是它但确认不了时是 [`Hosted::Ambiguous`]：绝不接错。
-fn hosted_alias(
-    s: &Session,
-    hosted: &[HostedInfo],
-    known: &HashMap<SessionId, NewSession>,
-    listed: &[Entry],
-) -> Hosted {
-    let own = |id: &SessionId| hosted.iter().any(|h| h.id == *id);
-    if own(&s.id) {
-        return Hosted::Own;
-    }
-    let may_be = |h: &HostedInfo, x: &Session| {
-        h.vendor == x.vendor
-            && h.pid.is_some()
-            && temp_started(&h.id)
-                .is_some_and(|t| is_new_since(x, &h.cwd, t, known.get(&h.id).map(|n| &n.existing)))
-    };
-    let temps: Vec<&HostedInfo> = hosted.iter().filter(|h| may_be(h, s)).collect();
-    match temps.as_slice() {
-        [] => Hosted::Own,
-        [h] if !listed
-            .iter()
-            .any(|e| e.session.id != s.id && !own(&e.session.id) && may_be(h, &e.session)) =>
-        {
-            Hosted::Alias(h.id.clone())
-        }
-        _ => Hosted::Ambiguous,
-    }
-}
-
-/// 会话台新建、托管在临时 id 下（`running` 为真）的对话写出会话记录后，列表里是真实 id、看起来没托管；
-/// 用打开时同一套认法（[`hosted_alias`]）找出这些真实 id（含认不准的，界面不把它们当成别处在用）。
-/// `listed` 是 `vendor` 这家的全部对话。
-fn aliased(
-    vendor: Vendor,
-    listed: &[Entry],
-    known: &HashMap<SessionId, NewSession>,
-    running: impl Fn(&SessionId) -> bool,
-) -> HashSet<SessionId> {
-    let hosted: Vec<HostedInfo> = known
-        .iter()
-        .filter(|(id, n)| n.vendor == vendor && running(id))
-        .map(|(id, n)| HostedInfo {
-            id: id.clone(),
-            vendor,
-            project: String::new(),
-            cwd: n.cwd.clone(),
-            pid: Some(0),
-            attached: false,
-            title: None,
-        })
-        .collect();
-    if hosted.is_empty() {
-        return HashSet::new();
-    }
-    listed
-        .iter()
-        .filter(|e| hosted_alias(&e.session, &hosted, known, listed) != Hosted::Own)
-        .map(|e| e.session.id.clone())
-        .collect()
-}
-
-/// 临时 id 里记的新建时间。
-fn temp_started(id: &SessionId) -> Option<SystemTime> {
-    let (key, ms) = id.as_str().strip_prefix(TEMP_PREFIX)?.rsplit_once('-')?;
-    Vendor::ALL
-        .iter()
-        .any(|v| v.key() == key && !v.info().presets_new_id)
-        .then_some(())?;
-    let ms: u64 = ms.parse().ok()?;
-    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
-}
-
 /// 打开一条已有对话：返回托管 id、标签页里要跑的 attach 命令，以及这次是不是新登记的托管
 /// （之前守护进程里没有这条；标签页没开成时要撤掉，见 [`Worker::open_tab`]）。
 fn attach_existing(
@@ -597,8 +600,20 @@ fn attach_existing(
     s: &Session,
 ) -> io::Result<(SessionId, Command, bool)> {
     let hosted = hosted_list(ctx);
-    let listed = ctx.index.list(s.vendor).unwrap_or_default();
-    match hosted_alias(s, &hosted, &lock(&ctx.known), &listed) {
+    let listed = ctx.index.list(s.vendor)?;
+    // 先 known 后 claims，和主循环同一个顺序拿锁。
+    let alias = || {
+        let known = lock(&ctx.known);
+        hosted_alias(s, &hosted, &known, &lock(&ctx.claims), &listed)
+    };
+    let mut found = alias();
+    // 认不准：可能是别的会话台新建、已经认领了的（审计 v0.1.4 第 13 条），接上它落盘的认领再看一次。
+    if found == Hosted::Ambiguous {
+        let saved = load_claims(&ctx.data_dir, SystemTime::now())?;
+        lock(&ctx.claims).adopt(saved);
+        found = alias();
+    }
+    match found {
         Hosted::Own => {
             let fresh = !hosted.iter().any(|h| h.id == s.id);
             Ok((s.id.clone(), register_resume(ctx, sources, s)?, fresh))
@@ -608,10 +623,32 @@ fn attach_existing(
             Ok((id, cmd, false))
         }
         Hosted::Ambiguous => Err(io::Error::other(format!(
-            "这个项目里有会话台新建的 {} 对话还在跑，确认不了是不是这条；请到那个标签页里继续，或等它结束再打开",
+            "这个项目里有会话台托管的 {} 对话还在跑，确认不了是不是这条；请到那个标签页里继续，或等它结束再打开",
             s.vendor
         ))),
     }
+}
+
+/// 守护进程此刻托管着、CLI 进程在跑的对话（`ai list`、`ai search` 的状态列）：认领到临时 id 下的换回那条对话的 id
+/// （进程号对得上才算）。守护进程没在跑就是空的；不拉起守护进程、不改认领记录。
+pub fn hosted_now(dir: &Path) -> HashSet<SessionId> {
+    let hosted = match host::client::request(dir, &Request::List) {
+        Ok(Response::List(h)) => h,
+        _ => return HashSet::new(),
+    };
+    let claims = load_claims(dir, SystemTime::now()).unwrap_or_default();
+    hosted
+        .into_iter()
+        .filter_map(|h| {
+            let pid = h.pid?;
+            match claims.get(&h.id) {
+                Some(b) if b.pid == pid => Some(b.real.clone()),
+                // 没认领到的临时 id 还不知道是哪条对话。
+                _ if temp_started(&h.id).is_some() => None,
+                _ => Some(h.id),
+            }
+        })
+        .collect()
 }
 
 /// 守护进程托管着的对话；守护进程没在跑就没有。
@@ -725,47 +762,69 @@ struct Loop {
     /// 交出终端（当前窗口里接对话、开编辑器）期间为 `true`：主循环停着，守护进程送来的提醒
     /// 写不进自己标签页，`host_watcher` 改发系统通知。和 `host_watcher` 转发事件共用这把锁，切换时不漏不压。
     away: Arc<Mutex<bool>>,
-    /// 上一轮选中的对话，选中换了才告诉守护进程「看过了」。
-    last_selected: Option<SessionId>,
     previews: Sender<Entry>,
+    /// 读「此刻」的线程：要读哪些对话（变了才发）。
+    moments: Sender<Vec<Entry>>,
+    /// 上次发给它的那批（id 和会话文件）。
+    moment_sent: Vec<(SessionId, PathBuf)>,
+    /// 上一次整帧画出来的样子：只有转圈换帧时拿它改那几格再交给终端（见 [`view::respin`]）。
+    frame: Option<Buffer>,
     /// 读整段对话的线程。
     transcripts: Sender<Entry>,
+    /// 取搜索结果命中片段的线程：查询词和看得见的那几条。
+    snippets: Sender<(String, Vec<Entry>)>,
     live: Sender<Option<SessionId>>,
     /// 上次告诉实时预览线程的目标。
     live_sent: Option<SessionId>,
-    quotas: Sender<Vendor>,
+    quotas: Sender<Account>,
+    /// 叫余额线程马上读一遍（`$` 打开时）。
+    balances: Sender<()>,
     seen: Sender<SessionId>,
     jobs: Sender<Job>,
     rx: Receiver<Msg>,
     /// 守护进程记着的被中断对话。
     stopped: Vec<RunRecord>,
+    /// 守护进程托管着的对话（上次 `List` 的结果，之后按事件增减）：认 v0.1.3 以原生 id 托管的那些用。
+    hosted: Vec<HostedInfo>,
 }
 
 impl Loop {
+    /// 顶栏额度现在该显示哪个账号的（厂商、账号短名）。
+    fn quota_key(&self) -> (Vendor, String) {
+        let a = self.app.quota_account();
+        (a.vendor, a.key)
+    }
+
     fn run(&mut self, tui: &mut Tui) -> io::Result<()> {
         let mut dirty = true;
         let mut last_draw = Instant::now();
         let started = Instant::now();
         while !self.app.quit {
-            dirty |= self.app.tick_blink(started.elapsed());
-            if dirty || last_draw.elapsed() >= CLOCK {
+            let ticked = self.app.tick_blink(started.elapsed());
+            let spun = ticked && self.app.only_spun;
+            dirty |= ticked && !spun;
+            if dirty || last_draw.elapsed() >= CLOCK || (spun && !self.respin(tui)?) {
                 self.app.now = SystemTime::now();
-                tui.terminal
+                let done = tui
+                    .terminal
                     .draw(|f| view::draw(f, &mut self.app, &self.theme))?;
+                self.frame = Some(done.buffer.clone());
                 last_draw = Instant::now();
                 dirty = false;
             }
             if event::poll(TICK)? {
-                let vendor = self.app.vendor;
+                let quota_was = self.quota_key();
                 let effects = match event::read()? {
                     Event::Key(k) => self.app.key(k),
                     Event::Mouse(m) => self.app.mouse(m, Instant::now()),
                     Event::FocusGained => {
+                        self.app.board_front = true;
                         let r = self.ime.focus_gained();
                         self.ime_result(r);
                         Vec::new()
                     }
                     Event::FocusLost => {
+                        self.app.board_front = false;
                         let r = self.ime.focus_lost();
                         self.ime_result(r);
                         Vec::new()
@@ -778,8 +837,9 @@ impl Loop {
                 }
                 let r = self.ime.set_enabled(self.app.config.auto_ascii_input);
                 self.ime_result(r);
-                if self.app.vendor != vendor {
-                    let _ = self.quotas.send(self.app.vendor);
+                // 换了家、或选中了另一个账号的对话：顶栏额度换成那个账号的。
+                if self.quota_key() != quota_was {
+                    let _ = self.quotas.send(self.app.quota_account());
                 }
             }
             while let Ok(msg) = self.rx.try_recv() {
@@ -790,17 +850,54 @@ impl Loop {
                 self.app.set_state(id.clone(), self.notifier.state(&id));
                 dirty = true;
             }
+            if lock(&self.ctx.claims).due(SystemTime::now()) {
+                self.refresh_aliases();
+                dirty = true;
+            }
             if let Some(e) = self.app.take_preview_request() {
                 let _ = self.previews.send(e);
             }
             if let Some(e) = self.app.take_transcript_request() {
                 let _ = self.transcripts.send(e);
             }
+            if let Some(req) = self.app.take_snippet_request() {
+                let _ = self.snippets.send(req);
+            }
+            self.send_moment_targets();
             self.set_live(self.app.live_target());
-            self.mark_seen();
+            dirty |= self.mark_seen();
         }
         self.set_live(None);
         Ok(())
+    }
+
+    /// 只有转圈换了一帧：拿上一帧改转圈那几格交给终端，终端只收到这几格。没有上一帧、窗口大小变了
+    /// 返回 `false`，要整帧重画。
+    fn respin(&mut self, tui: &mut Tui) -> io::Result<bool> {
+        let size = tui.terminal.size()?;
+        let Some(last) = self
+            .frame
+            .as_mut()
+            .filter(|b| (b.area.width, b.area.height) == (size.width, size.height))
+        else {
+            return Ok(false);
+        };
+        view::respin(last, &self.app.areas.spin, self.app.spinner());
+        tui.terminal.draw(|f| f.buffer_mut().clone_from(last))?;
+        Ok(true)
+    }
+
+    /// 要读「此刻」的对话变了才告诉读的线程。
+    fn send_moment_targets(&mut self) {
+        let targets = self.app.moment_targets();
+        let keys: Vec<(SessionId, PathBuf)> = targets
+            .iter()
+            .map(|e| (e.session.id.clone(), e.session.path.clone()))
+            .collect();
+        if keys != self.moment_sent {
+            let _ = self.moments.send(targets);
+            self.moment_sent = keys;
+        }
     }
 
     /// 输入源没切成：在底栏说一句，不挡别的。
@@ -842,29 +939,24 @@ impl Loop {
         }
         let result = tui.suspend(f);
         *lock(&self.away) = false;
+        // 回来时主人就在这个标签页里（交出去期间收不到焦点事件）。
+        self.app.board_front = true;
         let r = self.ime.back();
         self.ime_result(r);
         result
     }
 
-    /// 选中「刚做完」的对话，本地状态灯就算看过了。用户把选中挪到一条托管对话上（右侧开始预览它），
-    /// 再告诉守护进程看过了，它那份提醒判断不再为这一轮弹提醒。选中不动、对话在那时做完的不算：
-    /// 会话台可能正放在后台没人看，提醒照发。
-    fn mark_seen(&mut self) {
-        let selected = self.app.selected_entry().map(|e| e.session.id.clone());
-        let changed = selected != self.last_selected;
-        self.last_selected.clone_from(&selected);
-        let Some(id) = selected else {
-            return;
+    /// 选着「刚做完」的对话看了一会儿（[`App::take_seen`]）就算看过：本地状态灯变成不闪的「等你回复」，
+    /// 再告诉守护进程，它那份提醒判断不再为这一轮弹提醒，别的会话台窗口也收到广播跟着停闪。返回要不要重画。
+    fn mark_seen(&mut self) -> bool {
+        let Some(id) = self.app.take_seen() else {
+            return false;
         };
-        if self.app.state_of(&id) == SessionState::Done {
-            self.notifier
-                .notify(id.clone(), Activity::Seen, Instant::now());
-            self.app.set_state(id.clone(), self.notifier.state(&id));
-        }
-        if changed && self.app.states.contains_key(&id) {
-            let _ = self.seen.send(id);
-        }
+        self.notifier
+            .notify(id.clone(), Activity::Seen, Instant::now());
+        self.app.set_state(id.clone(), self.notifier.state(&id));
+        let _ = self.seen.send(id);
+        true
     }
 
     /// 守护进程请会话台代弹的提醒：往自己标签页写 OSC 9/777，终端自己弹（点它回到会话台）。
@@ -885,13 +977,23 @@ impl Loop {
 
     fn reload(&mut self, v: Vendor) {
         match self.index.list(v) {
-            Ok(entries) => self.app.set_entries(v, entries),
+            Ok(entries) => {
+                // 新建时定不了 id 的几家：消息数变了的记下来，等对证是不是会话台新建的那个进程写的。
+                if !v.info().presets_new_id {
+                    let mut claims = lock(&self.ctx.claims);
+                    for e in entries.iter().filter(|e| !e.session.automatic) {
+                        let s = &e.session;
+                        claims.entry_seen(&s.id, s.message_count, s.last_active);
+                    }
+                }
+                self.app.set_entries(v, entries);
+            }
             Err(e) => self.app.status = Some(format!("列表没读到：{e}")),
         }
         // 会话台开着时第一次用这家（之前没有数据目录、标签藏着）：读到它的对话就把标签补回来。
         if !self.app.shown.contains(&v) && !self.app.list_of(v).entries.is_empty() {
-            let dirs = VendorDirs::from_env(&self.app.home);
-            self.app.hide_missing(|x| dirs.of(x).1.exists());
+            let accounts = Arc::clone(&self.ctx.accounts);
+            self.app.hide_missing(|x| installed(&accounts, x));
         }
         // 会话文件有变化才会走到这里，顺带重查最近在写的文件（判断「别处在用」）。
         let lists = &self.app.lists;
@@ -900,21 +1002,96 @@ impl Loop {
         self.refresh_interrupted();
     }
 
-    /// 托管在临时 id 下的 Codex 新对话认回列表里的真实 id（见 [`aliased`]），界面不把它们当成别处在用。
+    /// 托管在临时 id 下的新对话认回列表里的真实 id：先对证攒下的变化（[`Claims::settle`]），
+    /// 认领到的交给界面（状态、实时预览、已读、x 结束按临时 id），认不准的界面也不当成别处在用。
     fn refresh_aliases(&mut self) {
         let app = &self.app;
         let known = lock(&self.ctx.known);
-        let ids = Vendor::ALL
-            .into_iter()
-            .filter(|v| !v.info().presets_new_id)
-            .flat_map(|v| {
-                aliased(v, &app.list_of(v).entries, &known, |id| {
-                    app.state_of(id) != SessionState::Stopped
+        let mut claims = lock(&self.ctx.claims);
+        let temps: Vec<HostedInfo> = claims
+            .running()
+            .filter_map(|(id, pid)| {
+                let n = known.get(id)?;
+                Some(HostedInfo {
+                    id: id.clone(),
+                    vendor: n.vendor,
+                    project: String::new(),
+                    cwd: n.cwd.clone(),
+                    pid: Some(pid),
+                    attached: false,
+                    title: None,
                 })
             })
             .collect();
+        let vendors: Vec<Vendor> = temps.iter().map(|h| h.vendor).collect();
+        let lists = Vendor::ALL
+            .into_iter()
+            .filter(|v| vendors.contains(v))
+            .map(|v| app.list_of(v).entries.as_slice());
+        let mut pairs = Vec::new();
+        for listed in lists.clone() {
+            // 以自己的 id 托管着、在跑的（不经认领看原始状态，认领到的真实 id 不算）。
+            pairs.extend(time_pairs(listed, &temps, &known, |id| {
+                app.states
+                    .get(id)
+                    .is_some_and(|s| *s != SessionState::Stopped)
+            }));
+        }
+        let changed = claims.settle(SystemTime::now(), &pairs);
+        let mut aliases = HashMap::new();
+        let mut aliased = HashSet::new();
+        let mut note = |id: &SessionId, h: Hosted| match h {
+            Hosted::Alias(temp) => {
+                aliased.insert(id.clone());
+                aliases.insert(id.clone(), temp);
+            }
+            Hosted::Ambiguous => {
+                aliased.insert(id.clone());
+            }
+            Hosted::Own => {}
+        };
+        for listed in lists {
+            for e in listed {
+                if pairs.iter().any(|(r, _)| *r == e.session.id) {
+                    note(
+                        &e.session.id,
+                        hosted_alias(&e.session, &temps, &known, &claims, listed),
+                    );
+                }
+            }
+        }
+        // v0.1.3 以原生 id 托管、还在跑的：对到的那条（工作账号下带前缀的 id）状态、预览、结束都按它。
+        // 这家只有默认账号时列表里没有带前缀的 id，不用对。
+        let accounts = &self.ctx.accounts;
+        let prefixed = |v: Vendor| accounts.iter().any(|a| a.vendor == v && !a.is_default());
+        for h in self
+            .hosted
+            .iter()
+            .filter(|h| h.pid.is_some() && native_hosted(&h.id) && prefixed(h.vendor))
+        {
+            let listed = app.list_of(h.vendor).entries.as_slice();
+            for e in listed
+                .iter()
+                .filter(|e| e.session.id.native() == h.id.as_str())
+            {
+                note(
+                    &e.session.id,
+                    hosted_alias(&e.session, &self.hosted, &known, &claims, listed),
+                );
+            }
+        }
+        let saved = if changed.is_empty() {
+            Ok(())
+        } else {
+            save_claims(&self.ctx.data_dir, &changed, claims.bound())
+        };
+        drop(claims);
         drop(known);
-        self.app.aliased = ids;
+        if let Err(e) = saved {
+            self.app.status = Some(format!("认领记录没写成：{e}"));
+        }
+        self.app.set_aliases(aliases);
+        self.app.aliased = aliased;
     }
 
     /// 托管列表整个换掉（重新同步、守护进程没了）之前：原来托管着、之后不在的，记下结束时间。
@@ -937,7 +1114,11 @@ impl Loop {
     /// 被中断记录或列表变了：重新对到列表里，更新「被中断」组和动作线程用的对照表。
     fn refresh_interrupted(&mut self) {
         let app = &self.app;
-        let map = resolve_interrupted(&self.stopped, |v| app.list_of(v).entries.as_slice());
+        let map = resolve_interrupted(
+            &self.stopped,
+            |v| app.list_of(v).entries.as_slice(),
+            lock(&self.ctx.claims).bound(),
+        );
         self.app.set_interrupted(map.keys().cloned().collect());
         *lock(&self.ctx.interrupted) = map;
     }
@@ -978,17 +1159,24 @@ impl Loop {
         });
     }
 
-    fn search(&mut self, v: Vendor, query: &str) {
-        match self.index.search(v, query, SEARCH_LIMIT) {
-            Ok(hits) => self
-                .app
-                .set_hits(v, query, hits.into_iter().map(|h| h.entry).collect()),
+    /// `v` 为 `None` 是各家一起搜。
+    fn search(&mut self, v: Option<Vendor>, query: &str) {
+        let hits = match v {
+            Some(v) => self.index.search(v, query, SEARCH_LIMIT),
+            None => self.index.search_all(query, SEARCH_LIMIT),
+        };
+        match hits {
+            Ok(hits) => self.app.set_search_hits(v, query, hits),
             Err(e) => self.app.status = Some(format!("搜索出错：{e}")),
         }
     }
 
     fn apply(&mut self, effect: Effect, tui: &mut Tui) -> io::Result<()> {
         let job = match effect {
+            Effect::RefreshBalances => {
+                let _ = self.balances.send(());
+                return Ok(());
+            }
             Effect::Search { vendor, query } => {
                 self.search(vendor, &query);
                 return Ok(());
@@ -1001,7 +1189,7 @@ impl Loop {
                 if let Some(q) = self.app.search.as_ref().map(|s| s.query.clone())
                     && !q.is_empty()
                 {
-                    self.search(vendor, &q);
+                    self.search(self.app.search_scope(), &q);
                 }
                 return Ok(());
             }
@@ -1072,22 +1260,26 @@ impl Loop {
             Effect::Finder(d) => Job::Finder(d),
             Effect::GitStatus(d) => Job::Git(d),
             Effect::CopyResume(e) => Job::Copy(e),
+            Effect::Export(e) => Job::Export(e),
         };
         let _ = self.jobs.send(job);
         Ok(())
     }
 
     /// 在当前窗口接上对话，CLI 退出或被别处接走后回到会话台。
+    /// 回来时告诉守护进程看过了：接着期间它就在这个窗口里，答完的最后一轮主人看着呢，不该回来还闪。
+    /// 走守护进程再广播回来，排在接着期间的状态事件后面，不会被它们盖掉。
     fn open_here(&mut self, tui: &mut Tui, s: &Session) -> io::Result<String> {
-        let cmd = match self
+        let (id, cmd) = match self
             .ctx
             .sources()
             .and_then(|src| attach_existing(&self.ctx, &src, s))
         {
-            Ok((_, c, _)) => c,
+            Ok((id, c, _)) => (id, c),
             Err(e) => return Ok(format!("没打开：{e}")),
         };
         let result = self.suspend(tui, || InlineOpener.open(&cmd, ""))?;
+        let _ = self.seen.send(id);
         Ok(match result {
             Ok(_) => "已回到会话台".to_owned(),
             Err(e) => format!("对话结束：{e}"),
@@ -1096,15 +1288,17 @@ impl Loop {
 
     fn new_here(&mut self, tui: &mut Tui, v: Vendor, cwd: &Path) -> io::Result<String> {
         let existing = ids_in(&self.index, v, cwd);
-        let cmd = match self
+        let (id, cmd) = match self
             .ctx
             .sources()
             .and_then(|src| register_new(&self.ctx, &src, v, cwd, existing))
         {
-            Ok((_, c)) => c,
+            Ok(x) => x,
             Err(e) => return Ok(format!("没新建：{e}")),
         };
         let result = self.suspend(tui, || InlineOpener.open(&cmd, ""))?;
+        // 和 `open_here` 一样：回来时它的最后一轮主人看过了。
+        let _ = self.seen.send(id);
         Ok(match result {
             Ok(_) => "已回到会话台".to_owned(),
             Err(e) => format!("对话结束：{e}"),
@@ -1119,21 +1313,24 @@ impl Loop {
                 if let Some(q) = self.app.search.as_ref().map(|s| s.query.clone())
                     && !q.is_empty()
                 {
-                    self.search(self.app.vendor, &q);
+                    self.search(self.app.search_scope(), &q);
                 }
             }
             Msg::Index(Update::Problem(_)) => {}
             Msg::Preview(id, p) => self.app.set_preview(id, p),
+            Msg::Moment(id, m) => self.app.set_moment(id, m),
             Msg::Transcript(id, at, t) => self.app.set_transcript(&id, at, t),
+            Msg::Snippet(query, id, snip) => self.app.set_snippet(&query, id, snip),
             Msg::Live(id, snap) => {
                 // 目标已经换了的旧画面丢掉。
                 if self.live_sent.as_ref() == Some(&id) {
                     self.app.live = snap.map(|s| (id, s));
                 }
             }
-            Msg::Quota(v, r) => {
-                self.app.quota.insert(v, r);
+            Msg::Quota(v, key, r) => {
+                self.app.quota.insert((v, key), r);
             }
+            Msg::Balance(report) => self.app.balance = Some(report),
             Msg::Procs(ids) => {
                 self.app.open_elsewhere = ids;
             }
@@ -1148,15 +1345,10 @@ impl Loop {
                     .map(|i| i.id.clone())
                     .collect();
                 self.forget_hosted(&alive);
-                let mut known = lock(&self.ctx.known);
-                for i in infos.iter().filter(|i| temp_started(&i.id).is_some()) {
-                    known.entry(i.id.clone()).or_insert_with(|| NewSession {
-                        vendor: i.vendor,
-                        cwd: i.cwd.clone(),
-                        existing: HashSet::new(),
-                    });
-                }
-                drop(known);
+                // 重新同步之前漏没漏事件不知道：重新开始看。
+                lock(&self.ctx.claims).unwatch_all();
+                self.hosted.clear();
+                self.learn_hosted(infos.clone());
                 for i in infos.into_iter().filter(|i| i.pid.is_some()) {
                     self.notifier.notify(i.id.clone(), Activity::Started, now);
                     if i.attached {
@@ -1168,13 +1360,16 @@ impl Loop {
                         .insert(i.id.clone(), self.notifier.state(&i.id));
                 }
             }
+            Msg::Learned(infos) => self.learn_hosted(infos),
             Msg::Interrupted(list) => {
                 self.stopped = list;
                 self.refresh_interrupted();
             }
-            Msg::Host(ev) => self.host_event(ev, now),
+            Msg::Host(ev, at) => self.host_event(ev, at, now),
             Msg::OldHost(old) => self.app.old_host = old.then(HashSet::new),
             Msg::HostGone => {
+                lock(&self.ctx.claims).unwatch_all();
+                self.hosted.clear();
                 self.app.old_host = None;
                 self.notifier = Notifier::new();
                 self.forget_hosted(&HashSet::new());
@@ -1186,7 +1381,85 @@ impl Loop {
         self.refresh_aliases();
     }
 
-    fn host_event(&mut self, ev: HostEvent, now: Instant) {
+    /// 记下托管列表（按 id 更新或补上，没列出的留着：补取失败时是空的）：临时 id 记进 `known`
+    /// （别的会话台新建的也认得厂商和项目，审计 v0.1.4 第 13 条）、看着在跑的进程，再接上别的会话台落盘的认领（[`Claims::adopt`]）。
+    fn learn_hosted(&mut self, infos: Vec<HostedInfo>) {
+        let (known, claims) = (Arc::clone(&self.ctx.known), Arc::clone(&self.ctx.claims));
+        let mut known = lock(&known);
+        let mut claims = lock(&claims);
+        let mut changed = Vec::new();
+        for i in infos.iter().filter(|i| temp_started(&i.id).is_some()) {
+            known.entry(i.id.clone()).or_insert_with(|| NewSession {
+                vendor: i.vendor,
+                cwd: i.cwd.clone(),
+                existing: HashSet::new(),
+            });
+            if let Some(pid) = i.pid
+                && claims.watch(&i.id, pid, SystemTime::now())
+            {
+                changed.push(i.id.clone());
+            }
+        }
+        self.save_claims(&claims, &changed);
+        match load_claims(&self.ctx.data_dir, SystemTime::now()) {
+            Ok(saved) => claims.adopt(saved),
+            Err(e) => self.app.status = Some(format!("认领记录没读到：{e}")),
+        }
+        drop(claims);
+        drop(known);
+        for i in infos {
+            match self.hosted.iter_mut().find(|h| h.id == i.id) {
+                Some(h) => *h = i,
+                None => self.hosted.push(i),
+            }
+        }
+    }
+
+    /// 临时 id 那个进程的动静记进认领证据：起了（换了）进程、有输出、退出。
+    /// 起进程的 id 没见过（别的会话台新建的，`Started` 里没有厂商和项目）就补取一次托管列表。
+    fn watch_temp(&mut self, ev: &HostEvent, at: SystemTime) {
+        let pid = match ev {
+            HostEvent::Started { pid, .. } => Some(*pid),
+            _ => None,
+        };
+        if let HostEvent::Started { id, .. } | HostEvent::Exited { id, .. } = ev {
+            match self.hosted.iter_mut().find(|h| h.id == *id) {
+                Some(h) => h.pid = pid,
+                None if pid.is_some() => {
+                    let _ = self.jobs.send(Job::Learn);
+                }
+                None => {}
+            }
+        }
+        let claims = Arc::clone(&self.ctx.claims);
+        let mut claims = lock(&claims);
+        match ev {
+            HostEvent::Started { id, pid } if temp_started(id).is_some() => {
+                if claims.watch(id, *pid, at) {
+                    self.save_claims(&claims, std::slice::from_ref(id));
+                }
+            }
+            HostEvent::Output { id }
+            | HostEvent::Bell { id }
+            | HostEvent::Notify { id, .. }
+            | HostEvent::Title { id, .. } => claims.output(id, at),
+            HostEvent::Exited { id, .. } => claims.unwatch(id),
+            _ => {}
+        }
+    }
+
+    /// 认领变了的临时 id 落盘；没写成在底栏说一声。
+    fn save_claims(&mut self, claims: &Claims, changed: &[SessionId]) {
+        if changed.is_empty() {
+            return;
+        }
+        if let Err(e) = save_claims(&self.ctx.data_dir, changed, claims.bound()) {
+            self.app.status = Some(format!("认领记录没写成：{e}"));
+        }
+    }
+
+    fn host_event(&mut self, ev: HostEvent, at: SystemTime, now: Instant) {
+        self.watch_temp(&ev, at);
         if let HostEvent::Alert { title, body, .. } = ev {
             self.show_alert(title, body);
             return;
@@ -1305,651 +1578,14 @@ fn editor(dir: &Path) -> Result<(), String> {
     }
 }
 
-// ---- 后台线程 ----
-
-fn forward<T: Send + 'static>(rx: Receiver<T>, tx: Sender<Msg>, wrap: fn(T) -> Msg) {
-    thread::spawn(move || {
-        for m in rx {
-            if tx.send(wrap(m)).is_err() {
-                return;
-            }
-        }
-    });
-}
-
-/// 读预览：只读最新要的那条，前面没来得及读的跳过。
-fn preview_worker(ctx: Ctx, tx: Sender<Msg>) -> Sender<Entry> {
-    let (req, rx) = mpsc::channel::<Entry>();
-    thread::spawn(move || {
-        let sources = ctx.sources();
-        while let Ok(mut e) = rx.recv() {
-            while let Ok(newer) = rx.try_recv() {
-                e = newer;
-            }
-            let s = &e.session;
-            let messages = sources
-                .as_ref()
-                .map_err(|err| io::Error::new(err.kind(), err.to_string()))
-                .and_then(|src| source_for(src, s.vendor)?.load_preview(s, PREVIEW_MESSAGES))
-                .map_err(|err| err.to_string());
-            let p = Preview {
-                at: s.last_active,
-                messages,
-            };
-            if tx.send(Msg::Preview(s.id.clone(), p)).is_err() {
-                return;
-            }
-        }
-    });
-    req
-}
-
-/// 读整段对话：和预览一样只读最新要的那条。大文件只读最后 32MB，几百毫秒，不挡界面。
-fn transcript_worker(ctx: Ctx, tx: Sender<Msg>) -> Sender<Entry> {
-    let (req, rx) = mpsc::channel::<Entry>();
-    thread::spawn(move || {
-        let sources = ctx.sources();
-        while let Ok(mut e) = rx.recv() {
-            while let Ok(newer) = rx.try_recv() {
-                e = newer;
-            }
-            let s = &e.session;
-            let t = sources
-                .as_ref()
-                .map_err(|err| io::Error::new(err.kind(), err.to_string()))
-                .and_then(|src| source_for(src, s.vendor)?.load_transcript(s))
-                .map_err(|err| err.to_string());
-            if tx
-                .send(Msg::Transcript(s.id.clone(), s.last_active, t))
-                .is_err()
-            {
-                return;
-            }
-        }
-    });
-    req
-}
-
-/// 实时预览：有目标时每 [`LIVE_EVERY`] 向守护进程取一次那条对话的屏幕，画面没变守护进程只回「没变」，
-/// 不发给界面；目标为 `None` 时阻塞等下一个目标，不碰守护进程。
-fn live_worker(dir: PathBuf, tx: Sender<Msg>) -> Sender<Option<SessionId>> {
-    let (req, rx) = mpsc::channel::<Option<SessionId>>();
-    thread::spawn(move || {
-        let mut target: Option<SessionId> = None;
-        // 上次发给界面的画面版本；`None` 表示还没发过或上次没取到。
-        let mut shown: Option<u64> = None;
-        let mut failed = false;
-        loop {
-            let next = match target {
-                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                Some(_) => rx.recv_timeout(LIVE_EVERY),
-            };
-            match next {
-                Ok(mut t) => {
-                    while let Ok(newer) = rx.try_recv() {
-                        t = newer;
-                    }
-                    if t != target {
-                        (target, shown, failed) = (t, None, false);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            let Some(id) = target.as_ref() else { continue };
-            let msg = match host::client::snapshot(&dir, id, shown) {
-                Ok(Snapshot::Unchanged) => continue,
-                Ok(Snapshot::Screen(s)) => {
-                    (shown, failed) = (Some(s.version), false);
-                    Msg::Live(id.clone(), Some(s))
-                }
-                // 取不到只告诉界面一次，之后照样定时再试（守护进程可能马上回来）。
-                Err(_) if failed => continue,
-                Err(_) => {
-                    (shown, failed) = (None, true);
-                    Msg::Live(id.clone(), None)
-                }
-            };
-            if tx.send(msg).is_err() {
-                return;
-            }
-        }
-    });
-    req
-}
-
-/// 额度：切到哪家就读哪家，之后每分钟重读当前那家。
-fn quota_worker(tx: Sender<Msg>) -> Sender<Vendor> {
-    let (req, rx) = mpsc::channel::<Vendor>();
-    thread::spawn(move || {
-        let Ok(mut current) = rx.recv() else {
-            return;
-        };
-        loop {
-            if tx.send(Msg::Quota(current, quota::quota(current))).is_err() {
-                return;
-            }
-            match rx.recv_timeout(QUOTA_EVERY) {
-                Ok(v) => current = v,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        }
-    });
-    req
-}
-
-/// 每 [`PROCS_EVERY`] 看一次本机进程，把参数里带着会话 id 的报上来；`ps` 跑不了这一轮就跳过。
-fn procs_worker(tx: Sender<Msg>) {
-    thread::spawn(move || {
-        loop {
-            if let Ok(out) = run_child(Process::new("/bin/ps").args(["-axww", "-o", "command="])) {
-                let ids = sources::live::session_ids(&out)
-                    .into_iter()
-                    .map(SessionId::from)
-                    .collect();
-                if tx.send(Msg::Procs(ids)).is_err() {
-                    return;
-                }
-            }
-            thread::sleep(PROCS_EVERY);
-        }
-    });
-}
-
-/// 告诉守护进程用户看过了哪条对话。守护进程没在跑就算了（它没在跑也就没有要提醒的）。
-fn seen_worker(dir: PathBuf) -> Sender<SessionId> {
-    let (req, rx) = mpsc::channel::<SessionId>();
-    thread::spawn(move || {
-        for id in rx {
-            let _ = host::client::request(&dir, &Request::Seen { id });
-        }
-    });
-    req
-}
-
-/// 以会话台身份订阅守护进程的状态事件和代弹提醒；守护进程没在跑就每隔一会儿再试。
-/// 守护进程是不认订阅的旧版时照样报「后台是旧版」，改为每隔 `HOSTED_POLL` 用 `List` 重读托管对话；
-/// 它的对话都结束后轮询停下，下一轮把它换成新版。
-/// 只有上一个守护进程留下了在跑记录（可能是断电、重启后第一次打开）时才主动拉起它，让它认出被中断的对话。
-fn host_watcher(ctx: Ctx, board: BoardInfo, away: Arc<Mutex<bool>>, tx: Sender<Msg>) {
-    thread::spawn(move || {
-        let dir = ctx.data_dir.clone();
-        let left = host::interrupt::load(&host::interrupt::running_path(&dir));
-        if left.is_ok_and(|l| !l.is_empty())
-            && let Err(e) = host::client::ensure_daemon(&dir, ctx_launch(&ctx.exe))
-        {
-            let _ = tx.send(Msg::Status(format!(
-                "守护进程没起来，认不出被中断的对话：{e}"
-            )));
-        }
-        loop {
-            let old = old_daemon(&ctx, &tx);
-            if let Ok(mut feed) = host::client::board_feed(&dir, board.clone(), HOSTED_POLL) {
-                if tx.send(Msg::OldHost(old || feed.polling())).is_err() {
-                    return;
-                }
-                if let Ok(Response::List(infos)) = host::client::request(&dir, &Request::List)
-                    && tx.send(Msg::Hosted(infos)).is_err()
-                {
-                    return;
-                }
-                if let Ok(list) = interrupted_list(&dir)
-                    && tx.send(Msg::Interrupted(list)).is_err()
-                {
-                    return;
-                }
-                while let Ok(Some(item)) = feed.recv() {
-                    let sent = match item {
-                        BoardItem::Event(ev) => pass_host_event(ev, &away, &tx, &system_alert),
-                        BoardItem::Hosted(infos) => tx.send(Msg::Hosted(infos)).map_err(|_| ()),
-                    };
-                    if sent.is_err() {
-                        return;
-                    }
-                }
-                if tx.send(Msg::HostGone).is_err() {
-                    return;
-                }
-            }
-            thread::sleep(HOST_RETRY);
-        }
-    });
-}
-
-/// 在跑的守护进程比当前程序旧吗。旧版且空着就顺手换成新版（换不成在底栏说一声）。没在跑算不旧。
-fn old_daemon(ctx: &Ctx, tx: &Sender<Msg>) -> bool {
-    match host::probe(&ctx.data_dir) {
-        Ok(info) if info.replaceable() => {
-            match host::ensure_daemon(&ctx.data_dir, ctx_launch(&ctx.exe)) {
-                Ok(info) => info.outdated(),
-                Err(e) => {
-                    let _ = tx.send(Msg::Status(format!("后台换新版没成功：{e}")));
-                    true
-                }
-            }
-        }
-        Ok(info) => info.outdated(),
-        Err(_) => false,
-    }
-}
-
-/// 托管事件交给主循环；会话台交出终端期间（`away`）主循环收不到，代弹提醒改交 `fallback`（系统通知）。
-/// 判断和转发持着同一把锁，`Loop::suspend` 置位后再清队列，两边不会漏掉或压住提醒。主循环没了返回错误。
-fn pass_host_event(
-    ev: HostEvent,
-    away: &Mutex<bool>,
-    tx: &Sender<Msg>,
-    fallback: &dyn Fn(Message),
-) -> Result<(), ()> {
-    let away = lock(away);
-    match ev {
-        HostEvent::Alert { title, body, .. } if *away => {
-            fallback(Message { title, body });
-            Ok(())
-        }
-        ev => tx.send(Msg::Host(ev)).map_err(|_| ()),
-    }
-}
-
-/// 系统通知，放到别的线程发（osascript 最多等 5 秒，不卡住调用方）。
-fn system_alert(msg: Message) {
-    thread::spawn(move || {
-        if let Err(e) = SystemNotifier.show(&msg) {
-            eprintln!("huitai: 系统通知没发出去: {e}");
-        }
-    });
-}
-
-/// 开标签页（已开着就切过去）；既没开出也没切到任何标签页、却失败了，就调 `undo` 撤掉为它做的准备，
-/// 并把撤销没成的原因接在错误后面。标签页开了、只是记录没存下的失败不撤：那个标签页里的 attach 还要用这条登记。
-fn open_or_undo(
-    tabs: io::Result<Tabs>,
-    opener: &dyn Opener,
-    id: &SessionId,
-    cmd: &Command,
-    title: &str,
-    undo: impl FnOnce() -> io::Result<()>,
-) -> io::Result<Outcome> {
-    let watched = Watched {
-        inner: opener,
-        reached: Cell::new(false),
-    };
-    let result = tabs.and_then(|mut t| t.open_or_focus(&watched, id, cmd, title));
-    let Err(e) = result else {
-        return result;
-    };
-    if watched.reached.get() {
-        return Err(e);
-    }
-    match undo() {
-        Ok(()) => Err(e),
-        Err(u) => Err(io::Error::new(
-            e.kind(),
-            format!("{e}（托管登记没撤掉：{u}）"),
-        )),
-    }
-}
-
-/// 记下有没有真的开出或切到一个标签页。
-struct Watched<'a> {
-    inner: &'a dyn Opener,
-    reached: Cell<bool>,
-}
-
-impl Opener for Watched<'_> {
-    fn open(&self, cmd: &Command, title: &str) -> io::Result<opener::Opened> {
-        let r = self.inner.open(cmd, title);
-        if r.is_ok() {
-            self.reached.set(true);
-        }
-        r
-    }
-
-    fn focus(&self, handle: &opener::TabHandle) -> io::Result<bool> {
-        let r = self.inner.focus(handle);
-        if matches!(r, Ok(true)) {
-            self.reached.set(true);
-        }
-        r
-    }
-}
-
-/// 开标签页、结束、回收站这类可能慢的动作，排队在一个线程里做，结果用一句话报回。
-fn job_worker(ctx: Ctx, index: Index, tx: Sender<Msg>) -> Sender<Job> {
-    let (req, rx) = mpsc::channel::<Job>();
-    thread::spawn(move || {
-        let opener = opener::opener_for(&ctx.terminal, |k| std::env::var(k).ok());
-        let mut worker = Worker {
-            ctx,
-            index,
-            opener,
-            tx,
-        };
-        for job in rx {
-            let msg = worker.run(job);
-            if worker.tx.send(msg).is_err() {
-                return;
-            }
-        }
-    });
-    req
-}
-
-struct Worker {
-    ctx: Ctx,
-    index: Index,
-    opener: Box<dyn Opener>,
-    tx: Sender<Msg>,
-}
-
-impl Worker {
-    fn tabs(&self) -> io::Result<Tabs> {
-        Tabs::load(&self.ctx.data_dir.join("tabs.json"))
-    }
-
-    fn run(&mut self, job: Job) -> Msg {
-        let result = match job {
-            Job::Git(dir) => {
-                let out = run_child(
-                    Process::new("git")
-                        .arg("-C")
-                        .arg(&dir)
-                        .args(["status", "--short"]),
-                )
-                .map_err(|e| e.to_string());
-                return Msg::Git(dir, out);
-            }
-            Job::Open(e) => self.open(&e),
-            Job::New(v, cwd) => self.new_session(v, &cwd),
-            Job::RestoreTabs => self.restore_tabs(),
-            Job::ResumeInterrupted(entries) => self.resume_interrupted(&entries),
-            Job::Dismiss(id) => self.dismiss(&[id]).map(|()| "已移出「被中断」".to_owned()),
-            Job::Restarted(id) => match self.dismiss_quietly(&[id]) {
-                Ok(list) => return Msg::Interrupted(list),
-                Err(e) => Err(e),
-            },
-            Job::Kill(id) => self.kill(&id),
-            Job::Trash(e) => self.trash(&e),
-            Job::Untrash(v) => self.untrash(v),
-            Job::Finder(dir) => {
-                run_child(Process::new("open").arg(&dir)).map(|_| "已在 Finder 打开".to_owned())
-            }
-            Job::Copy(e) => self.copy_resume(&e),
-        };
-        Msg::Status(result.unwrap_or_else(|e| format!("没做成：{e}")))
-    }
-
-    /// `c`：恢复命令（厂商 CLI 自己的，不经会话台托管）写进剪贴板。
-    fn copy_resume(&self, e: &Entry) -> io::Result<String> {
-        let s = &e.session;
-        let cmd = source_for(&self.ctx.sources()?, s.vendor)?.resume_cmd(s);
-        let home = &self.ctx.home;
-        let env = sources::env_prefix(&VendorDirs::from_env(home), s.vendor, home);
-        pbcopy(&resume_line(&cmd, &env))?;
-        Ok("已复制恢复命令".to_owned())
-    }
-
-    fn open(&self, e: &Entry) -> io::Result<String> {
-        let s = &e.session;
-        let (id, cmd, fresh) = attach_existing(&self.ctx, &self.ctx.sources()?, s)?;
-        let tab = opener::tab_title(s.vendor, &self.ctx.label(&s.cwd), Some(e.title()));
-        // 被中断的单条 ⏎ 只打开不发话；CLI 真起来了守护进程才把它移出被中断（见 `Loop::host_event`）。
-        let outcome = self.open_tab(&id, &cmd, &tab, fresh)?;
-        let title = truncate(e.title(), 24);
-        Ok(match outcome {
-            Outcome::Focused => format!("已切到「{title}」"),
-            Outcome::Opened => format!("已在新标签页打开「{title}」"),
-            Outcome::Inline => "已回到会话台".to_owned(),
-        })
-    }
-
-    fn new_session(&self, v: Vendor, cwd: &Path) -> io::Result<String> {
-        let existing = ids_in(&self.index, v, cwd);
-        let (id, cmd) = register_new(&self.ctx, &self.ctx.sources()?, v, cwd, existing)?;
-        let tab = opener::tab_title(v, &self.ctx.label(cwd), None);
-        self.open_tab(&id, &cmd, &tab, true)?;
-        Ok(format!("已在 {} 新开 {v} 对话", self.ctx.label(cwd)))
-    }
-
-    /// 把上次开着的标签全部重开。守护进程可能重启过，先把每条重新登记托管。
-    fn restore_tabs(&self) -> io::Result<String> {
-        let records = self.tabs()?.records().clone();
-        if records.is_empty() {
-            return Ok("没有记着的标签页".to_owned());
-        }
-        let sources = self.ctx.sources()?;
-        let hosted: HashSet<SessionId> = hosted_list(&self.ctx).into_iter().map(|h| h.id).collect();
-        for v in Vendor::ALL {
-            for e in self.index.list(v)? {
-                if records.contains_key(&e.session.id) {
-                    register_resume(&self.ctx, &sources, &e.session)?;
-                }
-            }
-        }
-        // 一条一条开，一条失败不影响别的；没开成的撤掉这次新登记的托管。
-        let failed = records
-            .iter()
-            .filter(|(id, rec)| {
-                let fresh = !hosted.contains(*id);
-                self.open_tab(id, &rec.command(), &rec.title, fresh)
-                    .is_err()
-            })
-            .count();
-        Ok(match failed {
-            0 => format!("已恢复 {} 个标签页", records.len()),
-            n => format!("恢复了 {} 个，{n} 个没打开", records.len() - n),
-        })
-    }
-
-    /// R：被中断的对话全部在新标签页重开，命令带那句「继续上次没做完的事……」。
-    /// 开了标签页不算恢复：CLI 真起来了，守护进程才把它移出被中断（见 `Loop::host_event`）；
-    /// attach 没接上、CLI 没起来的，留在被中断里还能再按 R。
-    fn resume_interrupted(&self, entries: &[Entry]) -> io::Result<String> {
-        let sources = self.ctx.sources()?;
-        let hosted: HashSet<SessionId> = hosted_list(&self.ctx).into_iter().map(|h| h.id).collect();
-        let mut opened = 0;
-        let mut failed = Vec::new();
-        for e in entries {
-            let s = &e.session;
-            let tab = opener::tab_title(s.vendor, &self.ctx.label(&s.cwd), Some(e.title()));
-            let result = register_continue(&self.ctx, &sources, s)
-                .and_then(|cmd| self.open_tab(&s.id, &cmd, &tab, !hosted.contains(&s.id)));
-            match result {
-                Ok(_) => opened += 1,
-                Err(err) => failed.push(format!("「{}」{err}", truncate(e.title(), 16))),
-            }
-        }
-        Ok(match failed.first() {
-            None => format!("已在 {opened} 个新标签页接着做"),
-            Some(first) => format!("接着做了 {opened} 个，{} 个没打开：{first}", failed.len()),
-        })
-    }
-
-    /// 开标签页（已开着就切过去）。`fresh`：这次才登记的托管；标签页没开成时撤掉它，
-    /// 不留一条永远没人来 attach 的登记（它会挡住旧守护进程换新版退出）。
-    fn open_tab(
-        &self,
-        id: &SessionId,
-        cmd: &Command,
-        title: &str,
-        fresh: bool,
-    ) -> io::Result<Outcome> {
-        open_or_undo(self.tabs(), self.opener.as_ref(), id, cmd, title, || {
-            if fresh {
-                self.cancel_unstarted(id)
-            } else {
-                Ok(())
-            }
-        })
-    }
-
-    /// 撤掉一条还没起过进程的托管登记；已经起了进程的（标签页其实开了、attach 接上了）不动。
-    fn cancel_unstarted(&self, id: &SessionId) -> io::Result<()> {
-        let unstarted = hosted_list(&self.ctx)
-            .iter()
-            .any(|h| h.id == *id && h.pid.is_none());
-        if !unstarted {
-            return Ok(());
-        }
-        lock(&self.ctx.known).remove(id);
-        match host::client::request(&self.ctx.data_dir, &Request::Kill { id: id.clone() })? {
-            Response::Ok => Ok(()),
-            Response::Error(e) => Err(io::Error::other(e)),
-            other => Err(io::Error::other(format!("守护进程回答不对：{other:?}"))),
-        }
-    }
-
-    /// 把这些对话（列表里的会话 id）移出被中断，再把最新的被中断列表报给界面。
-    fn dismiss(&self, ids: &[SessionId]) -> io::Result<()> {
-        let list = self.dismiss_quietly(ids)?;
-        let _ = self.tx.send(Msg::Interrupted(list));
-        Ok(())
-    }
-
-    /// 把这些对话（列表里的会话 id）移出被中断，返回最新的被中断列表。
-    fn dismiss_quietly(&self, ids: &[SessionId]) -> io::Result<Vec<RunRecord>> {
-        let host_ids: Vec<SessionId> = {
-            let map = lock(&self.ctx.interrupted);
-            ids.iter()
-                .map(|id| map.get(id).unwrap_or(id).clone())
-                .collect()
-        };
-        match host::client::request(&self.ctx.data_dir, &Request::Dismiss { ids: host_ids })? {
-            Response::Ok => {}
-            Response::Error(e) => return Err(io::Error::other(e)),
-            other => return Err(io::Error::other(format!("守护进程回答不对：{other:?}"))),
-        }
-        interrupted_list(&self.ctx.data_dir)
-    }
-
-    fn kill(&self, id: &SessionId) -> io::Result<String> {
-        match host::client::request(&self.ctx.data_dir, &Request::Kill { id: id.clone() })? {
-            Response::Ok => {
-                self.tabs()?.forget(id)?;
-                Ok("已结束后台进程".to_owned())
-            }
-            Response::Error(e) => Err(io::Error::other(e)),
-            other => Err(io::Error::other(format!("守护进程回答不对：{other:?}"))),
-        }
-    }
-
-    fn trash(&self, e: &Entry) -> io::Result<String> {
-        let sources = self.ctx.sources()?;
-        let entry = source_for(&sources, e.session.vendor)?.trash(&e.session)?;
-        self.relist(e.session.vendor);
-        let title = truncate(e.title(), 24);
-        Ok(if entry.hide_only {
-            format!("已隐藏「{title}」，u 恢复")
-        } else {
-            format!("「{title}」已进回收站，u 恢复")
-        })
-    }
-
-    /// 恢复这家最近进回收站的一条。
-    fn untrash(&self, v: Vendor) -> io::Result<String> {
-        let trash = Trash::default_location()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "取不到回收站位置"))?;
-        let Some(entry) = trash.list()?.into_iter().find(|t| t.vendor == v) else {
-            return Ok(format!("回收站里没有 {v} 的对话"));
-        };
-        let sources = self.ctx.sources()?;
-        source_for(&sources, v)?.restore(&entry)?;
-        self.relist(v);
-        let title = self
-            .index
-            .list(v)?
-            .into_iter()
-            .find(|e| e.session.id.as_str() == entry.id)
-            .map(|e| truncate(e.title(), 24))
-            .unwrap_or(entry.id);
-        Ok(format!("已恢复「{title}」"))
-    }
-
-    fn relist(&self, v: Vendor) {
-        self.index.refresh_vendor(v);
-        let _ = self.tx.send(Msg::Index(Update::Listed(v)));
-    }
-}
-
-/// 跑一个短命令拿标准输出，超时就杀掉。
-fn run_child(cmd: &mut Process) -> io::Result<String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let out = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("没有标准输出"))?;
-    let err = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("没有错误输出"))?;
-    // 另起线程读，输出多时不会把管道塞满卡住子进程。
-    let out = read_all(out);
-    let err = read_all(err);
-    let status = wait_child(&mut child)?;
-    let stdout = out.join().unwrap_or_default();
-    if status.success() {
-        return Ok(stdout);
-    }
-    let msg = err.join().unwrap_or_default();
-    Err(io::Error::other(
-        msg.lines().next().unwrap_or("命令失败").trim().to_owned(),
-    ))
-}
-
-/// 等子进程结束，超过 [`CHILD_TIMEOUT`] 就杀掉。
-fn wait_child(child: &mut std::process::Child) -> io::Result<std::process::ExitStatus> {
-    let deadline = Instant::now() + CHILD_TIMEOUT;
-    loop {
-        if let Some(st) = child.try_wait()? {
-            return Ok(st);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "超时"));
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// 把文字放进系统剪贴板。
-fn pbcopy(text: &str) -> io::Result<()> {
-    let mut child = Process::new("pbcopy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let written = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("没有标准输入"))
-        .and_then(|mut stdin| stdin.write_all(text.as_bytes()));
-    // 写完关掉标准输入（上面 take 出来的随闭包结束释放），pbcopy 读到结尾才退出。
-    let status = wait_child(&mut child)?;
-    written?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("pbcopy 失败"))
-    }
-}
-
-fn read_all(mut r: impl Read + Send + 'static) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut s = String::new();
-        let _ = r.read_to_string(&mut s);
-        s
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use super::jobs::{Worker, open_or_undo};
+    use super::workers::{Stamp, moment_due, pass_host_event, stamp};
     use super::*;
+    use crate::sources::codex::id_created as codex_id_created;
+    use crate::sources::{antigravity, created_at as id_created, hermes};
+    use crate::ui::claims::CLAIMS_FILE;
 
     fn base(program: &str) -> Command {
         Command {
@@ -1975,7 +1611,7 @@ mod tests {
         pass_host_event(alert("一"), &away, &tx, &fallback).unwrap();
         assert!(matches!(
             rx.try_recv(),
-            Ok(Msg::Host(HostEvent::Alert { .. }))
+            Ok(Msg::Host(HostEvent::Alert { .. }, _))
         ));
         assert!(lock(&fallen).is_empty());
 
@@ -1994,7 +1630,7 @@ mod tests {
         assert_eq!(*lock(&fallen), vec!["二".to_owned()]);
         assert!(matches!(
             rx.try_recv(),
-            Ok(Msg::Host(HostEvent::Bell { .. }))
+            Ok(Msg::Host(HostEvent::Bell { .. }, _))
         ));
         assert!(rx.try_recv().is_err());
 
@@ -2118,19 +1754,21 @@ mod tests {
             vendor: Vendor::Hermes,
             ..session(real, "/p/shop", 1_000_100)
         };
+        // 按时间对得上只算可能是它（没有证据不认领，见 `Claims`）。
         let alias = |h: HostedInfo| {
             hosted_alias(
                 &s,
                 std::slice::from_ref(&h),
                 &HashMap::new(),
-                &entries(std::slice::from_ref(&s)),
+                &Claims::default(),
+                &[],
             )
         };
         let temp = temp_at(created - Duration::from_secs(5));
-        assert_eq!(alias(temp.clone()), Hosted::Alias(temp.id));
-        // id 只到秒：同一秒里稍早一点新建的也认得出。
+        assert_eq!(alias(temp), Hosted::Ambiguous);
+        // id 只到秒：同一秒里稍早一点新建的也对得上。
         let same_second = temp_at(created + Duration::from_millis(500));
-        assert_eq!(alias(same_second.clone()), Hosted::Alias(same_second.id));
+        assert_eq!(alias(same_second), Hosted::Ambiguous);
         // 新建之前就有的不认。
         assert_eq!(
             alias(temp_at(created + Duration::from_secs(2))),
@@ -2174,16 +1812,119 @@ mod tests {
                 &s,
                 std::slice::from_ref(&h),
                 &HashMap::new(),
-                &entries(std::slice::from_ref(&s)),
+                &Claims::default(),
+                &[],
             )
         };
         let temp = temp_at(created - Duration::from_secs(3));
-        assert_eq!(alias(temp.clone()), Hosted::Alias(temp.id));
+        assert_eq!(alias(temp), Hosted::Ambiguous);
         // 新建之前就有的不认（精确到毫秒）。
         assert_eq!(
             alias(temp_at(created + Duration::from_millis(1))),
             Hosted::Own
         );
+    }
+
+    #[test]
+    fn moment_is_read_at_most_every_15s_and_only_when_the_file_changed() {
+        let t = Instant::now();
+        let a: Stamp = vec![Some((10, SystemTime::UNIX_EPOCH)), None];
+        let b: Stamp = vec![Some((20, SystemTime::UNIX_EPOCH)), None];
+        assert!(moment_due(None, &a, t), "没读过的马上读");
+        let last = (a.clone(), t);
+        assert!(
+            !moment_due(Some(&last), &a, t + MOMENT_EVERY * 4),
+            "文件没变不读"
+        );
+        assert!(
+            !moment_due(Some(&last), &b, t + Duration::from_secs(14)),
+            "变了也等满 15 秒"
+        );
+        assert!(moment_due(Some(&last), &b, t + MOMENT_EVERY));
+        // SQLite 几家写进 -wal 时主库不动，也算变了。
+        let wal: Stamp = vec![a[0], Some((4096, SystemTime::UNIX_EPOCH))];
+        assert!(moment_due(Some(&last), &wal, t + MOMENT_EVERY));
+        // 上次没读成记的是空版本：文件没变也过 15 秒再试。
+        let failed = (Stamp::new(), t);
+        assert!(!moment_due(Some(&failed), &a, t + Duration::from_secs(14)));
+        assert!(moment_due(Some(&failed), &a, t + MOMENT_EVERY));
+    }
+
+    #[test]
+    fn stamp_sees_wal_next_to_the_file() {
+        let dir = std::env::temp_dir().join(format!("huitai-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.db");
+        std::fs::write(&db, b"x").unwrap();
+        let before = stamp(&sources::with_wal(&db));
+        assert!(before[0].is_some() && before[1].is_none());
+        std::fs::write(dir.join("state.db-wal"), b"yy").unwrap();
+        assert_ne!(stamp(&sources::with_wal(&db)), before);
+        assert_eq!(
+            stamp(&sources::with_wal(&dir.join("gone.jsonl"))),
+            [None, None]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对话都在一个库里的几家：会话路径是空的（Hermes、OpenCode）或是产物目录（Antigravity），
+    /// 「此刻」要看库和它的 WAL 才知道有新回复。
+    #[test]
+    fn database_sessions_moment_follows_their_database() {
+        let dir = std::env::temp_dir().join(format!("huitai-moment-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let trash = || Trash::new(dir.join("trash"));
+        let cases: [(Box<dyn Source>, PathBuf, PathBuf); 3] = [
+            (
+                Box::new(sources::HermesSource::new(dir.join("hermes"), trash())),
+                dir.join("hermes/state.db"),
+                PathBuf::new(),
+            ),
+            (
+                Box::new(sources::OpenCodeSource::new(
+                    dir.join("opencode/opencode.db"),
+                    trash(),
+                )),
+                dir.join("opencode/opencode.db"),
+                PathBuf::new(),
+            ),
+            (
+                Box::new(sources::AntigravitySource::new(dir.join("agy"), trash())),
+                dir.join(format!("agy/{}", antigravity::SUMMARIES_DB)),
+                dir.join("agy/brain/c1"),
+            ),
+        ];
+        for (src, db, path) in cases {
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            std::fs::write(&db, b"x").unwrap();
+            if !path.as_os_str().is_empty() {
+                std::fs::create_dir_all(&path).unwrap();
+            }
+            let session = Session {
+                vendor: src.vendor(),
+                id: SessionId::from("c1"),
+                cwd: PathBuf::from("/p"),
+                path,
+                title: None,
+                git_branch: None,
+                last_active: SystemTime::UNIX_EPOCH,
+                message_count: 1,
+                automatic: false,
+                account: String::new(),
+            };
+            let t = Instant::now();
+            let last = (stamp(&src.moment_files(&session)), t);
+            let mut wal = db.into_os_string();
+            wal.push("-wal");
+            std::fs::write(&wal, b"new reply").unwrap();
+            let now = stamp(&src.moment_files(&session));
+            assert!(
+                moment_due(Some(&last), &now, t + MOMENT_EVERY),
+                "{}：库的 WAL 写了新回复要重读",
+                src.vendor()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2216,6 +1957,7 @@ mod tests {
             last_active: at(last),
             message_count: 1,
             automatic: false,
+            account: String::new(),
         }
     }
 
@@ -2263,12 +2005,28 @@ mod tests {
         let none = HashMap::new();
         let real = session(&v7(1_000_050, 1), "/p/shop", 1_000_100);
         let alias = |s: &Session, h: &[HostedInfo], known: &HashMap<SessionId, NewSession>| {
-            hosted_alias(s, h, known, &entries(std::slice::from_ref(s)))
+            hosted_alias(s, h, known, &Claims::default(), &[])
         };
-        // 新建之后才生成的同项目对话：接到临时 id 那个进程上。
+        // 新建之后才生成的同项目对话：可能是它，没认领前谁也不接。
+        assert_eq!(alias(&real, &h, &none), Hosted::Ambiguous);
+        // 认领过、认领时的进程还在：接到临时 id 那个进程上。
+        let claimed = |pid| {
+            Claims::restore(HashMap::from([(
+                SessionId::from(TEMP),
+                Bound {
+                    real: real.id.clone(),
+                    pid,
+                },
+            )]))
+        };
         assert_eq!(
-            alias(&real, &h, &none),
+            hosted_alias(&real, &h, &none, &claimed(42), &[]),
             Hosted::Alias(SessionId::from(TEMP))
+        );
+        // 临时 id 下已经换了个进程（CLI 退出后又接上，起的是新对话）：认领不算数，也不能当成它自己。
+        assert_eq!(
+            hosted_alias(&real, &h, &none, &claimed(7), &[]),
+            Hosted::Ambiguous
         );
         // 别的项目的、临时对话已经退出的、id 看不出生成时间的：都是它自己。
         let blog = session(&v7(1_000_050, 1), "/p/blog", 1_000_100);
@@ -2299,6 +2057,86 @@ mod tests {
         assert_eq!(alias(&real, &own, &none), Hosted::Own);
     }
 
+    /// 恢复/新建命令前带的目录变量：非默认账号带自己的目录；默认账号只有一个账号时不带，几个账号时清掉变量。
+    #[test]
+    fn env_prefix_follows_the_account_in_the_id() {
+        let home = Path::new("/h");
+        let default = Account::new(Vendor::Codex, "默认", PathBuf::from("/h/.codex"), home);
+        let work = Account::new(
+            Vendor::Codex,
+            "工作号",
+            PathBuf::from("/h/codex work"),
+            home,
+        );
+        let claude = Account::new(Vendor::Claude, "默认", PathBuf::from("/h/.claude"), home);
+        let all = [default.clone(), work.clone(), claude];
+        assert_eq!(
+            env_prefix_of(&all, Vendor::Codex, &work.key, home),
+            "CODEX_HOME='/h/codex work' "
+        );
+        assert_eq!(
+            env_prefix_of(&all, Vendor::Codex, "", home),
+            "env -u CODEX_HOME "
+        );
+        assert_eq!(env_prefix_of(&all, Vendor::Claude, "", home), "");
+        // 账号在设置里删掉了：按默认账号算。
+        assert_eq!(
+            env_prefix_of(&[default], Vendor::Codex, &work.key, home),
+            ""
+        );
+        // 改目录的变量不止一个的（OpenCode）：默认账号全清掉（继承的 XDG_DATA_HOME 不能把它带走）。
+        let two = |vendor: Vendor, other: &str| {
+            let default = crate::core::VendorDirs::defaults(home)
+                .dir(vendor)
+                .to_path_buf();
+            [
+                Account::new(vendor, "默认", default, home),
+                Account::new(vendor, "别处", PathBuf::from(other), home),
+            ]
+        };
+        assert_eq!(
+            env_prefix_of(
+                &two(Vendor::OpenCode, "/x/opencode/opencode.db"),
+                Vendor::OpenCode,
+                "",
+                home
+            ),
+            "env -u OPENCODE_DB -u XDG_DATA_HOME "
+        );
+    }
+
+    /// DECISIONS「Codex 第三轮审计第 1 条」：两个账号（两个 `CODEX_HOME`）同一时刻在同一项目各自新建，
+    /// 临时 id 带着账号前缀不撞；每条真实对话只认回自己账号的那个临时 id。
+    #[test]
+    fn temp_ids_of_two_accounts_only_map_back_within_their_account() {
+        let other = "0123abcd";
+        let temp_b = format!("{other}:{TEMP}");
+        let h = [
+            hosted(TEMP, "/p/shop", true),
+            hosted(&temp_b, "/p/shop", true),
+        ];
+        let none = HashMap::new();
+        let real_a = session(&v7(1_000_050, 1), "/p/shop", 1_000_100);
+        let mut real_b = session(
+            &format!("{other}:{}", v7(1_000_051, 2)),
+            "/p/shop",
+            1_000_100,
+        );
+        real_b.account = other.to_owned();
+        let both = entries(&[real_a.clone(), real_b.clone()]);
+        assert_eq!(
+            time_pairs(&both, &h, &none, |_| false),
+            vec![
+                (real_a.id.clone(), SessionId::from(TEMP)),
+                (real_b.id.clone(), SessionId::from(temp_b.as_str())),
+            ]
+        );
+        assert_eq!(
+            temp_started(&SessionId::from(temp_b.as_str())),
+            temp_started(&SessionId::from(TEMP))
+        );
+    }
+
     /// 审计第 1 条：会话台重开后不知道新建那一刻已有哪些对话，同项目的旧对话在新建之后又在别处聊过，
     /// 不能被认成临时 id 那条（以前按「之后有动静」认，会接到新建的那个进程上）。
     #[test]
@@ -2309,29 +2147,19 @@ mod tests {
         let real = session(&v7(1_000_050, 2), "/p/shop", 1_000_100);
         // 新建那条还没进列表时：旧对话是它自己。
         let only_old = entries(std::slice::from_ref(&old));
-        assert_eq!(hosted_alias(&old, &h, &none, &only_old), Hosted::Own);
-        // 都在列表里：旧对话还是它自己，新建那条认回临时 id。
+        let empty = Claims::default();
+        assert_eq!(hosted_alias(&old, &h, &none, &empty, &[]), Hosted::Own);
+        assert!(time_pairs(&only_old, &h, &none, |_| false).is_empty());
+        // 都在列表里：旧对话还是它自己，只有新建那条可能是临时 id 那条。
         let both = entries(&[old.clone(), real.clone()]);
-        assert_eq!(hosted_alias(&old, &h, &none, &both), Hosted::Own);
+        assert_eq!(hosted_alias(&old, &h, &none, &empty, &[]), Hosted::Own);
         assert_eq!(
-            hosted_alias(&real, &h, &none, &both),
-            Hosted::Alias(SessionId::from(TEMP))
+            hosted_alias(&real, &h, &none, &empty, &[]),
+            Hosted::Ambiguous
         );
         assert_eq!(
-            aliased(
-                Vendor::Codex,
-                &both,
-                &HashMap::from([(
-                    SessionId::from(TEMP),
-                    NewSession {
-                        vendor: Vendor::Codex,
-                        cwd: PathBuf::from("/p/shop"),
-                        existing: HashSet::new(),
-                    }
-                )]),
-                |_| true
-            ),
-            HashSet::from([real.id.clone()])
+            time_pairs(&both, &h, &none, |_| false),
+            vec![(real.id.clone(), SessionId::from(TEMP))]
         );
     }
 
@@ -2343,16 +2171,14 @@ mod tests {
         let b = session(&v7(1_000_070, 2), "/p/shop", 1_000_100);
         let list = entries(&[a.clone(), b.clone()]);
         let none = HashMap::new();
-        assert_eq!(hosted_alias(&a, &h, &none, &list), Hosted::Ambiguous);
-        assert_eq!(hosted_alias(&b, &h, &none, &list), Hosted::Ambiguous);
+        let empty = Claims::default();
+        assert_eq!(hosted_alias(&a, &h, &none, &empty, &[]), Hosted::Ambiguous);
+        assert_eq!(hosted_alias(&b, &h, &none, &empty, &[]), Hosted::Ambiguous);
+        assert_eq!(time_pairs(&list, &h, &none, |_| false).len(), 2);
         // 另一条托管在它自己的 id 下（肯定不是临时 id 那条）：不算对手。
-        let h2 = [
-            hosted(TEMP, "/p/shop", true),
-            hosted(b.id.as_str(), "/p/shop", true),
-        ];
         assert_eq!(
-            hosted_alias(&a, &h2, &none, &list),
-            Hosted::Alias(SessionId::from(TEMP))
+            time_pairs(&list, &h, &none, |id| *id == b.id),
+            vec![(a.id.clone(), SessionId::from(TEMP))]
         );
     }
 
@@ -2363,9 +2189,8 @@ mod tests {
             hosted("new-codex-1000020000", "/p/shop", true),
         ];
         let real = session(&v7(1_000_050, 1), "/p/shop", 1_000_100);
-        let list = entries(std::slice::from_ref(&real));
         assert_eq!(
-            hosted_alias(&real, &h, &HashMap::new(), &list),
+            hosted_alias(&real, &h, &HashMap::new(), &Claims::default(), &[]),
             Hosted::Ambiguous
         );
     }
@@ -2389,13 +2214,15 @@ mod tests {
             session(&v7(1_000_050, 3), "/p/blog", 1_000_100),
             session(&v7(999_000, 4), "/p/shop", 1_000_100),
         ]);
-        // 临时 id 那个进程在跑：新建之后才生成、同项目、新建时还没有的那条是它。
+        // 临时 id 那个进程在跑：新建之后才生成、同项目、新建时还没有的那条可能是它。
+        let running = [hosted(TEMP, "/p/shop", true)];
         assert_eq!(
-            aliased(Vendor::Codex, &list, &known, |id| *id == temp),
-            HashSet::from([SessionId::from(real.as_str())])
+            time_pairs(&list, &running, &known, |_| false),
+            vec![(SessionId::from(real.as_str()), temp)]
         );
         // 进程退出了：谁也不是。
-        assert!(aliased(Vendor::Codex, &list, &known, |_| false).is_empty());
+        let stopped = [hosted(TEMP, "/p/shop", false)];
+        assert!(time_pairs(&list, &stopped, &known, |_| false).is_empty());
     }
 
     fn record(id: &str, vendor: Vendor, cwd: &str) -> RunRecord {
@@ -2406,6 +2233,22 @@ mod tests {
             cwd: PathBuf::from(cwd),
             started_at: 1_000_000,
         }
+    }
+
+    /// 临时 id → 认领到的那条（进程号随便，中断恢复不看进程号）。
+    fn bound(pairs: &[(&str, &str)]) -> HashMap<SessionId, Bound> {
+        pairs
+            .iter()
+            .map(|(temp, real)| {
+                (
+                    SessionId::from(*temp),
+                    Bound {
+                        real: SessionId::from(*real),
+                        pid: 42,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn entries(list: &[Session]) -> Vec<Entry> {
@@ -2429,15 +2272,21 @@ mod tests {
         let records = [
             // 本来就是真实 id 的：原样对上。
             record("plain", Vendor::Codex, "/p/blog"),
-            // 会话台新建的 Codex 对话（临时 id）：认回同项目、之后才生成的那条。
+            // 会话台新建的 Codex 对话（临时 id）：认回它认领过的那条。
             record(TEMP, Vendor::Codex, "/p/shop"),
             // 列表里没有这条（从没写出会话文件）：不列。
             record("ghost", Vendor::Codex, "/p/shop"),
         ];
-        let map = resolve_interrupted(&records, |v| match v {
+        let lists = |v| match v {
             Vendor::Codex => codex.as_slice(),
             _ => &[],
-        });
+        };
+        // 没认领过：光按时间对得上（同项目、之后才生成的只有一条）也不列（审计 01）。
+        assert_eq!(
+            resolve_interrupted(&records, lists, &HashMap::new()),
+            HashMap::from([(SessionId::from("plain"), SessionId::from("plain"))])
+        );
+        let map = resolve_interrupted(&records, lists, &bound(&[(TEMP, &real)]));
         assert_eq!(
             map,
             HashMap::from([
@@ -2451,9 +2300,14 @@ mod tests {
     /// 不能被当成它列进被中断，否则 R 会把「继续」发给那条旧对话。
     #[test]
     fn old_conversation_is_not_taken_for_an_interrupted_new_one() {
-        let codex = entries(&[session(&v7(999_000, 1), "/p/shop", 1_000_200)]);
+        let old = v7(999_000, 1);
+        let codex = entries(&[session(&old, "/p/shop", 1_000_200)]);
         let records = [record(TEMP, Vendor::Codex, "/p/shop")];
-        assert!(resolve_interrupted(&records, |_| codex.as_slice()).is_empty());
+        assert!(resolve_interrupted(&records, |_| codex.as_slice(), &HashMap::new()).is_empty());
+        // 认领记录写错了（指着新建之前就有的对话）也不认。
+        assert!(
+            resolve_interrupted(&records, |_| codex.as_slice(), &bound(&[(TEMP, &old)])).is_empty()
+        );
     }
 
     #[test]
@@ -2463,7 +2317,7 @@ mod tests {
             session(&v7(1_000_060, 2), "/p/shop", 1_000_200),
         ]);
         let records = [record(TEMP, Vendor::Codex, "/p/shop")];
-        assert!(resolve_interrupted(&records, |_| codex.as_slice()).is_empty());
+        assert!(resolve_interrupted(&records, |_| codex.as_slice(), &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -2477,20 +2331,193 @@ mod tests {
         ]);
         let mut r = record(TEMP, Vendor::Codex, "/p/shop");
         r.started_at = 1_000_400;
+        let records = [r];
         assert_eq!(
-            resolve_interrupted(&[r], |_| codex.as_slice()),
+            resolve_interrupted(&records, |_| codex.as_slice(), &bound(&[(TEMP, &latest)])),
             HashMap::from([(SessionId::from(latest.as_str()), SessionId::from(TEMP))])
+        );
+        // 认领的还是上一次跑的那条（换进程时会话台没开着）：不认。
+        assert!(
+            resolve_interrupted(&records, |_| codex.as_slice(), &bound(&[(TEMP, &earlier)]))
+                .is_empty()
         );
     }
 
     #[test]
     fn one_entry_claimed_by_two_interrupted_records_is_not_listed() {
-        let codex = entries(&[session(&v7(1_000_050, 1), "/p/shop", 1_000_100)]);
+        let real = v7(1_000_050, 1);
+        let codex = entries(&[session(&real, "/p/shop", 1_000_100)]);
+        let other = "new-codex-1000010000";
         let records = [
             record(TEMP, Vendor::Codex, "/p/shop"),
-            record("new-codex-1000010000", Vendor::Codex, "/p/shop"),
+            record(other, Vendor::Codex, "/p/shop"),
         ];
-        assert!(resolve_interrupted(&records, |_| codex.as_slice()).is_empty());
+        let both = bound(&[(TEMP, &real), (other, &real)]);
+        assert!(resolve_interrupted(&records, |_| codex.as_slice(), &both).is_empty());
+    }
+
+    /// 工作账号（短名 `0badcafe`）下原生 id 是 `native` 的对话。
+    fn in_work(native: &str, cwd: &str) -> Session {
+        in_account("0badcafe", native, cwd)
+    }
+
+    fn in_account(key: &str, native: &str, cwd: &str) -> Session {
+        let mut s = session(&format!("{key}:{native}"), cwd, 1_000_100);
+        s.account = key.to_owned();
+        s
+    }
+
+    /// 审计 v0.1.4 第 7 条：v0.1.3 在自定义目录（现在的工作账号）下托管的对话记的是原生 id，新版列表里它带了账号前缀。
+    /// 回车要接到那个还在跑的进程上，不再起第二个 CLI；两个工作账号里同项目都有这个 id 时认不准，两条都不接。
+    /// 默认账号有这个 id 时照旧是默认账号那条（新版托管默认账号的对话也记原生 id）。
+    #[test]
+    fn native_id_hosted_by_v013_maps_to_the_prefixed_entry() {
+        let none = HashMap::new();
+        let claims = Claims::default();
+        let h = [hosted("x-1", "/p/shop", true)];
+        let work = in_work("x-1", "/p/shop");
+        let listed = entries(&[work.clone(), session("other", "/p/shop", 5)]);
+        assert_eq!(
+            hosted_alias(&work, &h, &none, &claims, &listed),
+            Hosted::Alias(SessionId::from("x-1"))
+        );
+        // 别的项目里的同名对话不是它。
+        let elsewhere = in_work("x-1", "/p/blog");
+        let listed = entries(std::slice::from_ref(&elsewhere));
+        assert_eq!(
+            hosted_alias(&elsewhere, &h, &none, &claims, &listed),
+            Hosted::Own
+        );
+        // 两个工作账号同项目都有这个 id（默认账号没有）：哪条都认不准，不接也不另起。
+        let other = in_account("0deadbee", "x-1", "/p/shop");
+        let listed = entries(&[work.clone(), other.clone()]);
+        assert_eq!(
+            hosted_alias(&work, &h, &none, &claims, &listed),
+            Hosted::Ambiguous
+        );
+        assert_eq!(
+            hosted_alias(&other, &h, &none, &claims, &listed),
+            Hosted::Ambiguous
+        );
+        // 新版托管的默认账号对话（原生 id），工作账号里同项目有同 id 的副本：默认账号那条是它自己，
+        // 工作账号那条没托管，各开各的（和改之前一样）。
+        let default = session("x-1", "/p/shop", 1_000_100);
+        let listed = entries(&[default.clone(), work.clone()]);
+        assert_eq!(
+            hosted_alias(&default, &h, &none, &claims, &listed),
+            Hosted::Own
+        );
+        assert_eq!(
+            hosted_alias(&work, &h, &none, &claims, &listed),
+            Hosted::Own
+        );
+        // 只在别的项目有同名的另一条：同项目那条就是它。
+        let far = in_work("x-1", "/p/blog");
+        let listed = entries(&[default.clone(), far.clone()]);
+        assert_eq!(
+            hosted_alias(&default, &h, &none, &claims, &listed),
+            Hosted::Own
+        );
+        assert_eq!(hosted_alias(&far, &h, &none, &claims, &listed), Hosted::Own);
+        // 新版托管的工作账号那条（带前缀的 id）是它自己，默认账号那条照旧是原生 id 那个。
+        let both = [
+            hosted("x-1", "/p/shop", true),
+            hosted("0badcafe:x-1", "/p/shop", true),
+        ];
+        let listed = entries(&[default.clone(), work.clone()]);
+        assert_eq!(
+            hosted_alias(&work, &both, &none, &claims, &listed),
+            Hosted::Own
+        );
+        assert_eq!(
+            hosted_alias(&default, &both, &none, &claims, &listed),
+            Hosted::Own
+        );
+    }
+
+    /// 审计 v0.1.4 第 7 条（中断记录那半）：v0.1.3 记的原生 id 对到工作账号那条带前缀的；对不上唯一一条不列。
+    #[test]
+    fn native_id_interrupted_by_v013_maps_to_the_prefixed_entry() {
+        let work = in_work("x-1", "/p/shop");
+        let records = [record("x-1", Vendor::Codex, "/p/shop")];
+        let codex = entries(std::slice::from_ref(&work));
+        assert_eq!(
+            resolve_interrupted(&records, |_| codex.as_slice(), &HashMap::new()),
+            HashMap::from([(work.id.clone(), SessionId::from("x-1"))])
+        );
+        // 两个工作账号同项目都有：对不上唯一一条，不列。
+        let codex = entries(&[work.clone(), in_account("0deadbee", "x-1", "/p/shop")]);
+        assert!(resolve_interrupted(&records, |_| codex.as_slice(), &HashMap::new()).is_empty());
+        // 默认账号有这个 id：是默认账号那条（和改之前一样）。
+        let codex = entries(&[session("x-1", "/p/shop", 1_000_100), work.clone()]);
+        assert_eq!(
+            resolve_interrupted(&records, |_| codex.as_slice(), &HashMap::new()),
+            HashMap::from([(SessionId::from("x-1"), SessionId::from("x-1"))])
+        );
+        // 工作账号那条自己另有（新版的）记录：原生 id 的记录是默认账号那条的。
+        let records = [
+            record("x-1", Vendor::Codex, "/p/shop"),
+            record("0badcafe:x-1", Vendor::Codex, "/p/shop"),
+        ];
+        assert_eq!(
+            resolve_interrupted(&records, |_| codex.as_slice(), &HashMap::new()),
+            HashMap::from([
+                (SessionId::from("x-1"), SessionId::from("x-1")),
+                (work.id.clone(), work.id.clone()),
+            ])
+        );
+    }
+
+    /// 第 `n` 条认领：临时 id 的新建时间在 `ms` 之前（新建在将来的记录读的时候会扔掉）。
+    fn claim_at(ms: u128, n: usize) -> (SessionId, Bound) {
+        (
+            SessionId::from(format!("new-codex-{}", ms - 10_000 + n as u128)),
+            Bound {
+                real: SessionId::from(format!("real-{n}")),
+                pid: 42,
+            },
+        )
+    }
+
+    /// 审计 v0.1.4 第 12 条：几个会话台同时各存各的认领，一条都不丢；旧记录读不出来就报错、原文件不动。
+    #[test]
+    fn concurrent_claim_saves_keep_every_entry_and_bad_file_is_not_overwritten() {
+        let dir = tabs_dir("claims-lock");
+        let ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let writers: Vec<_> = (0..8)
+            .map(|w| {
+                let dir = dir.clone();
+                thread::spawn(move || {
+                    for i in 0..20 {
+                        let (temp, b) = claim_at(ms, w * 20 + i);
+                        let bound = HashMap::from([(temp.clone(), b)]);
+                        save_claims(&dir, &[temp], &bound).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let all = load_claims(&dir, SystemTime::now()).unwrap();
+        assert_eq!(all.len(), 160, "丢了认领");
+
+        std::fs::write(dir.join(CLAIMS_FILE), "{坏了").unwrap();
+        let (temp, b) = claim_at(ms, 999);
+        let err = save_claims(
+            &dir,
+            std::slice::from_ref(&temp),
+            &HashMap::from([(temp.clone(), b)]),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(CLAIMS_FILE)).unwrap(),
+            "{坏了"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 假终端：`open` 按 `fail` 成败，`focus` 一律说标签页不在了。
@@ -2675,5 +2702,59 @@ mod tests {
         // 标签页「开了」，但没有 attach 来、CLI 没起来：还在被中断里。
         assert_eq!(interrupted_list(&dir).unwrap(), vec![rec]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审计 v0.1.3 第 04 条：Kimi 带不进话、OpenCode 1.x 只填进输入框，不能算进「已在 N 个新标签页接着做」。
+    #[test]
+    fn resume_reports_what_each_vendor_did_with_the_message() {
+        let dir = PathBuf::from(format!("/tmp/htr-{}-deliver", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = worker_in(&dir, false);
+        let with = |vendor: Vendor, id: &str| {
+            let mut e = pi_entry(id, &dir);
+            e.session.vendor = vendor;
+            e
+        };
+        let msg = w
+            .resume_interrupted(&[
+                pi_entry("p1", &dir),
+                with(Vendor::Kimi, "session_k1"),
+                // 测试里没有 OpenCode 的库：认不出是 2.x，按 1.x 报要按回车。
+                with(Vendor::OpenCode, "ses_e113ed23fffeV2onlyAbCdEfGh"),
+            ])
+            .unwrap();
+        assert_eq!(
+            msg,
+            "开了 3 个新标签页：1 个接着做了，1 个话已填好、要按回车（OpenCode），\
+             1 个带不进话、要自己输入（Kimi Code）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_report_wording() {
+        use Delivery::{Manual, Sent, Typed};
+        let fail = vec!["「修登录」开不了".to_owned()];
+        assert_eq!(
+            resume_report(&[(Vendor::Claude, Sent)], &[]),
+            "已在 1 个新标签页接着做"
+        );
+        assert_eq!(
+            resume_report(&[(Vendor::Claude, Sent)], &fail),
+            "接着做了 1 个，1 个没打开：「修登录」开不了"
+        );
+        assert_eq!(
+            resume_report(&[(Vendor::Kimi, Manual), (Vendor::Kimi, Manual)], &[]),
+            "开了 2 个新标签页：2 个带不进话、要自己输入（Kimi Code）"
+        );
+        assert_eq!(
+            resume_report(&[(Vendor::OpenCode, Typed)], &fail),
+            "开了 1 个新标签页：1 个话已填好、要按回车（OpenCode），1 个没打开：「修登录」开不了"
+        );
+        assert_eq!(
+            resume_report(&[], &fail),
+            "接着做了 0 个，1 个没打开：「修登录」开不了"
+        );
     }
 }

@@ -2,11 +2,15 @@
 //! `sessions` 一行一条对话，`messages` 一行一条消息（`role` 为 user/assistant/tool，助手的工具调用在 `tool_calls`）。
 //! 表结构以上游 `persistence/sqlite/_schema_ddl.py`（v33）为准，变得快，取列宽松：先查有哪些列，只取有的。
 //!
-//! - 只读打开（`sqlite3 -readonly`，带 busy 超时，见 `sqlite`），从不写库。
+//! - 只读打开（带等锁和查询超时，见 `sqlite`），从不写库。
 //! - 只列本机终端里开的对话：来源取 `COALESCE(created_source, source)`（gateway 把本机各入口改记成 `local`，
 //!   真正的入口在 `created_source`），`cli`、`tui`、`desktop`、`acp`、`local` 算；Telegram、Discord 等消息平台、
 //!   子代理（`subagent`）不列。`tool`、`oneshot`（`hermes chat -q` 一次性跑）和 `cron` 算自动运行。
 //! - Hermes 自己归档、隐藏的不列；压缩后另起一行续写的，只列最新那行（`-r` 接着聊的也是它）。
+//! - 消息按 Hermes 自己历史界面的规则取（见 [`Display`]）：压缩时归档的原话照样显示、可搜，只给模型看的不显示，
+//!   压缩复制出来的同一条消息只算一次；带图片的消息只取文字（见 [`TEXT_SQL`]）。
+//! - 时间超出合理范围的（坏库、导入的）在 SQL 里就当没有（见 [`time_sql`]）。
+//! - 正文修订号（`transcript_revision`，原地改正文时上游触发器加一）交给索引（[`Scan::revisions`]）。
 //! - 项目目录取 `cwd`，空的退用 `git_repo_root`。
 //! - 恢复 `hermes -r <id>`（它自己 cd 回记录的目录）；新建 `hermes --in <目录>`，定不了 id。
 //! - 删除只隐藏（对话在 Hermes 自己的库里，和 Codex 一样）。
@@ -19,7 +23,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use super::jsonl;
-use super::sqlite::{self, Row};
+use super::sqlite::{self, Row, secs, str_col};
 use super::{
     Command, Part, PreviewMessage, Role, Scan, Source, Transcript, Trash, TrashEntry, transcript,
 };
@@ -33,8 +37,28 @@ const LOCAL_SOURCES: [&str; 6] = ["cli", "tui", "desktop", "gui", "acp", "local"
 /// 自动运行的来源：第三方集成、一次性跑、定时任务。
 const AUTO_SOURCES: [&str; 3] = ["tool", "oneshot", "cron"];
 
+/// Hermes 存时间的合理范围（秒），同上游 `rules.EPOCH_MIN..EPOCH_MAX`。
+const EPOCH_MAX: f64 = 4_200_000_000.0;
+
+/// `sessions` 表里存时间的列。
+const SESSION_TIMES: [&str; 2] = ["started_at", "last_activity_at"];
+
+/// 消息正文取成文字。Hermes 把多模态内容（文字加图片）存成 `\0json:` 前缀加 JSON（上游 `_encode_content`），
+/// SQLite 的文本函数（`length`、`substr`、`like`）在 NUL 处截断，所以按字节认前缀，在库里只取文字块（图片的
+/// base64 不读出库）；前缀后是 JSON 字符串的（字面带这个前缀的文字被上游包了一层）取字符串本身，不是合法 JSON 的照上游
+/// 原样返回。没有前缀的原样返回（老版本直接存的 `[{type:"text"…}]` 由 [`message_text`] 解）。表别名 `m`。
+const TEXT_SQL: &str = "(case when substr(cast(m.content as blob), 1, 6) = x'006a736f6e3a' then (\
+     select case \
+       when not json_valid(j) then j \
+       when json_type(j) = 'array' then (select group_concat(json_extract(e.value, '$.text'), char(10)) \
+         from json_each(j) as e where e.type = 'object' \
+         and json_extract(e.value, '$.type') in ('text', 'input_text', 'output_text')) \
+       when json_type(j) = 'text' then json_extract(j, '$') \
+     end from (select cast(substr(cast(m.content as blob), 7) as text) as j)) \
+   else m.content end)";
+
 /// `sessions` 表里要用到的列（有哪个取哪个）。
-const SESSION_COLUMNS: [&str; 13] = [
+const SESSION_COLUMNS: [&str; 14] = [
     "id",
     "source",
     "created_source",
@@ -48,6 +72,7 @@ const SESSION_COLUMNS: [&str; 13] = [
     "parent_session_id",
     "archived",
     "hidden",
+    "transcript_revision",
 ];
 
 pub struct HermesSource {
@@ -68,28 +93,17 @@ impl HermesSource {
         self.root.join("state.db")
     }
 
-    /// 这张表现在有哪些列。
     fn columns(&self, table: &str) -> io::Result<HashSet<String>> {
-        let rows = sqlite::query(
-            &self.db(),
-            &format!("select name from pragma_table_info('{table}')"),
-        )?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| r.get("name")?.as_str().map(str::to_owned))
-            .collect())
+        sqlite::columns(&self.db(), table)
     }
 
-    /// 只算还有效的消息：被回退（`/rewind`）的消息 `active = 0`，没有这一列的老库都算。
-    fn active_filter(&self) -> io::Result<&'static str> {
-        Ok(if self.columns("messages")?.contains("active") {
-            " and active = 1"
-        } else {
-            ""
-        })
+    /// 按 `messages` 表现有的列定怎么认看得见的消息。
+    fn display(&self) -> io::Result<Display> {
+        Ok(Display::new(&self.columns("messages")?))
     }
 
-    fn list(&self) -> io::Result<Vec<Session>> {
+    /// 列出对话，和各条的正文修订号（库里有这一列时）。
+    fn list(&self) -> io::Result<(Vec<Session>, HashMap<String, u64>)> {
         let have = self.columns("sessions")?;
         if !have.contains("id") {
             return Err(io::Error::new(
@@ -97,18 +111,26 @@ impl HermesSource {
                 "sessions 表没有 id 列，不认得这个库",
             ));
         }
-        let cols: Vec<&str> = SESSION_COLUMNS
+        let cols: Vec<String> = SESSION_COLUMNS
             .into_iter()
             .filter(|c| have.contains(*c))
+            .map(|c| {
+                if SESSION_TIMES.contains(&c) {
+                    format!("{} as {c}", time_sql(c))
+                } else {
+                    c.to_owned()
+                }
+            })
             .collect();
         let db = self.db();
         let rows = sqlite::query(&db, &format!("select {} from sessions", cols.join(", ")))?;
-        let active = self.active_filter()?;
+        let Display { filter, slot, .. } = self.display()?;
         let stats: HashMap<String, (usize, Option<SystemTime>)> = sqlite::query(
             &db,
             &format!(
-                "select session_id as id, sum(role = 'user') as n, max(timestamp) as last \
-                 from messages where 1{active} group by session_id"
+                "select m.session_id as id, count(distinct case when m.role = 'user' then {slot} end) as n, \
+                 max({}) as last from messages as m where 1{filter} group by m.session_id",
+                time_sql("m.timestamp")
             ),
         )?
         .iter()
@@ -118,13 +140,18 @@ impl HermesSource {
             Some((id, (n, r.get("last").and_then(secs))))
         })
         .collect();
-        // 没有标题的用第一句话。SQLite 的 min() 聚合让同一行的其他列取最小 id 那行的值。
+        // 没有标题的用第一句有字的话（只有图片的跳过），按显示顺序逐条看、找到就停。
+        let untitled = if have.contains("title") {
+            " where trim(coalesce(s.title, '')) = ''"
+        } else {
+            ""
+        };
         let first: HashMap<String, String> = sqlite::query(
             &db,
             &format!(
-                "select session_id as id, substr(content, 1, 400) as text, min(id) as first \
-                 from messages where role = 'user' and content is not null and content != ''{active} \
-                 group by session_id"
+                "select s.id as id, (select substr(t, 1, 400) from (select {TEXT_SQL} as t from messages as m \
+                 where m.session_id = s.id and m.role = 'user'{filter} order by {slot}) \
+                 where t != '' limit 1) as text from sessions as s{untitled}"
             ),
         )?
         .iter()
@@ -139,7 +166,7 @@ impl HermesSource {
             .filter_map(|r| str_col(r, "parent_session_id"))
             .collect();
         let hidden = self.trash.hidden_ids(Vendor::Hermes)?;
-        Ok(rows
+        let sessions: Vec<Session> = rows
             .iter()
             .filter(|r| {
                 let id = str_col(r, "id").unwrap_or_default();
@@ -148,7 +175,88 @@ impl HermesSource {
                 !hidden.contains(id) && !superseded
             })
             .filter_map(|r| session_from_row(r, &stats, &first))
-            .collect())
+            .collect();
+        let listed: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        let revisions = rows
+            .iter()
+            .filter_map(|r| {
+                let id = str_col(r, "id").filter(|id| listed.contains(id))?;
+                Some((id.to_owned(), r.get("transcript_revision")?.as_u64()?))
+            })
+            .collect();
+        Ok((sessions, revisions))
+    }
+}
+
+/// 怎么从 `messages` 表认出 Hermes 自己历史界面里显示的消息（上游 `_display_rows_from_conn`），按库里有的列降级：
+/// - 看得见：`active = 1`，或压缩时归档的（`active = 0, compacted = 1`：原话仍显示、仍可搜）；`/rewind` 回退的
+///   两个都是 0。没有 `compacted` 的老库只认 `active = 1`，连 `active` 都没有的全算。
+/// - 只给模型看的（`display_metadata` 里 `model_only` 为真，如压缩摘要）不显示。
+/// - 压缩时留下的几条会复制成新行，和原行共用 `display_order`：每个位置只取一行（有效的、最新的优先），
+///   顺序也按它。工具返回的后来副本（位置不同、`message_uid` 相同）不重复显示（上游 `not_a_later_tool_copy_sql`）。
+struct Display {
+    /// `where` 里接在后面的条件（以 ` and` 开头），表别名 `m`。
+    filter: String,
+    /// 同一条消息的几行共用的位置，也是显示顺序。
+    slot: &'static str,
+    /// 同一位置有几行时取哪行（`row_number()` 的排序）。
+    pick: &'static str,
+}
+
+impl Display {
+    fn new(have: &HashSet<String>) -> Self {
+        let has = |c: &str| have.contains(c);
+        let shown_only = |alias: &str| {
+            if has("display_metadata") {
+                format!(
+                    " and coalesce(json_extract(case when json_valid({alias}.display_metadata) \
+                     then {alias}.display_metadata else json_object() end, '$.model_only'), 0) = 0"
+                )
+            } else {
+                String::new()
+            }
+        };
+        let mut filter = match (has("active"), has("compacted")) {
+            (true, true) => " and (m.active = 1 or m.compacted = 1)".to_owned(),
+            (true, false) => " and m.active = 1".to_owned(),
+            _ => String::new(),
+        };
+        filter += &shown_only("m");
+        let slotted = has("display_order");
+        if slotted && has("message_uid") && has("compacted") {
+            filter += &format!(
+                " and not (m.role = 'tool' and m.message_uid is not null and exists (select 1 from messages as o \
+                 where o.session_id = m.session_id and o.timestamp = m.timestamp and o.message_uid = m.message_uid \
+                 and o.role = 'tool' and o.active = 0 and o.compacted = 1 \
+                 and +o.display_order < m.display_order{}))",
+                shown_only("o")
+            );
+        }
+        Self {
+            filter,
+            slot: if slotted {
+                "coalesce(m.display_order, m.id)"
+            } else {
+                "m.id"
+            },
+            pick: if has("active") {
+                "m.active desc, m.id desc"
+            } else {
+                "m.id desc"
+            },
+        }
+    }
+
+    /// 一条对话看得见的消息，每个位置一行，最后的 `limit` 条，按显示顺序倒着排。`cols` 是要的列（表别名 `m`），
+    /// `cond` 是另加的条件（以 ` and` 开头），`keep` 是去重之后再筛的条件（对 `cols` 的别名）。
+    fn latest(&self, id: &str, cols: &str, cond: &str, keep: &str, limit: usize) -> String {
+        let Self { filter, slot, pick } = self;
+        format!(
+            "select * from (select {cols}, {slot} as slot, \
+             row_number() over (partition by {slot} order by {pick}) as dup \
+             from messages as m where m.session_id = '{id}'{filter}{cond}) \
+             where dup = 1{keep} order by slot desc limit {limit}"
+        )
     }
 }
 
@@ -163,7 +271,10 @@ impl Source for HermesSource {
             return scan;
         }
         match self.list() {
-            Ok(sessions) => scan.sessions = sessions,
+            Ok((sessions, revisions)) => {
+                scan.sessions = sessions;
+                scan.revisions = revisions;
+            }
             Err(e) => scan.problems.push(format!("{}: {e}", self.db().display())),
         }
         scan
@@ -173,11 +284,15 @@ impl Source for HermesSource {
         let Some(id) = sqlite::safe_id(session.id.as_str()) else {
             return Ok(Vec::new());
         };
-        let active = self.active_filter()?;
-        let sql = format!(
-            "select role, content, timestamp from messages where session_id = '{id}' \
-             and role in ('user', 'assistant') and content is not null and content != ''{active} \
-             order by timestamp desc, id desc limit {n}"
+        let sql = self.display()?.latest(
+            id,
+            &format!(
+                "m.role as role, {TEXT_SQL} as content, {} as timestamp",
+                time_sql("m.timestamp")
+            ),
+            " and m.role in ('user', 'assistant')",
+            " and content != ''",
+            n,
         );
         let mut out: Vec<PreviewMessage> = sqlite::query(&self.db(), &sql)?
             .iter()
@@ -192,11 +307,15 @@ impl Source for HermesSource {
         let Some(id) = sqlite::safe_id(session.id.as_str()) else {
             return Ok(Transcript::default());
         };
-        let active = self.active_filter()?;
-        let sql = format!(
-            "select role, content, tool_calls, timestamp from messages where session_id = '{id}'{active} \
-             order by timestamp desc, id desc limit {}",
-            HISTORY_ROWS + 1
+        let sql = self.display()?.latest(
+            id,
+            &format!(
+                "m.role as role, {TEXT_SQL} as content, m.tool_calls as tool_calls, {} as timestamp",
+                time_sql("m.timestamp")
+            ),
+            "",
+            "",
+            HISTORY_ROWS + 1,
         );
         let mut rows = sqlite::query(&self.db(), &sql)?;
         let truncated = rows.len() > HISTORY_ROWS;
@@ -212,9 +331,10 @@ impl Source for HermesSource {
         let Some(id) = sqlite::safe_id(session.id.as_str()) else {
             return Ok(0);
         };
-        let active = self.active_filter()?;
+        let Display { filter, slot, .. } = self.display()?;
         let sql = format!(
-            "select count(*) as n from messages where session_id = '{id}' and role = 'user'{active}"
+            "select count(distinct {slot}) as n from messages as m \
+             where m.session_id = '{id}' and m.role = 'user'{filter}"
         );
         Ok(sqlite::query(&self.db(), &sql)?
             .first()
@@ -243,6 +363,11 @@ impl Source for HermesSource {
         Command::new("hermes", &["--in", &cwd.to_string_lossy()], cwd)
     }
 
+    /// 从 id 看出（[`id_created`]）。id 只精确到秒，取那一秒的最后一刻，免得同一秒里稍晚新建的那条被当成新建之前就有的。
+    fn created_at(&self, session: &Session) -> Option<SystemTime> {
+        id_created(session.id.native()).map(|t| t + Duration::from_millis(999))
+    }
+
     /// 只隐藏：对话在 Hermes 自己的库里。
     fn trash(&self, session: &Session) -> io::Result<TrashEntry> {
         self.trash
@@ -251,6 +376,11 @@ impl Source for HermesSource {
 
     fn restore(&self, entry: &TrashEntry) -> io::Result<()> {
         self.trash.restore(entry)
+    }
+
+    /// 会话路径是空的：对话都在 `state.db` 里，看库和它的 WAL。
+    fn moment_files(&self, _session: &Session) -> Vec<PathBuf> {
+        super::with_wal(&self.db())
     }
 
     fn watch_roots(&self) -> Vec<PathBuf> {
@@ -267,18 +397,10 @@ impl Source for HermesSource {
     }
 }
 
-fn str_col<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
-    row.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-}
-
-/// 秒（可带小数）→ `SystemTime`；负数、非数和大到表示不了的（坏库、导入的数据）返回 `None`，不 panic：
-/// 扫描在全家共用的索引线程里跑，一条坏时间不能让它退出。
-fn secs(v: &Value) -> Option<SystemTime> {
-    let s = v.as_f64().filter(|s| *s >= 0.0)?;
-    SystemTime::UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(s).ok()?)
+/// 时间列取值的 SQL：超出 `0..=EPOCH_MAX` 的（坏库、导入的数据：`1e999` 存成的无穷大、`1e20`）当 NULL。
+/// 要在聚合之前滤掉，不然 `max()` 会盖掉同一条对话里正常的最后时间。非数字（文字、二进制）也不在这个范围里。
+fn time_sql(col: &str) -> String {
+    format!("(case when {col} between 0 and {EPOCH_MAX} then {col} end)")
 }
 
 fn session_from_row(
@@ -329,6 +451,7 @@ fn session_from_row(
         last_active,
         message_count,
         automatic,
+        account: String::new(),
     })
 }
 
@@ -471,6 +594,7 @@ mod tests {
             last_active: SystemTime::UNIX_EPOCH,
             message_count: 1,
             automatic: false,
+            account: String::new(),
         };
         let cmd = src.resume_with_message_cmd(&s, "继续上次没做完的事。");
         assert_eq!(

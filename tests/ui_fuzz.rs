@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use fuzz_support::{MIXED, Rng};
 use huitai::core::{SessionId, SessionState, Vendor};
-use huitai::index::Entry;
+use huitai::index::{Entry, Hit};
 use huitai::sources::{PreviewMessage, Role};
 use huitai::ui::{App, Effect, Preview, Theme, view};
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -228,9 +228,22 @@ fn apply(app: &mut App, effects: Vec<Effect>, rng: &mut Rng) {
     for e in effects {
         match e {
             Effect::Search { vendor, query } => {
-                let all = app.list_of(vendor).entries.clone();
-                let hits: Vec<Entry> = all.into_iter().filter(|_| rng.chance(20)).collect();
-                app.set_hits(vendor, &query, hits);
+                // `None` 是各家一起搜：从各家的列表里挑。
+                let all: Vec<Entry> = Vendor::ALL
+                    .into_iter()
+                    .filter(|v| vendor.is_none_or(|w| w == *v))
+                    .flat_map(|v| app.list_of(v).entries.clone())
+                    .collect();
+                let hits: Vec<Hit> = all
+                    .into_iter()
+                    .filter(|_| rng.chance(20))
+                    .map(|entry| Hit {
+                        entry,
+                        in_title: true,
+                        in_body: false,
+                    })
+                    .collect();
+                app.set_search_hits(vendor, &query, hits);
             }
             Effect::GitStatus(dir) => {
                 let out = if rng.chance(70) {

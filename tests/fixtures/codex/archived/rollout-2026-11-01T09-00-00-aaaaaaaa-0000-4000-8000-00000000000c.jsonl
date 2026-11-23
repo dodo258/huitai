@@ -1,0 +1,12 @@
+{"timestamp":"2026-11-01T09:00:00.000Z","type":"session_meta","payload":{"id":"aaaaaaaa-0000-4000-8000-00000000000c","timestamp":"2026-11-01T09:00:00.000Z","cwd":"/Users/demo/projects/atlas","originator":"Codex Desktop","source":"vscode","git":{"branch":"feat/archive","commit_hash":"0000000"}}}
+{"timestamp":"2026-11-01T09:00:00.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>...</environment_context>"}]}}
+{"timestamp":"2026-11-01T09:00:01.000Z","type":"event_msg","payload":{"type":"task_started","started_at":1793523601}}
+{"timestamp":"2026-11-01T09:00:01.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"i1","content":[{"type":"text","text":"把地图瓦片缓存起来"}]}}}
+{"timestamp":"2026-11-01T09:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls tiles\"}","call_id":"c1"}}
+{"timestamp":"2026-11-01T09:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"z0.png\nz1.png"}}
+{"timestamp":"2026-11-01T09:00:20.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"i2","content":[{"type":"text","text":"瓦片缓存加好了，过期按经纬网格清理"}],"phase":"final"}}}
+{"timestamp":"2026-11-01T09:00:21.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":20000}}
+{"timestamp":"2026-11-01T09:05:00.000Z","type":"turn_context","payload":{"cwd":"/Users/demo/projects/atlas","model":"gpt-5"}}
+{"timestamp":"2026-11-01T09:05:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"再补一个清理的测试"}}
+{"timestamp":"2026-11-01T09:05:30.000Z","type":"event_msg","payload":{"type":"agent_message","message":"测试补好了"}}
+{"timestamp":"2026-11-01T09:05:31.000Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{}}}

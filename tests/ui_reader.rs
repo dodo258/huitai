@@ -332,6 +332,22 @@ fn enter_continues_the_conversation() {
 }
 
 #[test]
+fn s_exports_the_open_conversation_and_shows_where_it_went() {
+    let mut app = stopped_app();
+    open_with(&mut app, short_transcript());
+    let fx = app.key(key(KeyCode::Char('s')));
+    match fx.as_slice() {
+        [Effect::Export(entry)] => assert_eq!(entry.session.id.as_str(), "c-shop-3"),
+        other => panic!("应该导出这条：{other:?}"),
+    }
+    assert!(app.reader.is_some(), "导出后还在看全文");
+    assert!(dump(&render(&mut app, W, H)).contains("s 存成 Markdown"));
+    // 运行层存完把路径写进状态栏。
+    app.status = Some("已存到 ~/Downloads/修结算-2026-11-20.md".to_owned());
+    assert!(dump(&render(&mut app, W, H)).contains("已存到 ~/Downloads/修结算-2026-11-20.md"));
+}
+
+#[test]
 fn no_live_screen_while_reading_a_running_conversation() {
     let mut app = demo_app(Vendor::Claude);
     // c-shop-1 在跑：选中它时要实时画面，开着全文时不要。

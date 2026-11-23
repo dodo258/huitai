@@ -39,7 +39,7 @@ use super::pty;
 use super::scan::{Scanner, Signal, Status};
 use super::screen::Screen;
 use super::version;
-use crate::core::{Config, SessionId};
+use crate::core::{Config, SessionId, SessionState, Vendor};
 
 /// 写给客户端卡住超过这么久就断开它（对话不受影响）。
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -173,9 +173,31 @@ struct Board {
 
 struct Hosted {
     spec: SpawnSpec,
-    /// 标题前缀：`<厂商标记> <项目名> · `。
-    prefix: String,
     state: Mutex<State>,
+}
+
+impl Hosted {
+    /// 这条对话此刻的标题前缀，见 [`tab_prefix`]。
+    fn prefix(&self, status: Option<SessionState>) -> String {
+        tab_prefix(status, &self.spec.project, self.spec.vendor)
+    }
+}
+
+/// 标签页标题前缀：「状态 项目 · 厂商 · 」，如 `◆等你 huitai · Claude · `，后面接 CLI 设的标题。
+/// 状态由守护进程的 Notifier 算好经 [`DaemonHandle::set_status`] 告诉托管层；还不知道或已停时不写状态。
+/// 标签页挤的时候终端从后面截，状态和项目名留得最久。
+pub fn tab_prefix(status: Option<SessionState>, project: &str, vendor: Vendor) -> String {
+    let word = match status {
+        Some(SessionState::Running) => "在跑",
+        Some(SessionState::Waiting) => "等你",
+        Some(SessionState::Done) => "做完",
+        Some(SessionState::Stopped) | None => "",
+    };
+    let head = match status {
+        Some(s) if !word.is_empty() => format!("{}{word} ", s.glyph()),
+        _ => String::new(),
+    };
+    format!("{head}{project} · {} · ", vendor.name())
 }
 
 #[derive(Default)]
@@ -183,6 +205,10 @@ struct State {
     run: Option<Running>,
     client: Option<Client>,
     title: Option<String>,
+    /// 标签页标题前面的状态（Notifier 算的）。
+    status: Option<SessionState>,
+    /// 状态变了、新标题还没发给接着的标签页：等输出停在完整的地方再插（见 [`Scanner::at_boundary`]）。
+    title_pending: bool,
     last_output_event: Option<Instant>,
     /// 最近一次登记（Spawn）的时间，判断待启动的登记是否过期。
     registered: Option<Instant>,
@@ -288,6 +314,45 @@ impl DaemonHandle {
     /// 托管中的对话。
     pub fn list(&self) -> Vec<HostedInfo> {
         self.0.list()
+    }
+
+    /// 标签页标题前面的状态变了（守护进程的 Notifier 算的）：改前缀，接着的标签页马上重发一次标题。
+    /// 输出正停在序列或字符中间时不插，等下一段输出停在完整的地方再补（CLI 的字节一个不改）。
+    /// 状态没变或不是托管的对话什么也不做。
+    pub fn set_status(&self, id: &SessionId, status: SessionState) {
+        let Some(hosted) = self.0.find(id) else {
+            return;
+        };
+        let mut st = lock(&hosted.state);
+        if st.status == Some(status) {
+            return;
+        }
+        st.status = Some(status);
+        let prefix = hosted.prefix(st.status);
+        let State {
+            run,
+            client,
+            title,
+            title_pending,
+            ..
+        } = &mut *st;
+        let Some(run) = run.as_mut() else {
+            return;
+        };
+        run.scanner.set_prefix(&prefix);
+        let Some(c) = client.as_ref() else {
+            // 没接着：下次接上时发的就是新标题。
+            return;
+        };
+        if run.scanner.at_boundary() {
+            c.send_all(
+                KIND_OUTPUT,
+                title_sequence(&prefix, title.as_deref()).as_bytes(),
+            );
+            *title_pending = false;
+        } else {
+            *title_pending = true;
+        }
     }
 
     /// 马上查一遍闲置对话（平时由守护进程定时查），返回这次开始收回的对话。
@@ -444,26 +509,17 @@ fn handle(shared: &Arc<Shared>, mut stream: UnixStream) -> io::Result<()> {
     let Some(first) = read_request(&mut stream)? else {
         return Ok(());
     };
-    let request = if shared.build.protocol == 0 {
-        // 装成没有握手的旧版（测试用）：和旧版一样读不懂 Hello 和 Retire，直接关连接。
-        if matches!(first, Request::Hello(_) | Request::Retire) {
-            return Err(io::Error::new(ErrorKind::InvalidData, "不认识的请求"));
-        }
-        first
-    } else {
-        let Request::Hello(peer) = first else {
-            // 没有握手的旧客户端：回一句它能显示的话。
-            return reply(&mut stream, Response::Error(OLD_CLIENT.to_owned()));
-        };
-        if !shared.greet(&mut stream, &peer)? {
-            return Ok(());
-        }
-        match read_request(&mut stream)? {
-            Some(r) => r,
-            None => return Ok(()),
-        }
+    let Request::Hello(peer) = first else {
+        // 没有握手的旧客户端：回一句它能显示的话。
+        return reply(&mut stream, Response::Error(OLD_CLIENT.to_owned()));
     };
-    serve(shared, stream, request)
+    if !shared.greet(&mut stream, &peer)? {
+        return Ok(());
+    }
+    let Some(request) = read_request(&mut stream)? else {
+        return Ok(());
+    };
+    serve(shared, stream, request, &peer)
 }
 
 /// 读一个请求。连接关了返回 `None`；不是请求帧或读不懂（更新的客户端加的请求）时回一句错误，也返回 `None`。
@@ -483,7 +539,14 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Option<Request>> {
     Ok(parsed)
 }
 
-fn serve(shared: &Arc<Shared>, mut stream: UnixStream, request: Request) -> io::Result<()> {
+/// `peer` 是握手时客户端报的版本：带厂商的应答只列它认识的厂商。
+fn serve(
+    shared: &Arc<Shared>,
+    mut stream: UnixStream,
+    request: Request,
+    peer: &Build,
+) -> io::Result<()> {
+    let known = |vendor| peer.knows(vendor, &shared.build);
     if matches!(
         request,
         Request::Attach { .. } | Request::Board(_) | Request::Events
@@ -529,7 +592,9 @@ fn serve(shared: &Arc<Shared>, mut stream: UnixStream, request: Request) -> io::
             reply(&mut stream, r)
         }
         Request::List => {
-            let r = Response::List(shared.list());
+            let mut list = shared.list();
+            list.retain(|h| known(h.vendor));
+            let r = Response::List(list);
             reply(&mut stream, r)
         }
         Request::Snapshot { id, since } => {
@@ -537,7 +602,11 @@ fn serve(shared: &Arc<Shared>, mut stream: UnixStream, request: Request) -> io::
             reply(&mut stream, r)
         }
         Request::Interrupted => {
-            let list = lock(&shared.interrupted).values().cloned().collect();
+            let list = lock(&shared.interrupted)
+                .values()
+                .filter(|r| known(r.vendor))
+                .cloned()
+                .collect();
             reply(&mut stream, Response::Interrupted(list))
         }
         Request::Dismiss { ids } => {
@@ -750,7 +819,6 @@ impl Shared {
         }
         let hosted = sessions.entry(spec.id.clone()).or_insert_with(|| {
             Arc::new(Hosted {
-                prefix: format!("{} {} · ", spec.vendor.mark(), spec.project),
                 spec,
                 state: Mutex::default(),
             })
@@ -1086,7 +1154,7 @@ fn attach_to(
                     run.activity.nudge(shared.clock.now());
                 }
             }
-            None => match start(shared, hosted, env, cols, rows) {
+            None => match start(shared, hosted, &hosted.prefix(st.status), env, cols, rows) {
                 Ok(run) => {
                     started = Some(run.pid);
                     st.run = Some(run);
@@ -1102,7 +1170,8 @@ fn attach_to(
         }
         let run = st.run.as_ref().expect("上面刚确认或启动过");
         let mut snapshot = run.screen.restore_sequence();
-        snapshot.extend_from_slice(title_sequence(hosted, st.title.as_deref()).as_bytes());
+        let prefix = hosted.prefix(st.status);
+        snapshot.extend_from_slice(title_sequence(&prefix, st.title.as_deref()).as_bytes());
         let client = Client::new(client_id, &stream, snapshot.len())?;
         client.send_all(KIND_RESPONSE, &serde_json::to_vec(&Response::Ok)?);
         for part in snapshot.chunks(RESTORE_CHUNK) {
@@ -1110,6 +1179,8 @@ fn attach_to(
         }
         let input = Arc::clone(&run.input);
         st.client = Some(client);
+        // 接上时发的标题已经是此刻的状态。
+        st.title_pending = false;
         input
     };
     if let Some(pid) = started {
@@ -1186,11 +1257,11 @@ fn pump_client_input(
     }
 }
 
-/// attach 时主动设一次标题：CLI 设过就用加了前缀的那个，没设过就只用前缀。
-fn title_sequence(hosted: &Hosted, title: Option<&str>) -> String {
+/// 主动设一次标题（attach 时、状态变了时）：CLI 设过就用加了前缀的那个，没设过就只用前缀。
+fn title_sequence(prefix: &str, title: Option<&str>) -> String {
     let text = match title {
-        Some(t) => format!("{}{t}", hosted.prefix),
-        None => hosted.prefix.trim_end_matches(" · ").to_owned(),
+        Some(t) => format!("{prefix}{t}"),
+        None => prefix.trim_end_matches(" · ").to_owned(),
     };
     format!("\x1b]2;{text}\x07")
 }
@@ -1198,6 +1269,7 @@ fn title_sequence(hosted: &Hosted, title: Option<&str>) -> String {
 fn start(
     shared: &Arc<Shared>,
     hosted: &Arc<Hosted>,
+    prefix: &str,
     env: &[(String, String)],
     cols: u16,
     rows: u16,
@@ -1269,7 +1341,7 @@ fn start(
         input,
         pid,
         screen: Screen::new(cols, rows),
-        scanner: Scanner::new(&hosted.prefix),
+        scanner: Scanner::new(prefix),
         activity: Activity::new(shared.clock.now()),
         reclaiming: false,
         killed: false,
@@ -1321,6 +1393,8 @@ fn forward_output(shared: &Shared, hosted: &Hosted, chunk: &[u8]) -> Option<Vec<
         run,
         client,
         title,
+        status,
+        title_pending,
         last_output_event,
         ..
     } = &mut *guard;
@@ -1328,6 +1402,16 @@ fn forward_output(shared: &Shared, hosted: &Hosted, chunk: &[u8]) -> Option<Vec<
     let run = run.as_mut()?;
     failpoint::output(chunk);
     run.scanner.feed(chunk, &mut out, &mut signals);
+    // 状态变时输出正停在序列中间：等到这一段结束在完整的地方，接在后面补发标题（CLI 这段里自己设的标题算在前面）。
+    if *title_pending && run.scanner.at_boundary() {
+        *title_pending = false;
+        let t = signals.iter().rev().find_map(|s| match s {
+            Signal::Title(t) => Some(t.as_str()),
+            _ => None,
+        });
+        let prefix = hosted.prefix(*status);
+        out.extend_from_slice(title_sequence(&prefix, t.or(title.as_deref())).as_bytes());
+    }
     let now = shared.clock.now();
     run.activity.output(now);
     if signals.iter().any(needs_you) {
@@ -1351,7 +1435,10 @@ fn forward_output(shared: &Shared, hosted: &Hosted, chunk: &[u8]) -> Option<Vec<
         *client = None;
         events.extend(detached_events(id));
     }
-    if working || last_output_event.is_none_or(|t| t.elapsed() >= OUTPUT_EVENT_GAP) {
+    // CLI 用 OSC 7501 根记录说在等你、还没改口：输出只是重画（OpenCode 2.x 别的标签页在跑），不报有输出，
+    // 状态灯留在等你，直到它报 working（马上报有输出）或 idle/done。
+    let blocked = run.scanner.cli_blocked();
+    if !blocked && (working || last_output_event.is_none_or(|t| t.elapsed() >= OUTPUT_EVENT_GAP)) {
         *last_output_event = Some(Instant::now());
         events.push(HostEvent::Output { id: id.clone() });
     }
@@ -1389,10 +1476,12 @@ fn needs_you(signal: &Signal) -> bool {
 
 /// panic 之后状态机和扫描器可能停在半截，换成新的（大小不变）。
 fn reset_screen(hosted: &Hosted) {
-    if let Some(run) = lock(&hosted.state).run.as_mut() {
+    let mut st = lock(&hosted.state);
+    let prefix = hosted.prefix(st.status);
+    if let Some(run) = st.run.as_mut() {
         let (cols, rows) = run.screen.size();
         run.screen = Screen::new(cols, rows);
-        run.scanner = Scanner::new(&hosted.prefix);
+        run.scanner = Scanner::new(&prefix);
     }
 }
 
@@ -1518,19 +1607,29 @@ mod tests {
         assert_eq!(shared.register(spec), Response::Ok);
         let hosted = shared.find(&SessionId::from("t")).unwrap();
         assert_eq!(hosted.spec.project, "ab\\cde");
-        let mark = Vendor::Claude.mark();
+        let prefix = hosted.prefix(Some(SessionState::Waiting));
         assert_eq!(
-            title_sequence(&hosted, None),
-            format!("\x1b]2;{mark} ab\\cde\x07")
+            title_sequence(&hosted.prefix(None), None),
+            "\x1b]2;ab\\cde · Claude\x07"
         );
         assert_eq!(
-            title_sequence(&hosted, Some("x")),
-            format!("\x1b]2;{mark} ab\\cde · x\x07")
+            title_sequence(&prefix, Some("x")),
+            "\x1b]2;◆等你 ab\\cde · Claude · x\x07"
         );
         // CLI 自己设的标题走扫描器改写，前缀同样是干净的。
         let (mut out, mut signals) = (Vec::new(), Vec::new());
-        Scanner::new(&hosted.prefix).feed(b"\x1b]0;x\x07", &mut out, &mut signals);
-        assert_eq!(out, format!("\x1b]0;{mark} ab\\cde · x\x07").into_bytes());
+        Scanner::new(&prefix).feed(b"\x1b]0;x\x07", &mut out, &mut signals);
+        assert_eq!(out, "\x1b]0;◆等你 ab\\cde · Claude · x\x07".as_bytes());
         let _ = fs::remove_dir_all(&shared.dir);
+    }
+
+    #[test]
+    fn tab_prefix_puts_the_state_first() {
+        let p = |s| tab_prefix(s, "huitai", Vendor::Claude);
+        assert_eq!(p(None), "huitai · Claude · ");
+        assert_eq!(p(Some(SessionState::Stopped)), "huitai · Claude · ");
+        assert_eq!(p(Some(SessionState::Running)), "●在跑 huitai · Claude · ");
+        assert_eq!(p(Some(SessionState::Done)), "✓做完 huitai · Claude · ");
+        assert_eq!(p(Some(SessionState::Waiting)), "◆等你 huitai · Claude · ");
     }
 }

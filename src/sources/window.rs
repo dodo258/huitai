@@ -106,6 +106,117 @@ impl Window {
         };
         lines(tail)
     }
+
+    /// 只读了头尾时，两段之间没读的那些完整行在文件里的范围 `[开始, 结束)`；整读时 `None`。
+    pub fn middle(&self) -> Option<(u64, u64)> {
+        if self.whole {
+            return None;
+        }
+        let start = self
+            .head
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i as u64 + 1);
+        let tail_at = self.len - self.tail.len() as u64;
+        let end = self
+            .tail
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(self.len, |i| tail_at + i as u64 + 1);
+        (start < end).then_some((start, end))
+    }
+}
+
+/// [`rfind_line`] 一次读多少。
+const SEARCH_CHUNK: u64 = 1 << 20;
+
+/// 在文件 `[start, end)` 里从后往前找含 `needle` 的行（`start`、`end` 都在行首），每找到一行交给 `accept`，
+/// 它认了就返回这一行；都不认返回 `None`。只读 1MB 一块、只把命中的那行整行读出来，长过
+/// [`MAX_LINE_BYTES`] 的行跳过。用来在大文件没读的中间段里找最后一条标题这类稀有的小记录。
+pub(crate) fn rfind_line(
+    path: &Path,
+    (start, end): (u64, u64),
+    needle: &[u8],
+    mut accept: impl FnMut(&[u8]) -> bool,
+) -> io::Result<Option<Vec<u8>>> {
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    let mut f = File::open(path)?;
+    // 只认从 `limit` 之前开始的命中：之后的已经看过。
+    let mut limit = end;
+    while limit > start {
+        let from = limit.saturating_sub(SEARCH_CHUNK).max(start);
+        // 多读 needle 长度减一，跨块边界的命中也找得到。
+        let to = (limit + needle.len() as u64 - 1).min(end);
+        let mut buf = Vec::with_capacity((to - from) as usize);
+        f.seek(SeekFrom::Start(from))?;
+        (&mut f).take(to - from).read_to_end(&mut buf)?;
+        let mut upto = (limit - from) as usize;
+        while let Some(i) = rfind(&buf, needle, upto) {
+            let at = from + i as u64;
+            let (line_start, line) = line_around(&mut f, at, start, end)?;
+            if let Some(line) = line
+                && accept(&line)
+            {
+                return Ok(Some(line));
+            }
+            if line_start < from {
+                limit = line_start;
+                break;
+            }
+            upto = (line_start - from) as usize;
+        }
+        limit = limit.min(from);
+    }
+    Ok(None)
+}
+
+/// `buf` 里最后一个从 `upto` 之前开始的 `needle`。先找 needle 里少见的那个字节（`$`、`_`，没有就第一个字节）再比整段。
+fn rfind(buf: &[u8], needle: &[u8], upto: usize) -> Option<usize> {
+    let k = needle
+        .iter()
+        .position(|b| matches!(b, b'$' | b'_'))
+        .unwrap_or(0);
+    let mut last = upto.min(buf.len().checked_sub(needle.len())? + 1);
+    while last > 0 {
+        let i = buf[k..k + last].iter().rposition(|&b| b == needle[k])?;
+        if buf[i..].starts_with(needle) {
+            return Some(i);
+        }
+        last = i;
+    }
+    None
+}
+
+/// `at` 所在那一行（不含换行）和它的开头位置，只在 `[start, end)` 里找；长过 [`MAX_LINE_BYTES`] 的行给 `None`。
+fn line_around(f: &mut File, at: u64, start: u64, end: u64) -> io::Result<(u64, Option<Vec<u8>>)> {
+    const STEP: u64 = 64 * 1024;
+    let max = MAX_LINE_BYTES as u64;
+    let mut line_start = start;
+    let mut pos = at;
+    while pos > start && at - pos <= max {
+        let from = pos.saturating_sub(STEP).max(start);
+        let mut buf = Vec::new();
+        f.seek(SeekFrom::Start(from))?;
+        (&mut *f).take(pos - from).read_to_end(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            line_start = from + i as u64 + 1;
+            break;
+        }
+        pos = from;
+    }
+    if at - line_start > max || (pos > start && at - pos > max) {
+        return Ok((pos, None));
+    }
+    let mut line = Vec::new();
+    f.seek(SeekFrom::Start(line_start))?;
+    let mut reader = BufReader::new((&mut *f).take((end - line_start).min(max + 1)));
+    reader.read_until(b'\n', &mut line)?;
+    if line.len() as u64 > max {
+        return Ok((line_start, None));
+    }
+    Ok((line_start, Some(trim_line(&line).to_vec())))
 }
 
 /// 读文件最后 `bytes` 字节，丢掉开头不完整的那一行。返回内容和是否已读到文件开头。
@@ -382,6 +493,64 @@ mod tests {
         let mut got = Vec::new();
         for_each_line_capped(&mut f, 8, 6000, |l, _| got.push(l.len())).unwrap();
         assert_eq!(got, [5000, 7, 5000]);
+    }
+
+    #[test]
+    fn middle_and_backward_search() {
+        let mut content = Vec::new();
+        for i in 0..2000 {
+            let line = match i {
+                700 => r#"{"$set":{"summary":"旧标题"}}"#.to_owned(),
+                900 => r#"{"$set":{"lastUpdated":"x"}}"#.to_owned(),
+                1000 => r#"{"id":"m","content":"正文里提到 \"$set\" 不算"}"#.to_owned(),
+                _ => format!("line-{i:05}"),
+            };
+            content.extend_from_slice(line.as_bytes());
+            content.push(b'\n');
+        }
+        let p = tmp("middle", &content);
+        let w = Window::read_with(&p, 100, 100).unwrap();
+        let (start, end) = w.middle().unwrap();
+        // 中间段从开头最后一个完整行之后起，到结尾第一个完整行之前止，两头都在行首。
+        let head_end: usize = w.head_lines().map(|l| l.len() + 1).sum();
+        let tail_len: usize = w.tail_lines().map(|l| l.len() + 1).sum();
+        assert_eq!(start as usize, head_end);
+        assert_eq!(end as usize, content.len() - tail_len);
+        let mut seen = Vec::new();
+        let hit = rfind_line(&p, (start, end), br#""$set""#, |l| {
+            seen.push(String::from_utf8(l.to_vec()).unwrap());
+            l.windows(7).any(|w| w == b"summary")
+        })
+        .unwrap();
+        assert_eq!(
+            hit.as_deref(),
+            Some(r#"{"$set":{"summary":"旧标题"}}"#.as_bytes())
+        );
+        assert_eq!(seen.len(), 2, "从后往前，没认的那条之后才到它：{seen:?}");
+        assert!(
+            rfind_line(&p, (start, end), b"none", |_| true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Window::read(&p).unwrap().middle().is_none(),
+            "整读的没有中间段"
+        );
+    }
+
+    #[test]
+    fn backward_search_finds_hits_across_chunk_edges() {
+        // 命中横跨两块的边界：`$` 在倒数第一块开始前 2 字节。
+        let hit = r#"{"$set":{"summary":"x"}}"#;
+        let mut content = "a\n".repeat(1000).into_bytes();
+        content.extend_from_slice(hit.as_bytes());
+        content.push(b'\n');
+        let after = SEARCH_CHUNK as usize + 2 - (hit.len() - 2 + 1);
+        content.extend(std::iter::repeat_n(b'y', after - 1));
+        content.push(b'\n');
+        let p = tmp("edge", &content);
+        let line = rfind_line(&p, (0, content.len() as u64), br#""$set""#, |_| true).unwrap();
+        assert_eq!(line.as_deref(), Some(hit.as_bytes()));
     }
 
     #[test]

@@ -342,6 +342,24 @@ fn read_restore(att: &mut Attachment, id: &SessionId) -> Vec<u8> {
     }
 }
 
+/// 去掉所有 `ESC ] 2 ; … BEL` 标题序列。
+fn without_title_osc(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(i) = rest.windows(4).position(|w| w == b"\x1b]2;") {
+        out.extend_from_slice(&rest[..i]);
+        match rest[i..].iter().position(|&b| b == 0x07) {
+            Some(end) => rest = &rest[i + end + 1..],
+            None => {
+                rest = &rest[i..];
+                break;
+            }
+        }
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
 fn assert_same_screen(a: &Screen, b: &Screen, what: &str) {
     assert_eq!(a.signature(), b.signature(), "{what}：画面不一致");
     assert_eq!(a.history_text(), b.history_text(), "{what}：历史不一致");
@@ -683,7 +701,9 @@ fn burst_50mb() {
     let (_, live) = reader.join();
     let mut expect = plain.clone();
     expect.extend_from_slice(b"\r\nDONE");
-    let got = live.kept.unwrap();
+    // 守护进程在状态变化时补发带「状态 项目 · 厂商」前缀的标题（OSC 2，c5993ca 起）；
+    // 文件本身没有 OSC，去掉它们后应和输出逐字节一致。
+    let got = without_title_osc(&live.kept.unwrap());
     assert!(
         got == expect,
         "客户端收到的字节和输出不一致：{} vs {}",

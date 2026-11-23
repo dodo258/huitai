@@ -2,11 +2,13 @@
 //! 强调色一次只用一个，随当前标签（厂商）切换。
 //!
 //! 颜色按角色分，同一个颜色只表示一类东西：
-//! - 这家的强调色（Claude 橙、Codex 蓝、pi 紫、Hermes 黄铜、OpenCode 青绿、Qwen Code 蓝紫，色值在 `core::vendor` 的表里）：能按的——印章、选中细条、序号、按键提示；项目名带三成。
+//! - 这家的强调色（Claude 橙、Codex 蓝、pi 紫、Hermes 黄铜、OpenCode 青绿、Antigravity 黄绿，色值在 `core::vendor` 的表里）：能按的——印章、选中细条、序号、按键提示；项目名带三成。
 //!   顶栏标签照 gitui、ratatui Tabs：不垫底色，标签之间淡竖线，当前这家强调色加粗加下划线；底色只给印章。
 //! - 状态色只给状态灯和状态计数：在跑绿、等你黄、刚做完青、别处柔绿、已停灰。青色不用蓝，免得和 Codex 的蓝混。
 //! - 红色只给快用完的额度和出错。
-//! - 其余是灰阶：标题、正文、次要（表头、组名以外的说明）、暗字（时间、路径）。
+//! - 其余是灰阶：标题、正文、次要（表头、组名以外的说明）、暗字（时间、路径、账号名、动态行）。
+//!   四级灰阶在底色、选中底色、栏底色、预览底色和展开组的垫色上对比度都不低于 4.5:1（WCAG AA），
+//!   相邻两级至少差 1.2 倍，主次靠亮度梯度和粗细分，不靠把暗字压到看不清（测试 `grays_readable_and_ordered`）。
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -55,10 +57,10 @@ impl Theme {
         bar: rgb(0x1d1e23),
         preview: rgb(0x131417),
         select: rgb(0x24262c),
-        text: rgb(0xb9b7ae),
+        text: rgb(0xc4c2b9),
         title: rgb(0xf2efe7),
-        muted: rgb(0x7c7a72),
-        faint: rgb(0x5c5a54),
+        muted: rgb(0xaaa79f),
+        faint: rgb(0x918e86),
         light: false,
         running: rgb(0x78c98f),
         waiting: rgb(0xe8b85a),
@@ -74,10 +76,10 @@ impl Theme {
         bar: rgb(0xe9e9e6),
         preview: rgb(0xfbfbfa),
         select: rgb(0xe2e1dc),
-        text: rgb(0x3a3935),
+        text: rgb(0x302f2c),
         title: rgb(0x141518),
-        muted: rgb(0x6f6d66),
-        faint: rgb(0x9d9b94),
+        muted: rgb(0x4b4a45),
+        faint: rgb(0x64625c),
         light: true,
         running: rgb(0x2e8f4c),
         waiting: rgb(0xa8740f),
@@ -239,6 +241,52 @@ mod tests {
         assert_eq!(colorfgbg_is_light("15;0"), Some(false));
         assert_eq!(colorfgbg_is_light("0;default;15"), Some(true));
         assert_eq!(colorfgbg_is_light("x"), None);
+    }
+
+    /// WCAG 2 的对比度：(亮 + 0.05) / (暗 + 0.05)。
+    fn contrast(a: Color, b: Color) -> f64 {
+        let lum = |c: Color| {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("主题色都是 RGB：{c:?}")
+            };
+            let ch = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// 账号名、动态行、时间这些暗字在列表会出现的每种底色上都要读得清（不低于 4.5:1），
+    /// 四级灰阶从标题到暗字依次变暗、相邻两级至少差 1.2 倍，主次层级还在。
+    #[test]
+    fn grays_readable_and_ordered() {
+        for t in [Theme::DARK, Theme::LIGHT] {
+            let mut grounds = vec![t.base, t.select, t.bar, t.preview];
+            grounds.extend(Vendor::ALL.map(|v| t.band(t.accent(v))));
+            let levels = [t.title, t.text, t.muted, t.faint];
+            for bg in &grounds {
+                for fg in levels {
+                    let c = contrast(fg, *bg);
+                    assert!(c >= 4.5, "{fg:?} 在 {bg:?} 上只有 {c:.2}:1");
+                }
+                for pair in levels.windows(2) {
+                    let (hi, lo) = (contrast(pair[0], *bg), contrast(pair[1], *bg));
+                    assert!(
+                        hi >= lo * 1.2,
+                        "{:?}（{hi:.2}）和 {:?}（{lo:.2}）在 {bg:?} 上分不开",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

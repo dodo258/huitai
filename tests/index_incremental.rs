@@ -176,6 +176,7 @@ fn session(id: &str, secs: u64, count: usize) -> Session {
         last_active: UNIX_EPOCH + Duration::from_secs(secs),
         message_count: count,
         automatic: false,
+        account: String::new(),
     }
 }
 
@@ -190,11 +191,11 @@ impl Source for Whole {
         match &*self.sessions.lock().unwrap() {
             Ok(s) => Scan {
                 sessions: s.clone(),
-                problems: Vec::new(),
+                ..Scan::default()
             },
             Err(e) => Scan {
-                sessions: Vec::new(),
                 problems: vec![e.clone()],
+                ..Scan::default()
             },
         }
     }

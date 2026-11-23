@@ -81,7 +81,7 @@ impl Index {
                     Ok(w) => Some(w),
                     Err(e) => {
                         let _ = up_tx.send(Update::Problem(format!(
-                            "监听三家目录失败，只能手动刷新: {e}"
+                            "监听各家目录失败，只能手动刷新: {e}"
                         )));
                         None
                     }

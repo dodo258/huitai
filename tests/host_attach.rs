@@ -71,7 +71,7 @@ fn reattach_restores_screen_history_and_output_made_while_detached() {
     assert!(back.screen.bracketed_paste());
     assert!(contains(
         &back.snapshot,
-        "\x1b]2;✻ demo · phase2\x07".as_bytes()
+        "\x1b]2;demo · Claude · phase2\x07".as_bytes()
     ));
     assert!(host.info(&id).unwrap().attached);
 }
@@ -111,11 +111,14 @@ fn only_title_sequences_are_rewritten() {
     let mut seen = Seen::new(COLS, ROWS);
     read_snapshot(&mut att, &mut seen);
     // CLI 还没设标题时，attach 先设一个只有前缀的标题。
-    assert!(seen.snapshot.ends_with("\x1b]2;✻ demo\x07".as_bytes()));
+    assert!(
+        seen.snapshot
+            .ends_with("\x1b]2;demo · Claude\x07".as_bytes())
+    );
     read_until(&mut att, &mut seen, "END", |s| {
         s.live_text().ends_with("END")
     });
-    let want = "a\x1b]0;✻ demo · hello\x07b\x1b]8;;http://x\x07L\x1b]8;;\x07\x1b]52;c;aGk=\x07\x1b]2;✻ demo · two\x1b\\\x1b[31m中\x1b[0mEND";
+    let want = "a\x1b]0;demo · Claude · hello\x07b\x1b]8;;http://x\x07L\x1b]8;;\x07\x1b]52;c;aGk=\x07\x1b]2;demo · Claude · two\x1b\\\x1b[31m中\x1b[0mEND";
     assert_eq!(seen.live_text(), want);
     assert_eq!(host.info(&id).unwrap().title.as_deref(), Some("two"));
 }
@@ -249,7 +252,7 @@ fn gemini_action_required_title_turns_the_lamp_to_waiting() {
     // 标题改写规则不变：只加前缀。
     assert_eq!(
         seen.live_text(),
-        "\x1b]0;✻ demo · ✦  Working… (demo)\x07\x1b]0;✻ demo · ✋  Action Required (demo)\x07END"
+        "\x1b]0;demo · Claude · ✦  Working… (demo)\x07\x1b]0;demo · Claude · ✋  Action Required (demo)\x07END"
     );
     let got = feed_lamps(&mut events, &mut lamps, "等待标题", |e| {
         matches!(e, HostEvent::Bell { .. })

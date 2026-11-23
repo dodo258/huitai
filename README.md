@@ -2,7 +2,7 @@
 
 # 会话台 `ai`
 
-在终端里敲 `ai`，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。
+在终端里敲 `ai`，本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Antigravity 的所有对话按项目列出来，回车接着聊；关掉窗口，对话照样在后台跑。
 
 [![Release](https://img.shields.io/github/v/release/dodo258/huitai?label=release&color=16181D)](https://github.com/dodo258/huitai/releases/latest) [![License](https://img.shields.io/badge/license-MIT-16181D)](LICENSE) ![macOS](https://img.shields.io/badge/macOS-16181D?logo=apple&logoColor=white) ![Rust](https://img.shields.io/badge/Rust-16181D?logo=rust&logoColor=white)
 
@@ -12,7 +12,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/images/board-light.png">
-  <img src="docs/images/board-dark.png" width="900" alt="会话台：左边按项目列出对话，表头写着状态、后台、对话、最近；右边是选中对话此刻的画面">
+  <img src="docs/images/board-dark.png" width="900" alt="会话台：顶栏是八家的标签（Claude、Codex、pi、Hermes、Kimi Code、Gemini、OpenCode、Antigravity）；左边按项目列出 Gemini CLI 的对话，默认账号和工作号混在一起、标着账号名，有在跑、等你回复、刚做完；右边是在跑那条此刻的画面">
 </picture>
 
 <sub>截图用的是假数据。</sub>
@@ -43,7 +43,7 @@ curl -fsSL https://github.com/dodo258/huitai/releases/latest/download/install.sh
 cargo install --locked --git https://github.com/dodo258/huitai
 ```
 
-**要求**：macOS（在 macOS 27、Apple 芯片上开发和测试；Intel 版只做了构建，没有真机测过）。在新标签页打开对话需要 [Ghostty](https://ghostty.org) 1.3 以上、[Kaku](https://github.com/tw93/Kaku) 或 [cmux](https://cmux.com)，别的终端在当前窗口打开（cmux 不支持开机自动打开和 ⌥空格新开会话台，它不接受从外面控制）。Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 装了哪家就列哪家：CLI 装在哪都行，你的终端里敲得出来就行；用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`PI_CODING_AGENT_DIR` 把数据放在别处的，会话台跟着去那里找。界面是简体中文。
+**要求**：macOS（在 macOS 27、Apple 芯片上开发和测试；Intel 版只做了构建，没有真机测过）。在新标签页打开对话需要 [Ghostty](https://ghostty.org) 1.3 以上、[Kaku](https://github.com/tw93/Kaku) 或 [cmux](https://cmux.com)，别的终端在当前窗口打开（cmux 不支持开机自动打开和 ⌥空格新开会话台，它不接受从外面控制）。Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode 装了哪家就列哪家：CLI 装在哪都行，你的终端里敲得出来就行；用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`PI_CODING_AGENT_DIR` 把数据放在别处的，会话台跟着去那里找。界面是简体中文。
 
 **占用**：会话台开着时约 27 MB 内存，后台守护进程空闲时约 22 MB（Apple M4 Max 实测）；没东西在跑时不重画，几乎不占 CPU。
 
@@ -57,7 +57,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 
 ## 常用操作
 
-**找对话**：`Tab` 换一家，`↑↓` 或 `jk` 移动，`←→` 收起、展开项目，在项目上按回车直接进到它的第一条对话，`1-9` 跳到第几个项目。`/` 搜标题和对话正文。
+**找对话**：`Tab` 换一家，`↑↓` 或 `jk` 移动，`←→` 收起、展开项目，在项目上按回车直接进到它的第一条对话，`1-9` 跳到第几个项目。`/` 搜标题和对话正文，默认只搜当前这家；不记得是在哪家聊的，搜索时按 `⌃A` 各家一起搜（结果按相关度混排，每行前面标那家的标记，回车照常打开），再按一次或 `Tab` 换家回到只搜一家。
 
 **接着聊**：回车在新标签页打开，已经开着的直接切过去，不会开第二个。想在当前窗口聊就按 `w`，对话结束回到会话台。
 
@@ -71,9 +71,9 @@ cargo install --locked --git https://github.com/dodo258/huitai
 
 **删了能找回**：`d` 把对话移进会话台的回收站，不真删（Codex 的对话只是藏起来）。`u` 恢复这家最近删的一条，多按几次依次往前找回。
 
-列表顶上一行表头：左边是项目，右边几列依次是状态、后台在跑几条、对话条数、最近什么时候聊过。数字 1–9 跳到对应项目。展开着的项目标题垫一层淡底，往下翻到组中间时它钉在列表最上面，随时点一下、按 `←` 就能收起。一个月以上没聊过的项目收进列表底部的「很久没聊」，回车打开。底栏右侧是选中项目的路径，单击在访达里打开。
+列表顶上一行表头：左边是项目和对话标题，右边几列依次是状态（每条对话的状态灯，有计划时前面写进度如 `2/5`；收起的项目写组里几条在跑、有没有等你）、后台在跑几条、对话条数、最近什么时候聊过。每列都靠右对齐在表头字下面；终端窄了先省对话条数，再省后台、最近，表头跟着一起省，状态列一直在。数字 1–9 跳到对应项目。展开着的项目标题垫一层淡底，往下翻到组中间时它钉在列表最上面，随时点一下、按 `←` 就能收起。一个月以上没聊过的项目收进列表底部的「很久没聊」，回车打开。底栏右侧是选中项目的路径，单击在访达里打开。
 
-列表里的状态灯：转着的绿色半圆 `◐` 在跑，`◆` 等你回复（慢慢闪），`✓` 刚做完，`○` 已停；一条对话从在跑停下来（做完或要你回复）的那一刻，整行亮一下再慢慢淡掉，收起的项目组由组标题替它亮；淡绿色的是别处（比如桌面端）开着的对话，转着表示它正在干活、不转表示只是开着，打开前会先问你。
+列表里的状态灯（在状态列）：转着的绿色半圆 `◐` 在跑，`◆` 等你回复（慢慢闪），`✓` 刚做完、你还没看过（看过就变成 `◆`），`✗` 失败，`○` 已停；一条对话从在跑停下来（做完或要你回复）的那一刻，整行亮一下再慢慢淡掉，收起的项目组由组标题替它亮；淡绿色的是别处（比如桌面端）开着的对话，转着表示它正在干活、不转表示只是开着，打开前会先问你。
 
 顶栏印章后面是各家合计：会话台托管的在跑几条（`◐3 在跑`）、等你几条（`◆1 等你`），别处开着几条（`●2 别处`）；没有就不写。单击「等你」跳到下一条等你回复的，单击「别处」跳到下一条别处开着的。
 
@@ -82,7 +82,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 - 在项目目录（或它的子目录）里敲 `ai`，这个项目自动展开。
 - `!` 跳到下一条等你回复的对话，各家轮着找；点顶栏的 `◆` 也一样。点顶栏的 `●N 别处` 跳到下一条桌面端等别处开着的。
 - `s` 把各家等你回复和在跑的对话列在一起，等你的排最前，一眼看出哪几条卡着；`Esc` 回到列表。
-- `v`（或 `→`）看整段对话：只读，从最后看起，工具调用折成一行、`t` 展开；从搜索结果里打开会高亮搜索词，`n` 跳下一处。确认是这条再 `⏎` 接着聊。
+- `v`（或 `→`）看整段对话：只读，从最后看起，工具调用折成一行、`t` 展开；从搜索结果里打开会高亮搜索词，`n` 跳下一处。确认是这条再 `⏎` 接着聊。按 `s` 把这条对话存成 Markdown，放在 `~/Downloads/<标题>-<日期>.md`（重名加序号），底栏写存到哪了；文件开头是标题、厂商、项目、时间，每条消息标着是你还是 AI，工具调用每次一行。
 - `⌥空格` 随时呼出会话台。后台第一次开对话时起来，之后一直有效。
 - `c` 复制恢复命令（`cd '目录' && claude --resume …`），粘进任何终端都能接着聊。
 - `x` 结束一条在后台跑的对话。
@@ -112,10 +112,11 @@ cargo install --locked --git https://github.com/dodo258/huitai
 | | `↑↓` `jk` | 移动 |
 | | `←→` `hl` | 收起 / 展开 |
 | | `/` | 搜标题和正文 |
+| | `⌃A`（搜索时） | 各家一起搜 / 只搜当前这家 |
 | | `1-9` | 跳到第几个项目 |
 | | `!` | 下一条等你回复的（跨家） |
 | | `s` | 各家等你回复和在跑的列在一起 |
-| | `v` / `→` | 看整段对话（只读，`t` 展开工具调用） |
+| | `v` / `→` | 看整段对话（只读，`t` 展开工具调用，`s` 存成 Markdown） |
 | | `b` | 显示 / 隐藏后台对话 |
 | 开 | `⏎` | 新标签页打开 |
 | | `w` / `⌥⏎` | 当前窗口打开（`⌥⏎` 要终端把 Option 当 Alt） |
@@ -137,8 +138,36 @@ cargo install --locked --git https://github.com/dodo258/huitai
 | | `q` | 退出（后台对话不停） |
 | 全局 | `⌥空格` | 呼出会话台 |
 
-命令行只有五个：`ai`（会话台）、`ai doctor`（自检）、`ai update`（升级：Homebrew 装的跑 `brew upgrade`，cargo 装的告诉你命令，直接下载的校验后换成新版；在跑的对话不受影响）、`ai attach <id>`（新标签页里用的，不用记）、`ai daemon`（后台，自动拉起）。
+命令行只有八个：`ai`（会话台）、`ai doctor`（自检）、`ai list`、`ai search <词>`（不进界面直接列对话、搜对话，见下面「命令行查询」）、`ai export <对话 id> [-o 文件]`（把一条对话导出成 Markdown，不给 `-o` 就打到标准输出；对话 id 在 `c` 复制的恢复命令里，几个账号里都有同一个 id 时会列出带账号的写法让你选）、`ai update`（升级：Homebrew 装的跑 `brew upgrade`，cargo 装的告诉你命令，直接下载的校验后换成新版；在跑的对话不受影响）、`ai attach <id>`（新标签页里用的，不用记）、`ai daemon`（后台，自动拉起）。
 
+## 命令行查询
+
+不进界面、直接把结果打出来，可以接管道、给脚本用。只读：读的是会话台上次扫到的索引，不扫描、不改任何文件，也不拉起后台；刚聊的新对话要开一次 `ai` 才查得到。从没开过 `ai`（还没有索引）时会说「还没有索引……先运行一次 ai」并以非 0 退出。
+
+- `ai list [--vendor 名] [--json]`：列出全部对话，最近的在前。`--vendor` 只要一家，写 `claude`、`codex`、`pi`、`hermes`、`kimi`、`gemini`、`opencode`、`antigravity` 或顶栏上的名字（不分大小写）。
+- `ai search <词…> [--json]`：搜标题和正文，结果和顺序同界面里按 `/` 搜：一家一家排（顺序同顶栏），每家里标题命中的在前、之后正文按相关度。几个词用空格分开，每个都要命中。
+
+不加 `--json` 时一条一行、各列对齐：时间、厂商、账号、状态（`托管中` 或 `-`）、项目、标题、id。id 在最后，`ai list | awk '{print $NF}'` 就能拿到；项目、标题太长会截断。`ai search` 正文命中的结果，下一行缩进四格写命中的那段正文。没有结果时什么都不打，在标准错误说一句。
+
+加 `--json` 打一个 JSON 数组，没有结果是 `[]`。每条的字段是稳定接口，以后只加不改：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `id` | 字符串 | 会话台用的对话 id，`ai export <id>` 认它；非默认账号的带 `<账号>:` 前缀 |
+| `vendor` | 字符串 | 厂商：`claude`、`codex`、`pi`、`hermes`、`kimi`、`gemini`、`opencode`、`antigravity` |
+| `account` | 字符串 | 账号显示名，家目录下默认位置的叫「默认」 |
+| `project` | 字符串 | 项目目录（绝对路径） |
+| `title` | 字符串 | 标题：会话台里改的名字优先，其次厂商的标题，都没有是 id |
+| `state` | 字符串 | `hosted`：会话台托管着、CLI 进程在跑；`stopped`：没有 |
+| `last_active` | 字符串 | 最近时间，本地时区的 RFC 3339，如 `2026-11-23T10:59:02+08:00` |
+| `archived` | 布尔 | 在会话台里归档了 |
+| `automatic` | 布尔 | 自动运行的对话（`claude -p`、`codex exec` 这类脚本、后台任务起的） |
+| `snippet` | 字符串或 `null` | 只有 `ai search` 有：命中的那段正文（一行，最多 240 字）；只命中标题、或读不到正文时是 `null` |
+
+```sh
+ai list --vendor codex --json | jq -r '.[] | select(.state == "hosted") | .title'
+ai search 部署 脚本 | head
+```
 
 ## 和 Rex 有什么不同
 
@@ -147,7 +176,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 | | 会话台 | Rex |
 |---|---|---|
 | 是什么 | 装在你现有终端里的一条命令 `ai`，Ghostty、Kaku、cmux 照用 | 一个独立的终端 App，用来替换你现在的终端 |
-| 管哪些对话 | 本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Qwen Code 的全部历史对话，按项目分组、全文搜索，回车接着聊 | 在 Rex 里开的会话；给 Claude Code、Codex、OpenCode、pi 标出谁在干活、谁在等你 |
+| 管哪些对话 | 本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Antigravity（`agy` 和 Antigravity App）的全部历史对话，按项目分组、全文搜索，回车接着聊 | 在 Rex 里开的会话；给 Claude Code、Codex、OpenCode、pi 标出谁在干活、谁在等你 |
 | 额度 | 顶栏显示 Claude、Codex 的限额窗口和 pi 的今日 token | 官方资料里没提到 |
 | 多台机器 | 只管本机 | 强项：连接别的机器上的 Rex 服务，iOS 等客户端在路上 |
 | 怎么拿到 | 一行命令安装，MIT 开源 | 加入邮件列表等邀请，免费、不用注册账号 |

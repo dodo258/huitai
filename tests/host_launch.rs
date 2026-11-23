@@ -61,7 +61,8 @@ fn ai_attach_forwards_output_and_returns_cli_exit_code() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(5), "输出：{text:?}");
     assert!(text.contains("got:hello"), "{text:?}");
-    assert!(text.contains("\x1b]2;π proj\x07"), "{text:?}");
+    // 前面可能已经带上守护进程算的状态（「●在跑 」），看 attach 是在它算出来之前还是之后。
+    assert!(text.contains("proj · pi\x07"), "{text:?}");
 }
 
 /// `ai attach` 跑在真终端（PTY）里：外层窗口改大小时 CLI 要收到新尺寸。

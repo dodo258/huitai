@@ -146,6 +146,26 @@ pub fn ago(then: SystemTime, now: SystemTime) -> String {
     }
 }
 
+/// 在跑了多久：「45 秒」「4 分 12 秒」「1 小时 3 分」。
+pub fn clock(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s} 秒"),
+        60..3600 => format!("{} 分 {} 秒", s / 60, s % 60),
+        _ => format!("{} 小时 {} 分", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// 用了多久、等了多久：「45 秒」「6 分钟」「1 小时 3 分」。
+pub fn span(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s} 秒"),
+        60..3600 => format!("{} 分钟", s / 60),
+        _ => format!("{} 小时 {} 分", s / 3600, s % 3600 / 60),
+    }
+}
+
 /// 家目录开头的换成 `~`。
 pub fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
@@ -191,6 +211,17 @@ pub fn resume_line(cmd: &Command, env: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_and_span() {
+        let d = Duration::from_secs;
+        assert_eq!(clock(d(45)), "45 秒");
+        assert_eq!(clock(d(252)), "4 分 12 秒");
+        assert_eq!(clock(d(3780)), "1 小时 3 分");
+        assert_eq!(span(d(360)), "6 分钟");
+        assert_eq!(span(d(59)), "59 秒");
+        assert_eq!(span(d(7200)), "2 小时 0 分");
+    }
 
     #[test]
     fn truncates_by_display_width() {

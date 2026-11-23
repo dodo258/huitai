@@ -1,104 +1,102 @@
-//! 只读查询 SQLite：调用系统自带的 `/usr/bin/sqlite3 -readonly -json`，不引入 SQLite 依赖。
-//! WAL 库在厂商进程没开着时没有 `-shm`，只读打开会失败（错误 14），这时改用 `immutable=1` 再查一次：
-//! 没有写入方，按不可变读是一致的。
+//! 只读查询厂商的 SQLite 库：进程内 rusqlite（和索引共用 bundled 的 SQLite），只读打开、从不写库，
+//! 等锁最多 [`BUSY`]，一次查询最多跑 [`TIMEOUT`]（到点中断）。
+//! WAL 库在厂商进程没开着时没有 `-shm`，所在目录又建不了（只读挂载、没有写权限）时，只读打开会失败
+//! （`SQLITE_CANTOPEN`，或 `SQLITE_READONLY_DIRECTORY`），这时改用 `immutable=1` 再查一次：没有写入方，按不可变读是一致的。
+//! 每行转成列名到值的 JSON 对象交给各家：字按原始字节取，不合法的 UTF-8 只坏那个字（见 [`text`]）；
+//! 无穷大这类 JSON 表示不了的实数当 null。
 
-use std::io::{self, Read};
+use std::collections::HashSet;
+use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::{Map, Value};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, ErrorCode, OpenFlags};
+use serde_json::{Map, Number, Value};
 
+/// 厂商正在写库时最多等这么久。
+const BUSY: Duration = Duration::from_secs(2);
+/// 一次查询最多跑这么久。
 const TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 库路径和 SQL 前面的参数。`-init /dev/null` 顶掉 `~/.sqliterc`：用户的启动脚本可能打印东西或改输出格式，
-/// 混进 `-json` 的结果就解析不了。
-const ARGS: [&str; 6] = [
-    "-init",
-    "/dev/null",
-    "-readonly",
-    "-json",
-    "-cmd",
-    ".timeout 2000",
-];
 
 pub(crate) type Row = Map<String, Value>;
 
 pub(crate) fn query(db: &Path, sql: &str) -> io::Result<Vec<Row>> {
-    match run(&db.to_string_lossy(), sql) {
-        Err(e) if e.to_string().contains("unable to open") => run(&immutable_uri(db), sql),
+    query_within(db, sql, TIMEOUT)
+}
+
+fn query_within(db: &Path, sql: &str, timeout: Duration) -> io::Result<Vec<Row>> {
+    let result = match run(db, false, sql, timeout) {
+        Err(e)
+            if matches!(
+                e.sqlite_error_code(),
+                Some(ErrorCode::CannotOpen | ErrorCode::ReadOnly)
+            ) =>
+        {
+            run(db, true, sql, timeout)
+        }
         other => other,
+    };
+    result.map_err(|e| match e.sqlite_error_code() {
+        Some(ErrorCode::OperationInterrupted) => io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("SQLite 查询超过 {} 秒", timeout.as_secs_f32()),
+        ),
+        _ => io::Error::other(format!("SQLite: {e}")),
+    })
+}
+
+fn run(db: &Path, immutable: bool, sql: &str, timeout: Duration) -> rusqlite::Result<Vec<Row>> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut conn = if immutable {
+        Connection::open_with_flags(immutable_uri(db), flags | OpenFlags::SQLITE_OPEN_URI)?
+    } else {
+        Connection::open_with_flags(db, flags)?
+    };
+    conn.busy_timeout(BUSY)?;
+    let deadline = Instant::now() + timeout;
+    conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+    let mut stmt = conn.prepare(sql)?;
+    let names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let mut row = Row::new();
+        for (i, name) in names.iter().enumerate() {
+            row.insert(name.clone(), value(r.get_ref(i)?));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn value(v: ValueRef<'_>) -> Value {
+    match v {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::from(i),
+        ValueRef::Real(f) => Number::from_f64(f).map_or(Value::Null, Value::Number),
+        ValueRef::Text(b) | ValueRef::Blob(b) => Value::String(text(b)),
     }
 }
 
-fn run(target: &str, sql: &str) -> io::Result<Vec<Row>> {
-    let bin = if Path::new("/usr/bin/sqlite3").exists() {
-        "/usr/bin/sqlite3"
-    } else {
-        "sqlite3"
-    };
-    let mut child = Command::new(bin)
-        .args(ARGS)
-        .args([target, sql])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| io::Error::new(e.kind(), format!("启动 {bin} 失败: {e}")))?;
-    let mut stdout = child.stdout.take().expect("stdout 已设为 piped");
-    let mut stderr = child.stderr.take().expect("stderr 已设为 piped");
-    let out = thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).map(|_| buf)
-    });
-    let err = thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("sqlite3 查询超过 {} 秒", TIMEOUT.as_secs()),
-            ));
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
-    let stdout = out
-        .join()
-        .map_err(|_| io::Error::other("读 sqlite3 输出的线程异常"))??;
-    let stderr = err.join().unwrap_or_default();
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "sqlite3 {target}: {}",
-            stderr.trim()
-        )));
+/// 库里的字节转成字。不是合法 UTF-8 的地方换成 U+FFFD：按字节截断的汉字，和 SQLite 把孤立代理项
+/// `\ud800` 解出来的三个字节（`ED A0..BF xx`，换成一个）。
+pub(crate) fn text(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
     }
-    if stdout.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Vec::new());
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let [0xED, 0xA0..=0xBF, 0x80..=0xBF, ..] = bytes[i..] {
+            out.extend_from_slice("\u{FFFD}".as_bytes());
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
     }
-    let rows: Vec<Value> = serde_json::from_slice(&stdout).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("sqlite3 输出不是 JSON: {e}"),
-        )
-    })?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|r| match r {
-            Value::Object(m) => Some(m),
-            _ => None,
-        })
-        .collect())
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn immutable_uri(db: &Path) -> String {
@@ -114,6 +112,42 @@ fn immutable_uri(db: &Path) -> String {
     uri
 }
 
+/// 这张表现在有哪些列（厂商的表结构变得快，取列前先查）。
+pub(crate) fn columns(db: &Path, table: &str) -> io::Result<HashSet<String>> {
+    let rows = query(
+        db,
+        &format!("select name from pragma_table_info('{table}')"),
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.get("name")?.as_str().map(str::to_owned))
+        .collect())
+}
+
+/// 文字列，去掉首尾空白；空的、不是文字的当没有。
+pub(crate) fn str_col<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
+    row.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// 秒（可带小数）→ `SystemTime`；负数、非数和大到表示不了的（坏库、导入的数据）返回 `None`，不 panic：
+/// 扫描在全家共用的索引线程里跑，一条坏时间不能让它退出。
+pub(crate) fn secs(v: &Value) -> Option<SystemTime> {
+    let s = v.as_f64().filter(|s| *s >= 0.0)?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(s).ok()?)
+}
+
+/// `hex()` 传出来的原始字节：按字节截的一段可能切在字中间，要拼回整段再转字时用（Antigravity）。
+/// 不是十六进制返回 `None`。
+pub(crate) fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
+}
+
 /// 拼进 SQL 的 id 只允许字母数字、`-` 和 `_`（Hermes 的 id 带下划线），其余拒绝。
 pub(crate) fn safe_id(id: &str) -> Option<&str> {
     (!id.is_empty()
@@ -126,6 +160,7 @@ pub(crate) fn safe_id(id: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn uri_escapes_special_bytes() {
@@ -146,26 +181,82 @@ mod tests {
         assert_eq!(safe_id(""), None);
     }
 
-    /// sqlite3 以最后一个 `-init` 为准：前面先塞一个会打印东西、改输出格式的启动脚本（等同 `~/.sqliterc`），
-    /// 我们的参数要把它顶掉，输出还是干净的 JSON。
-    #[test]
-    fn startup_script_does_not_pollute_json() {
-        let dir = std::env::temp_dir().join(format!("huitai-sqliterc-{}", std::process::id()));
+    fn temp_db(name: &str, sql: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("huitai-sqlite-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let rc = dir.join("sqliterc");
-        std::fs::write(&rc, ".print polluted\nselect 'from rc';\n.mode list\n").unwrap();
-        let out = Command::new("/usr/bin/sqlite3")
-            .arg("-init")
-            .arg(&rc)
-            .args(ARGS)
-            .args([":memory:", "select 1 as a"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+        let db = dir.join("x.sqlite");
+        Connection::open(&db).unwrap().execute_batch(sql).unwrap();
+        db
+    }
+
+    /// WAL 库在写它的进程关掉以后没有 `-shm`，所在目录又不让建（如只读挂载）：只读打开报
+    /// `SQLITE_READONLY_DIRECTORY`，退到 `immutable=1` 照样读得到。
+    #[test]
+    fn wal_without_shm_falls_back_to_immutable() {
+        use std::os::unix::fs::PermissionsExt;
+        let db = temp_db(
+            "wal",
+            "pragma journal_mode = wal; create table t(a); insert into t values (1);",
+        );
+        let dir = db.parent().unwrap().to_owned();
+        assert!(!dir.join("x.sqlite-shm").exists());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let direct = run(&db, false, "select a from t", TIMEOUT).map_err(|e| e.sqlite_error_code());
+        let rows = query(&db, "select a from t");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        let rows: Vec<Value> = serde_json::from_slice(&out.stdout)
-            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
-        assert_eq!(rows, vec![serde_json::json!({ "a": 1 })]);
+        assert_eq!(direct, Err(Some(ErrorCode::ReadOnly)));
+        assert_eq!(rows.unwrap(), vec![row(json!({ "a": 1 }))]);
+    }
+
+    fn row(v: Value) -> Row {
+        v.as_object().unwrap().clone()
+    }
+
+    /// 坏 UTF-8 只坏那个字：按字节截断的汉字换成一个 U+FFFD，孤立代理项解出来的三个字节也只换一个；
+    /// 无穷大当 null；二进制按字取。以前 `sqlite3 -json` 遇到前两种原样输出、整批结果解析不了，遇到无穷大输出裸 `Inf`。
+    #[test]
+    fn values_that_broke_the_command_line_output() {
+        let db = temp_db("values", "create table t(a);");
+        let rows = query(
+            &db,
+            "select cast(x'e68ea5e58f' as text) as cut, cast(x'61eda0bd62' as text) as lone, \
+             1e999 as inf, -1e999 as ninf, x'e68ea5' as blob, 1.5 as real, 7 as int, null as none, \
+             '{\"text\":\"a\\ud83db\"}' ->> '$.text' as extracted",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+        assert_eq!(
+            rows,
+            vec![row(json!({
+                "cut": "接\u{FFFD}",
+                "lone": "a\u{FFFD}b",
+                "inf": null,
+                "ninf": null,
+                "blob": "接",
+                "real": 1.5,
+                "int": 7,
+                "none": null,
+                "extracted": "a\u{FFFD}b",
+            }))]
+        );
+    }
+
+    /// 跑不完的查询到点中断，返回超时，不卡住扫描线程。
+    #[test]
+    fn long_query_is_interrupted() {
+        let db = temp_db("slow", "create table t(a);");
+        let started = Instant::now();
+        let e = query_within(
+            &db,
+            "with recursive n(i) as (select 1 union all select i + 1 from n) select count(*) from n",
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

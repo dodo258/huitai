@@ -166,8 +166,9 @@ fn reopened_interrupted_conversation_that_dies_at_once_stays_interrupted() {
         .collect();
     interrupt::save(&interrupt::running_path(&dir), &left).unwrap();
     let daemon = Daemon::bind(&dir).unwrap();
+    let handle = daemon.handle();
     std::thread::spawn(move || daemon.run());
-    let host = TestHost { dir };
+    let host = TestHost { dir, handle };
     let list = || match host.request(&Request::Interrupted) {
         Response::Interrupted(l) => l.into_iter().map(|r| r.id).collect::<Vec<_>>(),
         other => panic!("Interrupted 应答不对：{other:?}"),

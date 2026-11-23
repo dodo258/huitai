@@ -1,14 +1,17 @@
 //! Claude 的两个官方渠道：状态栏缓存、用量接口；以及给会话台启动的 Claude 注入状态栏的 `--settings`。
 
+use std::collections::HashMap;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
 use super::rules::Channel;
-use super::{QuotaReader, exec, time, windows_from};
+use super::{QuotaReader, curl, time, windows_from};
+use crate::core::exec;
 use crate::core::{QuotaReading, Vendor};
 
 /// 取用量接口原始响应体的方式。默认实现读钥匙串里的登录凭证再用 curl 请求；测试里换成假数据。
@@ -67,10 +70,11 @@ pub(super) fn read_usage_api(r: &QuotaReader, ch: &Channel) -> Result<QuotaReadi
     else {
         unreachable!("只给用量接口渠道调用")
     };
-    // 钥匙串里那份登录凭证对应默认配置目录；改过 CLAUDE_CONFIG_DIR 时认不出该用哪份，宁可不读也不拿别的账号的。
-    if r.dirs.override_of(Vendor::Claude, &r.home).is_some() {
-        return Err("改过 CLAUDE_CONFIG_DIR，认不出该用哪份登录凭证，不走用量接口".to_owned());
-    }
+    // 非默认目录的账号有自己那份钥匙串条目，绝不拿默认那份（别的账号的）。
+    let service = match r.dirs.override_of(Vendor::Claude, &r.home) {
+        None => keychain_service.clone(),
+        Some((_, dir)) => account_service(keychain_service, &dir)?,
+    };
     let cache = r.data_dir.join(cache_file);
     if let Some(cached) = fs::read_to_string(&cache)
         .ok()
@@ -84,7 +88,7 @@ pub(super) fn read_usage_api(r: &QuotaReader, ch: &Channel) -> Result<QuotaReadi
     let body = (r.fetch)(&UsageRequest {
         url,
         headers,
-        keychain_service,
+        keychain_service: &service,
         token_pointer: token,
         expires_at_ms_pointer: expires_at_ms,
         timeout: Duration::from_secs(*timeout_secs),
@@ -105,9 +109,63 @@ pub(super) fn read_usage_api(r: &QuotaReader, ch: &Channel) -> Result<QuotaReadi
     Ok(reading)
 }
 
-/// 真实的用量接口请求：钥匙串取 Claude 登录凭证（只在内存里用），通过标准输入把请求头交给 curl，
-/// 不放进命令行参数，别的进程看不到。凭证过期就不请求（刷新凭证是 Claude 自己的事，会话台不碰）。
-pub(super) fn fetch_usage(req: &UsageRequest) -> Result<String, String> {
+/// 非默认目录（设了 `CLAUDE_CONFIG_DIR`）的账号在钥匙串里的条目名：默认条目名后面接
+/// `-<sha256(目录原样字符串) 的前 8 位十六进制>`（Claude Code 2.1.330 包里的 `m8()`：
+/// `` `Claude Code${OAUTH_FILE_SUFFIX}-credentials${CLAUDE_CONFIG_DIR ? "-" + sha256(dir).hex.slice(0,8) : ""}` ``）。
+/// 会话台启动这个账号时 `CLAUDE_CONFIG_DIR` 传的就是 `dir` 这个写法。
+pub(super) fn account_service(base: &str, dir: &Path) -> Result<String, String> {
+    let hex = sha256_hex(&dir.to_string_lossy())?;
+    Ok(format!("{base}-{}", &hex[..8]))
+}
+
+/// 系统自带的 `shasum` 算 SHA-256（只给钥匙串条目名用，一个账号 5 分钟最多一次）。
+fn sha256_hex(s: &str) -> Result<String, String> {
+    let out = exec::run("shasum", &["-a", "256"], Some(s), Duration::from_secs(3))
+        .map_err(|e| e.to_string())?;
+    let hex = out.split_whitespace().next().unwrap_or_default();
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(hex.to_ascii_lowercase())
+    } else {
+        Err("shasum 输出不认识".to_owned())
+    }
+}
+
+/// 钥匙串读一次最多管多久：几个账号、每分钟一次的额度刷新都不会高频读钥匙串（高频读会把 securityd 弄崩，
+/// claude-swap#496）。读不到也记着，5 分钟内不再问。
+const KEYCHAIN_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// 钥匙串条目名 → 读的时间和 access token（只在内存里，不落盘）或读不到的原因。
+type KeychainCache = HashMap<String, (Instant, Result<(String, Option<i64>), String>)>;
+
+static KEYCHAIN: Mutex<Option<KeychainCache>> = Mutex::new(None);
+
+/// 从钥匙串读这个条目里的 access token 和过期时间（毫秒），见 [`KEYCHAIN_TTL`]。只读，不刷新令牌。
+fn access_token(req: &UsageRequest) -> Result<(String, Option<i64>), String> {
+    cached(&KEYCHAIN, req.keychain_service, Instant::now(), || {
+        read_keychain(req)
+    })
+}
+
+/// `service` 这一项 [`KEYCHAIN_TTL`] 内读过就用上次的结果（成功失败都算），否则调 `read` 重读并记下。
+fn cached(
+    cache: &Mutex<Option<KeychainCache>>,
+    service: &str,
+    now: Instant,
+    read: impl FnOnce() -> Result<(String, Option<i64>), String>,
+) -> Result<(String, Option<i64>), String> {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some((at, got)) = cache.get(service)
+        && now.saturating_duration_since(*at) < KEYCHAIN_TTL
+    {
+        return got.clone();
+    }
+    let got = read();
+    cache.insert(service.to_owned(), (now, got.clone()));
+    got
+}
+
+fn read_keychain(req: &UsageRequest) -> Result<(String, Option<i64>), String> {
     let creds = exec::run(
         "security",
         &["find-generic-password", "-s", req.keychain_service, "-w"],
@@ -124,30 +182,46 @@ pub(super) fn fetch_usage(req: &UsageRequest) -> Result<String, String> {
     let expires_ms = creds
         .pointer(req.expires_at_ms_pointer)
         .and_then(Value::as_i64);
+    Ok((token.to_owned(), expires_ms))
+}
+
+/// 真实的用量接口请求：钥匙串取 Claude 登录凭证（只在内存里用），通过标准输入把请求头交给 curl，
+/// 不放进命令行参数，别的进程看不到。凭证过期就不请求（刷新凭证是 Claude 自己的事，会话台不碰）。
+pub(super) fn fetch_usage(req: &UsageRequest) -> Result<String, String> {
+    let (token, expires_ms) = access_token(req)?;
     if expires_ms.is_some_and(|ms| ms / 1000 <= req.now_secs) {
         return Err("登录凭证已过期，等 Claude 下次启动时自己刷新".to_owned());
     }
+    let (argv, header_lines) = usage_command(req, &token);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    exec::run(
+        argv[0],
+        &argv[1..],
+        Some(&header_lines),
+        req.timeout + Duration::from_secs(2),
+    )
+    .map_err(|e| format!("用量接口请求失败: {e}"))
+}
+
+/// 用量接口的 curl 命令（程序在第一个）和经标准输入给的请求头：和余额渠道一样用系统自带的 curl、第一个参数 `-q`
+/// （[`curl::argv`]），`~/.curlrc` 里的追踪选项不会把凭证写进文件；凭证只在标准输入里，不进命令行参数。
+pub fn usage_command(req: &UsageRequest, token: &str) -> (Vec<String>, String) {
     let mut header_lines = format!("Authorization: Bearer {token}\n");
     for h in req.headers {
         header_lines.push_str(h);
         header_lines.push('\n');
     }
     let max_time = req.timeout.as_secs().max(1).to_string();
-    exec::run(
-        "curl",
-        &[
-            "-sS",
-            "--fail",
-            "--max-time",
-            &max_time,
-            "-H",
-            "@-",
-            req.url,
-        ],
-        Some(&header_lines),
-        req.timeout + Duration::from_secs(2),
-    )
-    .map_err(|e| format!("用量接口请求失败: {e}"))
+    let argv = curl::argv(&[
+        "-sS",
+        "--fail",
+        "--max-time",
+        &max_time,
+        "-H",
+        "@-",
+        req.url,
+    ]);
+    (argv.into_iter().map(str::to_owned).collect(), header_lines)
 }
 
 /// 生成 `--settings` 的 JSON：状态栏命令先把标准输入（Claude 给状态栏的数据）存进缓存，
@@ -214,6 +288,36 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 条目名的算法：和 `printf %s <目录> | shasum -a 256` 前 8 位一致。
+    #[test]
+    fn account_service_appends_dir_hash() {
+        // sha256("/Users/me/.claude-work") 的前 8 位。
+        let s = account_service(
+            "Claude Code-credentials",
+            Path::new("/Users/me/.claude-work"),
+        );
+        assert_eq!(s.unwrap(), "Claude Code-credentials-1e91dd84");
+    }
+
+    /// 钥匙串 5 分钟内只读一次（读不到也算），各条目分开记。
+    #[test]
+    fn keychain_is_read_at_most_once_per_five_minutes() {
+        let cache = Mutex::new(None);
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Err::<(String, Option<i64>), _>("没有这一项".to_owned())
+        };
+        let t0 = Instant::now();
+        assert!(cached(&cache, "a", t0, read).is_err());
+        assert!(cached(&cache, "a", t0 + Duration::from_secs(299), read).is_err());
+        assert_eq!(reads.get(), 1);
+        let _ = cached(&cache, "b", t0, read);
+        assert_eq!(reads.get(), 2, "别的条目单独读");
+        let _ = cached(&cache, "a", t0 + KEYCHAIN_TTL, read);
+        assert_eq!(reads.get(), 3, "过了 5 分钟重读");
+    }
 
     #[test]
     fn quotes_single_quotes() {

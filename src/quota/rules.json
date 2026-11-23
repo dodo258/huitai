@@ -73,5 +73,41 @@
       "timestamp": "/timestamp",
       "count": ["/message/usage/totalTokens"]
     }
-  ]
+  ],
+  "balance": {
+    "_说明": "API 余额和订阅额度。每把密钥只发给它自己那家（url 的域名必须在代码里那家的域名表里）。public=false 的是没有公开文档的接口，照官方开源工具的写法接，界面上标「非公开接口」。",
+    "timeout_secs": 5,
+    "cache_minutes": 5,
+    "backoff_minutes": 10,
+    "backoff_max_minutes": 60,
+    "cache_file": "balance.json",
+    "providers": {
+      "deepseek": {
+        "url": "https://api.deepseek.com/user/balance", "public": true,
+        "parse": { "kind": "money_list", "list": "/balance_infos", "currency": "/currency", "amount": "/total_balance", "available": "/is_available" }
+      },
+      "moonshot_cn": {
+        "url": "https://api.moonshot.cn/v1/users/me/balance", "public": true,
+        "parse": { "kind": "money", "amount": "/data/available_balance", "debt": "/data/cash_balance", "currency": "CNY" }
+      },
+      "moonshot_intl": {
+        "url": "https://api.moonshot.ai/v1/users/me/balance", "public": true,
+        "parse": { "kind": "money", "amount": "/data/available_balance", "debt": "/data/cash_balance", "currency": "USD" }
+      },
+      "openrouter": {
+        "url": "https://openrouter.ai/api/v1/key", "public": true,
+        "parse": { "kind": "credit", "usage": "/data/usage", "limit": "/data/limit", "remaining": "/data/limit_remaining", "currency": "USD" }
+      },
+      "kimi_code": {
+        "url": "https://api.kimi.com/coding/v1/usages", "public": false,
+        "parse": { "kind": "windows", "windows": [
+          { "items": "/limits", "detail": "/detail", "used": "/used", "limit": "/limit", "remaining": "/remaining",
+            "resets_at": ["/resetTime", "/resetAt", "/reset_at", "/reset_time"],
+            "duration": "/window/duration", "unit": "/window/timeUnit", "units": { "MINUTE": 1, "HOUR": 60, "DAY": 1440 } },
+          { "items": "/usage", "used": "/used", "limit": "/limit", "remaining": "/remaining",
+            "resets_at": ["/resetTime", "/resetAt", "/reset_at", "/reset_time"], "label": "周" }
+        ] }
+      }
+    }
+  }
 }

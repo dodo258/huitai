@@ -364,3 +364,235 @@ fn only_db_and_wal_changes_affect_the_list() {
     assert!(!src.affects(&dir.join("opencode-local.db")));
     assert!(!src.affects(&dir.join("snapshot/x/opencode.db")));
 }
+
+#[test]
+fn moment_from_last_turn() {
+    let (_, src) = setup("opencode-moment");
+    let scan = src.scan();
+    let m = src.load_moment(by_id(&scan.sessions, V1)).unwrap();
+    assert_eq!(m.tool, None, "工具调用都有返回");
+    assert_eq!(m.summary.as_deref(), Some("旧路径都加了重定向。"));
+    assert_eq!(m.turn_started, Some(ms(1_795_000_060_000)));
+}
+
+/// 非默认账号的对话 id 带前缀：R 判断 `--prompt` 会不会自己发出，要换回 OpenCode 自己的 id 去库里找。
+#[test]
+fn message_delivery_of_a_non_default_account_uses_the_native_id() {
+    use huitai::core::Account;
+    use huitai::sources::{AccountSource, Delivery};
+    let (base, inner) = setup("opencode-delivery-account");
+    let work = Account::new(
+        Vendor::OpenCode,
+        "work",
+        base.join("opencode"),
+        Path::new("/nowhere"),
+    );
+    assert!(!work.key.is_empty(), "要测的是带前缀的账号");
+    let src = AccountSource::new(Box::new(inner), &work);
+    let scan = src.scan();
+    let find = |id: &str| {
+        scan.sessions
+            .iter()
+            .find(|s| s.id.as_str().ends_with(id))
+            .unwrap_or_else(|| panic!("没扫到 {id}"))
+    };
+    assert_ne!(find(V2).id.as_str(), V2, "id 带着账号前缀");
+    assert_eq!(src.message_delivery(find(V2)), Delivery::Sent);
+    assert_eq!(src.message_delivery(find(V1)), Delivery::Typed);
+    let _ = fs::remove_dir_all(base);
+}
+
+/// 审计 v0.1.3 第 19 条：提问之后助手连着 40 条只调工具、没有字（工具输出很大），预览要 8 条：
+/// 以前只取最后 32 条再挑有字的，一条都剩不下；现在按有字的往前取足，工具输出不读出来。
+#[test]
+fn preview_skips_long_runs_of_tool_only_steps() {
+    let out = "o".repeat(20_000);
+    let mut sql = format!(
+        "insert into message values ('msg_zq', '{V1}', 1795000500000, 1795000500000, '{{\"role\":\"user\"}}');\n\
+         insert into part values ('prt_zq', 'msg_zq', '{V1}', 1795000500000, 1795000500000, \
+         '{{\"type\":\"text\",\"text\":\"最后的问题\"}}');\n\
+         insert into session_message values ('smsg_zq', '{V2}', 'user', 500, 1795009500000, 1795009500000, \
+         '{{\"text\":\"最后的问题\"}}');\n"
+    );
+    for i in 0..40 {
+        let t = 1795000600000u64 + i;
+        sql.push_str(&format!(
+            "insert into message values ('msg_zt{i:02}', '{V1}', {t}, {t}, '{{\"role\":\"assistant\"}}');\n\
+             insert into part values ('prt_zt{i:02}', 'msg_zt{i:02}', '{V1}', {t}, {t}, \
+             '{{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{{\"input\":{{}},\"output\":\"{out}\"}}}}');\n\
+             insert into part values ('prt_zu{i:02}', 'msg_zt{i:02}', '{V1}', {t}, {t}, \
+             '{{\"type\":\"text\",\"text\":\"  \"}}');\n"
+        ));
+        let t = 1795009600000u64 + i;
+        let seq = 501 + i;
+        // 2.x：一半拆进 session_part，一半内联在 data.content。
+        let (data, part) = if i % 2 == 0 {
+            (
+                "{}".to_owned(),
+                format!(
+                    "insert into session_part values ('smsg_zt{i:02}', '{V2}', 0, 'tool', 'c{i}', {t}, {t}, \
+                     '{{\"name\":\"bash\",\"state\":{{\"content\":\"{out}\"}}}}');\n"
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "{{\"content\":[{{\"type\":\"tool\",\"name\":\"bash\",\"state\":{{\"content\":\"{out}\"}}}},\"裸字符串\"]}}"
+                ),
+                String::new(),
+            )
+        };
+        sql.push_str(&format!(
+            "insert into session_message values ('smsg_zt{i:02}', '{V2}', 'assistant', {seq}, {t}, {t}, '{data}');\n{part}"
+        ));
+    }
+    sql.push_str(&format!(
+        "update session set time_updated = 1795000700000 where id = '{V1}';\n\
+         update session_v2 set time_updated = 1795009700000 where id = '{V2}';\n"
+    ));
+    let (base, src) = setup("opencode-tool-run");
+    build_db(&base.join("opencode/opencode.db"), &sql);
+    let scan = src.scan();
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+    for id in [V1, V2] {
+        let preview = src.load_preview(by_id(&scan.sessions, id), 8).unwrap();
+        let last = preview.last().expect("预览不该是空的");
+        assert_eq!(
+            (last.role, last.text.as_str()),
+            (Role::User, "最后的问题"),
+            "{id}"
+        );
+        assert!(
+            preview.len() >= 2,
+            "提问前面的对话也取到：{id} {}",
+            preview.len()
+        );
+        assert!(preview.iter().all(|m| !m.text.trim().is_empty()));
+    }
+}
+
+/// 审计 v0.1.3 第 13 条：1.x 撤销不删消息，只记 `session.revert.messageID`；这条和之后的都不显示、不计数、
+/// 不进全文搜索。撤销到第二句话（`msg_a3`）：只剩第一轮。
+#[test]
+fn reverted_v1_messages_are_hidden() {
+    let (base, src) = setup("opencode-revert");
+    let db = base.join("opencode/opencode.db");
+    build_db(
+        &db,
+        &format!(
+            "ALTER TABLE session ADD COLUMN revert text;\n\
+             UPDATE session SET revert = '{{\"messageID\":\"msg_a3\",\"snapshot\":\"abc\"}}' WHERE id = '{V1}';\n\
+             UPDATE session SET revert = '{{\"messageID\":\"msg_b1\"}}' WHERE id = '{V1_FALLBACK}';\n"
+        ),
+    );
+    let scan = src.scan();
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+    let v1 = by_id(&scan.sessions, V1).clone();
+    assert_eq!(v1.message_count, 1);
+    // 唯一一句也撤了：和没说过话的一样不列。
+    assert!(scan.sessions.iter().all(|s| s.id.as_str() != V1_FALLBACK));
+    assert_eq!(
+        texts(&src.load_preview(&v1, 10).unwrap()),
+        [
+            (Role::User, "把接口文档按模块拆开"),
+            (Role::Assistant, "分成订单、用户两块了。"),
+        ]
+    );
+    let t = src.load_transcript(&v1).unwrap();
+    assert_eq!(t.parts.len(), 4, "{:?}", t.parts);
+    assert!(!t.parts.contains(&Part::ToolResult {
+        text: "exit 1".into()
+    }));
+    assert_eq!(src.count_messages(&v1).unwrap(), 1);
+
+    let index = Index::open(&base.join("index"), vec![Box::new(src)]).unwrap();
+    index.refresh();
+    index.index_bodies(&mut || true).unwrap();
+    let hits = |q: &str| index.search(Vendor::OpenCode, q, 10).unwrap().len();
+    assert_eq!(hits("订单"), 1);
+    assert_eq!(hits("重定向"), 0);
+    assert_eq!(hits("旧链接"), 0);
+}
+
+/// 补审第 3 条：孤立的 UTF-16 代理项（JavaScript 截在 emoji 中间）、按字节截在汉字中间的字，只让那个字变成
+/// U+FFFD，整家列表、整条预览和整段都照常读出来。
+#[test]
+fn broken_characters_do_not_break_the_list_or_preview() {
+    let (base, src) = setup("opencode-bad-chars");
+    // 1.x 第一句带孤立代理项；2.x 助手的一块字被截在「理」字中间（E7 90 86 只剩 E7 90）。
+    build_db(
+        &base.join("opencode/opencode.db"),
+        &format!(
+            "UPDATE part SET data = '{{\"type\":\"text\",\"text\":\"把接口\\ud83d文档按模块拆开\"}}' WHERE id = 'prt_a1a';\n\
+             INSERT INTO session_message VALUES ('msg_cut', '{V2}', 'assistant', 50, 1795009000000, 1795009000000, \
+               '{{\"content\":[{{\"type\":\"text\",\"text\":\"整' || cast(x'e790' as text) || '\"}}]}}');\n\
+             INSERT INTO session_message VALUES ('msg_cut2', '{V2}', 'user', 51, 1795009100000, 1795009100000, \
+               '{{\"text\":\"还有' || cast(x'e790' as text) || '\"}}');\n"
+        ),
+    );
+    let scan = src.scan();
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+    assert_eq!(scan.sessions.len(), 5, "整家照列");
+    let v1 = by_id(&scan.sessions, V1);
+    let first = &src.load_preview(v1, 10).unwrap()[0];
+    assert_eq!(first.text, "把接口\u{FFFD}文档按模块拆开");
+
+    let v2 = by_id(&scan.sessions, V2);
+    let msgs = src.load_preview(v2, 2).unwrap();
+    assert_eq!(
+        texts(&msgs),
+        [
+            (Role::Assistant, "整\u{FFFD}"),
+            (Role::User, "还有\u{FFFD}")
+        ]
+    );
+    let t = src.load_transcript(v2).unwrap();
+    assert!(t.parts.len() > 2, "别的消息照常读出来：{:?}", t.parts);
+    assert!(
+        t.parts
+            .iter()
+            .any(|p| matches!(p, Part::Message(m) if m.text == "整\u{FFFD}"))
+    );
+}
+
+/// 补审第 5 条：2.x 没起标题的对话，第一条用户消息坏了（截断的 JSON），标题用后面第一句有字的，不退回 id。
+#[test]
+fn v2_title_skips_a_broken_first_user_message() {
+    let (base, src) = setup("opencode-v2-title");
+    let id = "ses_e112f8ffffffV2brokenAbCdEf";
+    build_db(
+        &base.join("opencode/opencode.db"),
+        &format!(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated) \
+               VALUES ('{id}', 'prj_api', 'q', '/work/api', '2.0.0', 1795010000000, 1795010100000);\n\
+             INSERT INTO session_message VALUES ('msg_q1', '{id}', 'user', 1, 1795010010000, 1795010010000, '{{\"text\":\"截');\n\
+             INSERT INTO session_message VALUES ('msg_q2', '{id}', 'user', 2, 1795010020000, 1795010020000, '{{\"text\":\"  \"}}');\n\
+             INSERT INTO session_message VALUES ('msg_q3', '{id}', 'user', 3, 1795010030000, 1795010030000, '{{\"text\":\"给列表加分页\"}}');\n"
+        ),
+    );
+    let scan = src.scan();
+    assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+    let s = by_id(&scan.sessions, id);
+    assert_eq!(s.title.as_deref(), Some("给列表加分页"));
+}
+
+/// 审计 v0.1.4 第 20 条：1.x 一块字里有孤立代理项时，整段（导出、全文搜索用的）只把那个字换成 U+FFFD，
+/// 两边的正文和成对的 emoji 都留着，不整块丢掉。
+#[test]
+fn lone_surrogate_keeps_the_rest_of_the_transcript() {
+    let (base, src) = setup("opencode-bad-chars-transcript");
+    build_db(
+        &base.join("opencode/opencode.db"),
+        "UPDATE part SET data = '{\"type\":\"text\",\"text\":\"把接口\\ud83d文档按模块拆开\\ud83d\\ude00\"}' WHERE id = 'prt_a1a';\n",
+    );
+    let scan = src.scan();
+    let v1 = by_id(&scan.sessions, V1);
+    let t = src.load_transcript(v1).unwrap();
+    assert!(
+        t.parts
+            .iter()
+            .any(|p| matches!(p, Part::Message(m) if m.text == "把接口\u{FFFD}文档按模块拆开😀")),
+        "{:?}",
+        t.parts
+    );
+}

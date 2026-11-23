@@ -4,6 +4,7 @@
 mod ui_support;
 
 use huitai::core::{Config, SessionId, Vendor};
+use huitai::index::{Hit, Snippet};
 use huitai::ui::rows::Row;
 use huitai::ui::{App, Theme};
 use ratatui::crossterm::event::KeyCode;
@@ -74,6 +75,236 @@ fn search() {
     load_preview(&mut app);
     let buf = render(&mut app, W, H);
     assert_snapshot("search", &dump(&buf));
+}
+
+/// ⌃A 各家一起搜：Claude、Codex、pi 的结果混在一起，每行标题前标那家的标记，表头、搜索栏写着「各家」。
+#[test]
+fn search_all_vendors() {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    let mut app = demo_app(Vendor::Claude);
+    app.key(key(KeyCode::Char('/')));
+    for c in "接口".chars() {
+        app.key(key(KeyCode::Char(c)));
+    }
+    app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    let pick = |entries: Vec<huitai::index::Entry>, title: &str| {
+        entries.into_iter().find(|e| e.title() == title).unwrap()
+    };
+    let hit = |entry, in_title, in_body| Hit {
+        entry,
+        in_title,
+        in_body,
+    };
+    app.set_search_hits(
+        None,
+        "接口",
+        vec![
+            hit(
+                pick(codex_entries(), "给订单列表接口补单元测试"),
+                true,
+                false,
+            ),
+            hit(pick(claude_entries(), "把优惠券接口换成新版"), true, false),
+            hit(pick(pi_entries(), "RSS 初稿"), false, true),
+        ],
+    );
+    load_preview(&mut app);
+    let buf = render(&mut app, W, H);
+    let text = dump(&buf);
+    assert!(text.contains("搜索结果 · 各家"));
+    assert!(text.contains("各家 3 条"));
+    assert!(text.contains("⌃A 只搜 Claude"));
+    for v in [Vendor::Codex, Vendor::Claude, Vendor::Pi] {
+        assert!(
+            text.lines().any(|l| l.contains(&format!("{} ", v.mark()))),
+            "{} 的结果行前有那家的标记",
+            v.name()
+        );
+    }
+    assert_snapshot("search_all", &text);
+}
+
+/// 搜「结算」：一条只命中标题、一条标题正文都命中、一条只命中正文（正文很长、命中在中间）。
+fn snippet_app() -> App {
+    let mut app = demo_app(Vendor::Claude);
+    app.key(key(KeyCode::Char('/')));
+    for c in "结算".chars() {
+        app.key(key(KeyCode::Char(c)));
+    }
+    let entries = claude_entries();
+    let pick = |title: &str| entries.iter().find(|e| e.title() == title).unwrap().clone();
+    let hit = |title: &str, in_title, in_body| Hit {
+        entry: pick(title),
+        in_title,
+        in_body,
+    };
+    app.set_search_hits(
+        Some(Vendor::Claude),
+        "结算",
+        vec![
+            hit("结算页首屏加载慢，查一下原因", true, false),
+            hit("购物车结算按钮点了没反应", true, true),
+            hit("把优惠券接口换成新版", false, true),
+        ],
+    );
+    app
+}
+
+fn id_of(app: &App, title: &str) -> SessionId {
+    let s = app.search.as_ref().unwrap();
+    s.hits
+        .iter()
+        .find(|e| e.title() == title)
+        .unwrap()
+        .session
+        .id
+        .clone()
+}
+
+fn snip(text: &str, term: &str) -> Snippet {
+    Snippet {
+        text: text.to_owned(),
+        marks: text
+            .match_indices(term)
+            .map(|(i, m)| (i, i + m.len()))
+            .collect(),
+    }
+}
+
+#[test]
+fn search_snippets() {
+    let mut app = snippet_app();
+    // 第一帧：正文命中的两条先空着占位（暗色 …），只命中标题的不占行。
+    let text = dump(&render(&mut app, W, H));
+    assert!(text.contains("结算页首屏加载慢"));
+    let (_, want) = app
+        .take_snippet_request()
+        .expect("看得见的正文命中要取片段");
+    let want: Vec<&str> = want.iter().map(|e| e.title()).collect();
+    assert_eq!(want, ["购物车结算按钮点了没反应", "把优惠券接口换成新版"]);
+    assert_eq!(app.take_snippet_request(), None, "要过的不再要");
+    assert_eq!(app.line_heights(), [1, 2, 2]);
+
+    let cart = id_of(&app, "购物车结算按钮点了没反应");
+    let coupon = id_of(&app, "把优惠券接口换成新版");
+    app.set_snippet(
+        "结算",
+        cart,
+        Some(snip(
+            "找到了：结算按钮的 onClick 在优惠券还没算完时被禁用",
+            "结算",
+        )),
+    );
+    let long = format!(
+        "…{}换成新版接口以后，结算页要跟着改参数名；{}…",
+        "旧接口的返回字段有几个已经不用了，".repeat(4),
+        "顺便补上单元测试，覆盖满减和折扣两种券。".repeat(6)
+    );
+    app.set_snippet("结算", coupon, Some(snip(&long, "结算")));
+    // 查询词已经变了的旧结果丢掉。
+    app.set_snippet("别的", id_of(&app, "结算页首屏加载慢，查一下原因"), None);
+    load_preview(&mut app);
+    let buf = render(&mut app, W, H);
+    let text = dump(&buf);
+    assert_snapshot("search-snippets", &text);
+
+    // 命中词高亮：第 4 行（第二条结果下面那行）的「结算」加粗、垫强调色。
+    let line = row_text(&buf, 4);
+    let col = line
+        .find("结算")
+        .map(|b| huitai::ui::text::width(&line[..b]))
+        .unwrap();
+    let cell = &buf[(col as u16, 4)];
+    assert_eq!(cell.symbol(), "结");
+    assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+    assert_ne!(cell.bg, buf[((col - 2) as u16, 4)].bg, "命中词垫底色");
+}
+
+#[test]
+fn search_snippet_not_found_takes_no_line() {
+    let mut app = snippet_app();
+    render(&mut app, W, H);
+    app.take_snippet_request();
+    let coupon = id_of(&app, "把优惠券接口换成新版");
+    app.set_snippet("结算", coupon, None);
+    assert_eq!(app.line_heights(), [1, 2, 1]);
+    // 同一个词再搜一遍（比如改了名），取到的留着，不再要。
+    let s = app.search.clone().unwrap();
+    let hits = s
+        .hits
+        .into_iter()
+        .map(|entry| Hit {
+            in_title: true,
+            in_body: s.in_body.contains(&entry.session.id),
+            entry,
+        })
+        .collect();
+    app.set_search_hits(Some(Vendor::Claude), "结算", hits);
+    assert_eq!(app.take_snippet_request(), None);
+}
+
+/// 审计 v0.1.4 第 24 条：查询词没变、对话正文更新了（时间、条数跟着变），那条的片段作废重新取；没变的留着。
+#[test]
+fn search_snippet_is_refetched_when_the_conversation_changes() {
+    let mut app = snippet_app();
+    render(&mut app, W, H);
+    app.take_snippet_request();
+    let cart = id_of(&app, "购物车结算按钮点了没反应");
+    let coupon = id_of(&app, "把优惠券接口换成新版");
+    app.set_snippet("结算", cart.clone(), Some(snip("旧的结算片段", "结算")));
+    app.set_snippet("结算", coupon.clone(), Some(snip("结算没变", "结算")));
+
+    let s = app.search.clone().unwrap();
+    let hits = s
+        .hits
+        .into_iter()
+        .map(|mut entry| {
+            if entry.session.id == cart {
+                entry.session.message_count += 1;
+                entry.session.last_active += std::time::Duration::from_secs(60);
+            }
+            Hit {
+                in_title: true,
+                in_body: s.in_body.contains(&entry.session.id),
+                entry,
+            }
+        })
+        .collect();
+    app.set_search_hits(Some(Vendor::Claude), "结算", hits);
+    let (_, want) = app.take_snippet_request().expect("变了的那条要重新取");
+    let want: Vec<&SessionId> = want.iter().map(|e| &e.session.id).collect();
+    assert_eq!(want, [&cart]);
+    assert_eq!(
+        app.snippet_line(&coupon),
+        Some(Some(&snip("结算没变", "结算")))
+    );
+}
+
+#[test]
+fn search_snippets_in_narrow_and_tiny_terminals() {
+    for (w, h) in [(40, 12), (24, 6), (12, 4), (6, 3)] {
+        let mut app = snippet_app();
+        render(&mut app, w, h);
+        let cart = id_of(&app, "购物车结算按钮点了没反应");
+        app.set_snippet(
+            "结算",
+            cart,
+            Some(snip(
+                &format!("{}结算按钮{}", "很长的前文".repeat(30), "后".repeat(99)),
+                "结算",
+            )),
+        );
+        let text = dump(&render(&mut app, w, h));
+        for l in text.lines() {
+            assert!(huitai::ui::text::width(l) <= usize::from(w), "{w}×{h}：{l}");
+        }
+        if w >= 24 {
+            assert!(
+                text.contains("前文结算按钮"),
+                "{w}×{h} 看得到命中词：{text}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -303,4 +534,62 @@ fn old_daemon_hint_in_top_bar() {
     // 托管的对话都结束了（集合空了）就不提示。
     app.old_host = Some(Default::default());
     assert!(!top(&mut app, W).contains("后台是旧版"));
+}
+
+/// 多账号：同一家有两个账号时，每条标题后面用暗色小字写账号名；顶栏额度跟着选中对话的账号换。
+#[test]
+fn two_accounts_label_rows_and_switch_quota() {
+    use huitai::core::{Account, QuotaValue};
+    let home = std::path::Path::new(HOME);
+    let main = Account::new(Vendor::Claude, "默认", home.join(".claude"), home);
+    let work = Account::new(Vendor::Claude, "工作号", home.join(".claude-work"), home);
+    let mut entries = claude_entries();
+    for e in entries
+        .iter_mut()
+        .filter(|e| e.session.id.as_str() == "c-shop-2")
+    {
+        e.session.id = SessionId::in_account(&work.key, "c-shop-2");
+        e.session.account = work.key.clone();
+    }
+    let mut app = demo_app(Vendor::Claude);
+    app.set_accounts(vec![main, work.clone()]);
+    app.set_entries(Vendor::Claude, entries);
+    let mut theirs = quota_for(Vendor::Claude);
+    if let QuotaValue::Windows(w) = &mut theirs.value {
+        w[0].used_percent = 88.0;
+    }
+    app.quota.insert((Vendor::Claude, work.key.clone()), theirs);
+    select_id(&mut app, "c-shop-1");
+    let text = dump(&render(&mut app, W, H));
+    assert!(text.contains("23%"), "主账号的额度");
+    let line = text
+        .lines()
+        .find(|l| l.contains("把优惠券接口换成新版"))
+        .unwrap();
+    assert!(line.contains("工作号"), "{line}");
+    let line = text
+        .lines()
+        .find(|l| l.contains("购物车结算按钮点了没反应"))
+        .unwrap();
+    assert!(line.contains("默认"), "{line}");
+    assert_snapshot("accounts", &text);
+
+    // 别处开着它的进程参数里是不带账号前缀的 id，也认得出别处在用。
+    app.open_elsewhere.insert(SessionId::from("c-shop-2"));
+    let theirs = app
+        .list()
+        .entries
+        .iter()
+        .find(|e| e.session.account == work.key)
+        .unwrap()
+        .clone();
+    assert!(app.elsewhere(&theirs));
+    app.open_elsewhere.clear();
+
+    select_id(&mut app, &format!("{}:c-shop-2", work.key));
+    let text = dump(&render(&mut app, W, H));
+    assert!(
+        text.contains("88%"),
+        "选中工作号的对话，顶栏换成工作号的额度\n{text}"
+    );
 }

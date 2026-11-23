@@ -10,7 +10,7 @@ use huitai::core::{
     Config, QuotaReading, QuotaValue, QuotaWindow, Session, SessionId, SessionState, Vendor,
 };
 use huitai::index::{Entry, Note};
-use huitai::sources::{PreviewMessage, Role};
+use huitai::sources::{Moment, PlanStep, PreviewMessage, Role, StepStatus, moment};
 use huitai::ui::{App, Preview, Theme, view};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -74,6 +74,7 @@ pub fn entry(vendor: Vendor, x: &Fake) -> Entry {
             last_active: mins_ago(x.mins),
             message_count: x.messages,
             automatic: x.automatic,
+            account: String::new(),
         },
         note: Note {
             title: None,
@@ -358,23 +359,23 @@ pub fn opencode_entries() -> Vec<Entry> {
     )
 }
 
-pub fn qwen_entries() -> Vec<Entry> {
+pub fn antigravity_entries() -> Vec<Entry> {
     sorted(
-        Vendor::Qwen,
+        Vendor::Antigravity,
         &[
             f(
-                "5e1c0a2b-1111-4aaa-8bbb-000000000001",
+                "a9e10000-1111-4aaa-8bbb-000000000001",
                 "/Users/demo/projects/shop",
-                "购物车数量改成可以直接输入",
-                60 * 5,
+                "下单接口加幂等",
+                60 * 8,
                 3,
             ),
             f(
-                "5e1c0a2b-7777-4aaa-8bbb-000000000007",
+                "a9e10000-2222-4aaa-8bbb-000000000002",
                 "/Users/demo/projects/blog",
-                "文章列表分页",
-                60 * 30,
-                2,
+                "RSS 输出全文",
+                60 * 60 * 3,
+                1,
             ),
         ],
     )
@@ -441,12 +442,13 @@ pub fn preview_for(vendor: Vendor) -> Preview {
                 43,
             ),
         ],
-        Vendor::Qwen => vec![
-            m(Role::User, "购物车数量改成可以直接输入", 310),
+        Vendor::Qwen => unreachable!("Qwen Code 不再支持，不在 Vendor::ALL 里"),
+        Vendor::Antigravity => vec![
+            m(Role::User, "下单接口加幂等", 490),
             m(
                 Role::Assistant,
-                "数量框改成输入框了，输入 0 会删掉这件商品。",
-                300,
+                "按请求头里的幂等键去重，重复的直接回上次的结果。",
+                480,
             ),
         ],
         Vendor::OpenCode => vec![
@@ -478,10 +480,11 @@ pub fn quota_for(vendor: Vendor) -> QuotaReading {
         ),
         Vendor::Codex => (QuotaValue::Windows(vec![w("7 天", 9.0, 10080)]), "rollout"),
         Vendor::Pi => (QuotaValue::TokensToday(1_234_567), "本机统计"),
-        // Hermes、Kimi Code、Gemini、OpenCode、Qwen Code 还没有额度渠道，顶栏不写额度。
-        Vendor::Hermes | Vendor::Kimi | Vendor::Gemini | Vendor::OpenCode | Vendor::Qwen => {
+        // Hermes、Kimi Code、Gemini、OpenCode、Antigravity 还没有额度渠道，顶栏不写额度。
+        Vendor::Hermes | Vendor::Kimi | Vendor::Gemini | Vendor::OpenCode | Vendor::Antigravity => {
             (QuotaValue::Unavailable, "")
         }
+        Vendor::Qwen => unreachable!("Qwen Code 不再支持"),
     };
     QuotaReading {
         value,
@@ -505,9 +508,9 @@ pub fn demo_app(vendor: Vendor) -> App {
     app.set_entries(Vendor::Kimi, kimi_entries());
     app.set_entries(Vendor::Gemini, gemini_entries());
     app.set_entries(Vendor::OpenCode, opencode_entries());
-    app.set_entries(Vendor::Qwen, qwen_entries());
+    app.set_entries(Vendor::Antigravity, antigravity_entries());
     for v in Vendor::ALL {
-        app.quota.insert(v, quota_for(v));
+        app.quota.insert((v, String::new()), quota_for(v));
     }
     let states = [
         ("c-shop-1", SessionState::Running),
@@ -532,17 +535,73 @@ pub fn demo_app(vendor: Vendor) -> App {
     app
 }
 
+/// 给演示数据配上手写的「此刻」：shop 那条在跑（在跑的工具、计划 2/5、跑了 4 分 12 秒），
+/// 优惠券那条刚做完（总结、用时 6 分钟），博客那条等你回复，pi 的 RSS 初稿那条被打断（失败）。
+pub fn with_moments(app: &mut App) {
+    let step = |s: &str, status| PlanStep {
+        step: s.to_owned(),
+        status,
+    };
+    let moments = [
+        (
+            "c-shop-1",
+            Moment {
+                tool: Some(moment::ToolCall {
+                    name: "Bash".to_owned(),
+                    input: "npm run e2e -- checkout".to_owned(),
+                }),
+                summary: Some("移动端走的是同一个组件，已经一起修好。".to_owned()),
+                turn_started: Some(now() - Duration::from_secs(252)),
+                plan: vec![
+                    step("找到结算按钮被禁用的原因", StepStatus::Done),
+                    step("改 useCheckout 的状态更新", StepStatus::Done),
+                    step("跑 e2e 测试", StepStatus::Doing),
+                    step("看移动端", StepStatus::Todo),
+                    step("补一条回归测试", StepStatus::Todo),
+                ],
+                ..Moment::default()
+            },
+        ),
+        (
+            "c-shop-2",
+            Moment {
+                summary: Some("优惠券接口换成 v2 了，旧接口的调用都删了。".to_owned()),
+                duration: Some(Duration::from_secs(372)),
+                ..Moment::default()
+            },
+        ),
+        (
+            "c-blog-1",
+            Moment {
+                summary: Some("RSS 加好了，要不要把订阅链接放到页脚？".to_owned()),
+                ..Moment::default()
+            },
+        ),
+        (
+            "p-blog-1",
+            Moment {
+                summary: Some("正在生成 feed.xml".to_owned()),
+                failed: Some("interrupted".to_owned()),
+                ..Moment::default()
+            },
+        ),
+    ];
+    for (id, m) in moments {
+        app.set_moment(SessionId::from(id), m);
+    }
+}
+
 /// 往下按到选中这条为止。
-/// 当 Kimi Code、Gemini、OpenCode、Qwen Code 都没装（没有对话、数据目录不在），顶栏回到四家：测「不到五家时」的顶栏行为用。
+/// 当 Kimi Code、Gemini、OpenCode、Antigravity 都没装（没有对话、数据目录不在），顶栏回到四家：测「不到五家时」的顶栏行为用。
 pub fn only_first_four(app: &mut App) {
     app.set_entries(Vendor::Kimi, Vec::new());
     app.set_entries(Vendor::Gemini, Vec::new());
     app.set_entries(Vendor::OpenCode, Vec::new());
-    app.set_entries(Vendor::Qwen, Vec::new());
+    app.set_entries(Vendor::Antigravity, Vec::new());
     app.hide_missing(|v| {
         !matches!(
             v,
-            Vendor::Kimi | Vendor::Gemini | Vendor::OpenCode | Vendor::Qwen
+            Vendor::Kimi | Vendor::Gemini | Vendor::OpenCode | Vendor::Antigravity
         )
     });
 }

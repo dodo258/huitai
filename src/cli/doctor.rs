@@ -1,4 +1,4 @@
-//! `ai doctor`：自检。三家 CLI 装好没有、会话目录读不读得了、额度每个渠道能不能用、
+//! `ai doctor`：自检。各家 CLI 装好没有、会话目录读不读得了、额度每个渠道能不能用、余额和订阅额度各渠道通不通、
 //! 当前终端能不能开新标签页、守护进程是哪一版。只读，不开窗口、不弹授权框。
 
 use std::fmt::Write as _;
@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::core::{Config, QuotaReading, QuotaValue, Vendor};
+use crate::core::{Config, QuotaReading, QuotaValue, Vendor, exec};
 use crate::host::{self, Build, DaemonInfo, version};
-use crate::opener::{CmuxOpener, KakuOpener, Terminal, exec};
-use crate::quota::{ChannelReport, QuotaReader};
+use crate::opener::{CmuxOpener, KakuOpener, Terminal};
+use crate::quota::{self, BalanceReport, ChannelReport, OriginAccount, QuotaReader};
 use crate::sources::{self, Source, Trash};
-use crate::ui::{text, view};
+use crate::ui::{balance, text, view};
 
 /// 找 CLI 用的登录 shell 最多等多久（nvm、oh-my-zsh 这类配置启动慢）。
 const CLI_TIMEOUT: Duration = Duration::from_secs(15);
@@ -80,14 +80,18 @@ pub fn report(dir: &Path) -> String {
     let config = Config::load(&dir.join("config.json"));
 
     // 找 CLI 要起登录 shell，和扫描、读额度互不相干，并行做。
-    let (clis, scans, quotas) = thread::scope(|s| {
+    let (clis, scans, quotas, balances) = thread::scope(|s| {
         let clis = s.spawn(|| cli_section(&shell, &home, &srcs));
         let scans = s.spawn(|| sessions_section(&srcs, &home));
+        let balances = s.spawn(|| balance_section(&home));
         let quotas = quota_section();
         (
-            clis.join().unwrap_or_else(|_| crashed("三家 CLI")),
+            clis.join().unwrap_or_else(|_| crashed("各家 CLI")),
             scans.join().unwrap_or_else(|_| crashed("会话目录")),
             quotas,
+            balances
+                .join()
+                .unwrap_or_else(|_| crashed("余额和订阅额度")),
         )
     });
     let me = version::current();
@@ -95,6 +99,7 @@ pub fn report(dir: &Path) -> String {
         clis,
         scans,
         quotas,
+        balances,
         terminal_section(&Terminal::current(), &env, config.as_ref().ok(), cli_probe),
         Section {
             title: "守护进程".to_owned(),
@@ -135,7 +140,7 @@ pub fn render(sections: &[Section]) -> String {
     out
 }
 
-// ---- 三家 CLI ----
+// ---- 各家 CLI ----
 
 /// 和开对话时一样用登录 shell（`$SHELL -lc`）在家目录找，找得到再问版本。
 fn cli_section(shell: &str, home: &Path, srcs: &[Box<dyn Source>]) -> Section {
@@ -148,6 +153,7 @@ fn cli_section(shell: &str, home: &Path, srcs: &[Box<dyn Source>]) -> Section {
                     let found = exec::run(
                         Path::new(shell),
                         &["-lc", &find_script(&program)],
+                        None,
                         CLI_TIMEOUT,
                     )
                     .map(|out| parse_find(&out));
@@ -163,7 +169,7 @@ fn cli_section(shell: &str, home: &Path, srcs: &[Box<dyn Source>]) -> Section {
             .collect()
     });
     Section {
-        title: "三家 CLI（用登录 shell 找，和开对话时一样）".to_owned(),
+        title: "各家 CLI（用登录 shell 找，和开对话时一样）".to_owned(),
         items,
     }
 }
@@ -337,6 +343,67 @@ pub fn quota_items(vendor: Vendor, reports: &[ChannelReport], now: SystemTime) -
         .collect()
 }
 
+/// 余额和订阅额度：本机各账号配置和环境变量里的每把密钥查一遍（有 5 分钟缓存）。
+fn balance_section(home: &Path) -> Section {
+    let report = quota::balances(&sources::local_accounts(home));
+    Section {
+        title: "余额和订阅额度（密钥只读自 pi、Hermes 配置和环境变量，只发给各自那家）".to_owned(),
+        items: balance_items(&report, SystemTime::now()),
+    }
+}
+
+/// 每把密钥一行：哪家、读数或取不到的原因、密钥在哪（不写密钥本身）；写成命令的列为跳过。
+pub fn balance_items(report: &BalanceReport, now: SystemTime) -> Vec<Item> {
+    let place = |o: &quota::KeyOrigin| match &o.account {
+        Some(OriginAccount { vendor, name, .. }) => {
+            format!("{} {name} · {}", vendor.name(), o.place)
+        }
+        None => o.place.clone(),
+    };
+    let mut items: Vec<Item> = report
+        .rows
+        .iter()
+        .map(|r| {
+            let note = if r.provider.unofficial() {
+                "，非公开接口"
+            } else {
+                ""
+            };
+            let at = place(&r.origins[0]);
+            match &r.result {
+                Ok(b) => item(
+                    Mark::Ok,
+                    r.provider.name(),
+                    format!(
+                        "{}，{}（{at}{note}）",
+                        balance::plain(&b.value),
+                        text::ago(b.at, now)
+                    ),
+                ),
+                Err(e) => item(
+                    Mark::Warn,
+                    r.provider.name(),
+                    format!("取不到：{e}（{at}{note}）"),
+                ),
+            }
+        })
+        .collect();
+    items.extend(
+        report
+            .skipped
+            .iter()
+            .map(|s| item(Mark::Skip, place(&s.origin), s.reason.clone())),
+    );
+    if report.rows.is_empty() {
+        items.push(item(
+            Mark::Skip,
+            "余额",
+            "没找到 DeepSeek、Moonshot、OpenRouter、Kimi Code 的密钥",
+        ));
+    }
+    items
+}
+
 fn reading_text(r: &QuotaReading) -> String {
     match &r.value {
         QuotaValue::Windows(ws) => ws
@@ -460,8 +527,7 @@ fn major_minor(v: &str) -> Option<(u32, u32)> {
 
 /// 跑终端的命令行工具问一句只读的话（Kaku 列窗格、cmux ping），连不上就报错。
 fn cli_probe(cli: &Path, args: &[String]) -> io::Result<String> {
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    exec::run(cli, &args, KAKU_TIMEOUT)
+    exec::run(cli, args, None, KAKU_TIMEOUT)
 }
 
 // ---- 守护进程 ----
@@ -472,7 +538,7 @@ pub fn daemon_item(me: &Build, probe: io::Result<DaemonInfo>) -> Item {
             Mark::Skip
         }
         Err(_) => Mark::Fail,
-        Ok(info) if info.build.as_ref().is_some_and(|b| same_build(me, b)) => Mark::Ok,
+        Ok(info) if same_build(me, &info.build) => Mark::Ok,
         Ok(_) => Mark::Warn,
     };
     item(mark, "状态", describe(me, probe))
@@ -491,28 +557,26 @@ pub fn describe(me: &Build, probe: io::Result<DaemonInfo>) -> String {
         }
         Err(e) => return format!("连不上：{e}"),
     };
-    let (who, verdict) = match &info.build {
-        None => ("旧版（没有版本握手）".to_owned(), older(info.hosted)),
-        Some(b) => {
-            let verdict = if me.newer_than(b) {
-                older(info.hosted)
-            } else if b.newer_than(me) {
-                "比当前程序新：你用的 ai 是旧的，看看 `which ai`".to_owned()
-            } else if same_build(me, b) {
-                "和当前程序一致".to_owned()
-            } else {
-                let exe = b
-                    .exe
-                    .as_ref()
-                    .map_or_else(|| "未知".to_owned(), |p| p.display().to_string());
-                format!("版本号相同，但不是同一个程序文件（它是 {exe}）")
-            };
-            (format!("{}，协议 {}", b.label(), b.protocol), verdict)
-        }
+    let b = &info.build;
+    let verdict = if me.newer_than(b) {
+        older(info.hosted)
+    } else if b.newer_than(me) {
+        "比当前程序新：你用的 ai 是旧的，看看 `which ai`".to_owned()
+    } else if same_build(me, b) {
+        "和当前程序一致".to_owned()
+    } else {
+        let exe = b
+            .exe
+            .as_ref()
+            .map_or_else(|| "未知".to_owned(), |p| p.display().to_string());
+        format!("版本号相同，但不是同一个程序文件（它是 {exe}）")
     };
     format!(
-        "{who}，进程 {}，托管 {} 条对话 —— {verdict}",
-        info.pid, info.hosted
+        "{}，协议 {}，进程 {}，托管 {} 条对话 —— {verdict}",
+        b.label(),
+        b.protocol,
+        info.pid,
+        info.hosted
     )
 }
 
@@ -538,7 +602,7 @@ mod tests {
         }
     }
 
-    fn info(build: Option<Build>, hosted: usize) -> io::Result<DaemonInfo> {
+    fn info(build: Build, hosted: usize) -> io::Result<DaemonInfo> {
         Ok(DaemonInfo {
             build,
             pid: 42,
@@ -549,28 +613,23 @@ mod tests {
     #[test]
     fn says_whether_daemon_matches() {
         let me = build("0.2.0", 10);
-        let same = describe(&me, info(Some(me.clone()), 1));
+        let same = describe(&me, info(me.clone(), 1));
         assert!(
             same.contains("0.2.0") && same.contains("和当前程序一致"),
             "{same}"
         );
-        let old = describe(&me, info(Some(build("0.1.0", 10)), 2));
+        let old = describe(&me, info(build("0.1.0", 10), 2));
         assert!(
             old.contains("0.1.0") && old.contains("2 条对话结束后自动换新"),
             "{old}"
         );
-        let reinstalled = describe(&me, info(Some(build("0.2.0", 5)), 0));
+        let reinstalled = describe(&me, info(build("0.2.0", 5), 0));
         assert!(
             reinstalled.contains("下次打开对话时换成新版"),
             "{reinstalled}"
         );
-        let newer = describe(&me, info(Some(build("0.3.0", 1)), 0));
+        let newer = describe(&me, info(build("0.3.0", 1), 0));
         assert!(newer.contains("比当前程序新"), "{newer}");
-        let legacy = describe(&me, info(None, 3));
-        assert!(
-            legacy.contains("没有版本握手") && legacy.contains("3 条"),
-            "{legacy}"
-        );
     }
 
     #[test]
@@ -585,8 +644,11 @@ mod tests {
     #[test]
     fn daemon_marks() {
         let me = build("0.2.0", 10);
-        assert_eq!(daemon_item(&me, info(Some(me.clone()), 0)).mark, Mark::Ok);
-        assert_eq!(daemon_item(&me, info(None, 0)).mark, Mark::Warn);
+        assert_eq!(daemon_item(&me, info(me.clone(), 0)).mark, Mark::Ok);
+        assert_eq!(
+            daemon_item(&me, info(build("0.1.0", 10), 0)).mark,
+            Mark::Warn
+        );
         assert_eq!(
             daemon_item(&me, Err(io::Error::from(ErrorKind::NotFound))).mark,
             Mark::Skip
@@ -602,6 +664,7 @@ mod tests {
         let out = exec::run(
             Path::new("/bin/sh"),
             &["-c", &find_script("sh")],
+            None,
             CLI_TIMEOUT,
         )
         .unwrap();
@@ -612,6 +675,7 @@ mod tests {
         let out = exec::run(
             Path::new("/bin/sh"),
             &["-c", &find_script("huitai-no-such-cli")],
+            None,
             CLI_TIMEOUT,
         )
         .unwrap();
@@ -811,5 +875,72 @@ mod tests {
             out,
             "\n终端\n  ✓ 当前 Ghostty  能开\n  – 首选终端      跟随\n"
         );
+    }
+
+    #[test]
+    fn balance_lists_each_key_without_the_key() {
+        use crate::quota::{
+            Balance, BalanceRow, BalanceValue, KeyOrigin, Money, Provider, Skipped,
+        };
+        let now = SystemTime::now();
+        let pi = KeyOrigin {
+            account: Some(OriginAccount {
+                vendor: Vendor::Pi,
+                key: String::new(),
+                name: "默认".to_owned(),
+            }),
+            place: "auth.json · deepseek".to_owned(),
+        };
+        let env = KeyOrigin {
+            account: None,
+            place: "环境变量 KIMI_API_KEY".to_owned(),
+        };
+        let report = BalanceReport {
+            rows: vec![
+                BalanceRow {
+                    provider: Provider::DeepSeek,
+                    origins: vec![pi.clone()],
+                    result: Ok(Balance {
+                        value: BalanceValue::Money {
+                            amounts: vec![Money {
+                                currency: "CNY".to_owned(),
+                                amount: -1.5,
+                            }],
+                            available: false,
+                        },
+                        at: now,
+                    }),
+                },
+                BalanceRow {
+                    provider: Provider::KimiCode,
+                    origins: vec![env],
+                    result: Err("HTTP 500".to_owned()),
+                },
+            ],
+            skipped: vec![Skipped {
+                origin: pi,
+                reason: "密钥写成了命令，会话台不执行".to_owned(),
+            }],
+            defaults: Vec::new(),
+        };
+        let items = balance_items(&report, now);
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            (items[0].mark, items[0].detail.as_str()),
+            (
+                Mark::Ok,
+                "-¥1.50 欠费，刚刚（pi 默认 · auth.json · deepseek）"
+            )
+        );
+        assert_eq!(items[1].mark, Mark::Warn);
+        assert_eq!(
+            items[1].detail,
+            "取不到：HTTP 500（环境变量 KIMI_API_KEY，非公开接口）"
+        );
+        assert_eq!(items[2].mark, Mark::Skip);
+
+        let none = balance_items(&BalanceReport::default(), now);
+        assert_eq!(none.len(), 1);
+        assert!(none[0].detail.contains("没找到"));
     }
 }

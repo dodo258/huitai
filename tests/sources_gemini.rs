@@ -315,3 +315,54 @@ fn large_file_reads_head_and_tail_and_replays_rewinds() {
     assert!(tail[0].text.starts_with("第 9 句"), "{:?}", tail[0].text);
     assert_eq!(tail[1].text, "答 9");
 }
+
+#[test]
+fn moment_from_last_turn() {
+    let (_, src) = setup("gemini-moment");
+    let scan = src.scan();
+    let m = src.load_moment(by_id(&scan.sessions, MAIN)).unwrap();
+    assert_eq!(m.tool, None, "工具调用都有返回");
+    assert_eq!(
+        m.summary.as_deref(),
+        Some("移动端用的是同一个组件，一起修好了。")
+    );
+    assert_eq!(m.turn_started, Some(at(1_795_000_140)));
+}
+
+/// 审计 v0.1.3 第 18 条：首句后 AI 输出约 100 KiB 才写 `$set.summary`，之后又输出约 110 KiB：
+/// 标题落在头尾两段之间没读的地方，以前退回首句。中间段里更晚的标题也要盖过开头那段里的。
+#[test]
+fn summary_in_the_unread_middle_wins() {
+    let (base, src) = setup("gemini-middle-title");
+    let path = base.join("gemini/tmp/shop/chats/session-2026-11-19T08-00-8b9c0d1e.jsonl");
+    let id = "8b9c0d1e-8888-4aaa-8bbb-000000000008";
+    let pad = "字".repeat(300);
+    let mut lines = vec![
+        format!(
+            r#"{{"sessionId":"{id}","projectHash":"h","startTime":"2026-11-19T08:00:00.000Z","lastUpdated":"2026-11-19T08:00:00.000Z"}}"#
+        ),
+        r#"{"id":"u0","timestamp":"2026-11-19T08:00:00.000Z","type":"user","content":"最初的提问"}"#
+            .to_owned(),
+        r#"{"$set":{"summary":"开头起的标题"}}"#.to_owned(),
+    ];
+    for i in 0..210 {
+        if i == 100 {
+            lines.push(r#"{"$set":{"summary":"改好的标题"}}"#.to_owned());
+        }
+        lines.push(format!(
+            r#"{{"id":"g{i}","timestamp":"2026-11-19T08:00:01.000Z","type":"gemini","content":"{pad}"}}"#
+        ));
+        // 只改时间的 `$set` 不带标题，不能当成没标题。
+        lines.push(r#"{"$set":{"lastUpdated":"2026-11-19T08:00:01.000Z"}}"#.to_owned());
+    }
+    fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert!(fs::metadata(&path).unwrap().len() > 200 * 1024);
+
+    let title = || by_id(&src.scan().sessions, id).title.clone();
+    assert_eq!(title().as_deref(), Some("改好的标题"));
+
+    // 结尾那段里又改了一次：取结尾的。
+    lines.push(r#"{"$set":{"summary":"最后的标题"}}"#.to_owned());
+    fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(title().as_deref(), Some("最后的标题"));
+}

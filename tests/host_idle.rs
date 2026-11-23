@@ -52,7 +52,10 @@ impl IdleHost {
         .save(&dir.join("config.json"))
         .unwrap();
         Self {
-            host: TestHost { dir },
+            host: TestHost {
+                dir,
+                handle: handle.clone(),
+            },
             daemon: handle,
             now,
         }

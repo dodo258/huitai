@@ -1,11 +1,10 @@
 //! 全局呼出键按下后做什么：会话台开着就切到它所在的标签页，否则在首选终端新开一个 `ai`。
 
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::core::exec;
 use crate::host::BoardInfo;
 use crate::opener::{self, TabHandle, Terminal};
 use crate::sources;
@@ -98,39 +97,8 @@ pub fn ghostty_find_args(tty: &str) -> Vec<String> {
     vec!["-e".to_owned(), GHOSTTY_FIND_TTY.to_owned(), tty.to_owned()]
 }
 
-/// 跑 osascript，超时就杀掉；退出码 0 返回标准输出。输出只有一个 id，不会塞满管道。
 fn osascript(args: &[String]) -> io::Result<String> {
-    let mut child = Command::new("/usr/bin/osascript")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + OSASCRIPT_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Ghostty AppleScript 超时",
-            ));
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout.read_to_string(&mut out)?;
-    }
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "Ghostty AppleScript 退出码 {status}"
-        )));
-    }
-    Ok(out)
+    exec::run("/usr/bin/osascript", args, None, OSASCRIPT_TIMEOUT)
 }
 
 #[cfg(test)]

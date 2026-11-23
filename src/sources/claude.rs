@@ -6,15 +6,17 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use super::jsonl::{self, str_field};
+use super::moment::Event;
 use super::time::parse_rfc3339;
 use super::window::Window;
 use super::{
-    Command, Counted, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript, Trash,
-    TrashEntry, encode_path, transcript,
+    Command, Counted, Moment, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript,
+    Trash, TrashEntry, encode_path, moment, transcript,
 };
 use crate::core::{Session, SessionId, Vendor};
 
@@ -59,6 +61,10 @@ impl Source for ClaudeSource {
 
     fn load_transcript(&self, session: &Session) -> io::Result<Transcript> {
         transcript::read(&session.path, parts)
+    }
+
+    fn load_moment(&self, session: &Session) -> io::Result<Moment> {
+        moment::read_jsonl(&session.path, moment_events)
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
@@ -191,6 +197,7 @@ pub(crate) fn read_session(path: &Path) -> io::Result<Option<Session>> {
         last_active,
         message_count,
         automatic,
+        account: String::new(),
     }))
 }
 
@@ -241,15 +248,82 @@ fn parts(v: &Value) -> Vec<Part> {
     };
     for it in items {
         match str_field(it, "type") {
-            Some("tool_use") => out.push(Part::ToolCall {
-                name: str_field(it, "name").unwrap_or("工具").to_owned(),
-                input: transcript::input_summary(it.get("input").unwrap_or(&Value::Null)),
-            }),
+            Some("tool_use") => {
+                let (name, input) = tool_use(it);
+                out.push(Part::ToolCall { name, input });
+            }
             Some("tool_result") => out.push(Part::ToolResult {
                 text: transcript::output_text(it.get("content").unwrap_or(&Value::Null)),
             }),
             _ => {}
         }
+    }
+    out
+}
+
+/// `tool_use` 块的工具名和参数摘要。
+fn tool_use(it: &Value) -> (String, String) {
+    (
+        str_field(it, "name").unwrap_or("工具").to_owned(),
+        transcript::input_summary(it.get("input").unwrap_or(&Value::Null)),
+    )
+}
+
+/// 「此刻」用的一行：消息（同 [`message`]）和带关联 id 的工具调用、返回（`tool_use.id`、`tool_result.tool_use_id`，
+/// 并行的工具按 id 收），加上 `system` 行里的总结（`away_summary`）和这一轮用时（`turn_duration`），
+/// `TodoWrite` 调用里的计划。子代理的行只看消息（同 [`parts`]）。
+fn moment_events(v: &Value) -> Vec<Event> {
+    let mut out: Vec<Event> = message(v)
+        .map(|m| Event::Part(Part::Message(m)))
+        .into_iter()
+        .collect();
+    if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return out;
+    }
+    let items = v.pointer("/message/content").and_then(Value::as_array);
+    for it in items.into_iter().flatten() {
+        // 没有关联 id 的（旧格式）退回按先后对上。
+        let id = |k: &str| {
+            str_field(it, k)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        match str_field(it, "type") {
+            Some("tool_use") => {
+                let (name, input) = tool_use(it);
+                let plan = (name == "TodoWrite")
+                    .then(|| it.pointer("/input/todos"))
+                    .flatten()
+                    .and_then(|t| moment::plan_steps(t, &["content", "activeForm"]));
+                out.push(match id("id") {
+                    Some(id) => Event::ToolCall { id, name, input },
+                    None => Event::Part(Part::ToolCall { name, input }),
+                });
+                out.extend(plan.map(Event::Plan));
+            }
+            Some("tool_result") => out.push(match id("tool_use_id") {
+                Some(id) => Event::ToolResult { id },
+                None => Event::Part(Part::ToolResult {
+                    text: String::new(),
+                }),
+            }),
+            _ => {}
+        }
+    }
+    match (str_field(v, "type"), str_field(v, "subtype")) {
+        (Some("system"), Some("away_summary")) => {
+            if let Some(s) = str_field(v, "content") {
+                out.push(Event::Summary(s.to_owned()));
+            }
+        }
+        (Some("system"), Some("turn_duration")) => out.push(Event::TurnEnded {
+            duration: v
+                .get("durationMs")
+                .and_then(Value::as_u64)
+                .map(Duration::from_millis),
+            failed: None,
+        }),
+        _ => {}
     }
     out
 }

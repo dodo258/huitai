@@ -6,7 +6,8 @@
 //! - 会话台那边：不停 List、取快照、订阅事件又关掉、会话台登记又关掉，偶尔发一串垃圾连接；
 //!
 //! 每分钟记一次守护进程的 RSS、描述符、线程、CPU（`SOAK|` 开头的行，同时写进 `SOAK_CSV` 指定的文件），
-//! 结束时用最小二乘算后半程的斜率：内存、描述符、线程不能持续上涨；全部结束后描述符、线程、存活堆回到基线。
+//! 每分钟另记一次存活堆（`heap`，判断泄漏的依据）。结束时用最小二乘算后半程的斜率：存活堆、描述符、线程不能持续上涨；
+//! 跑满 [`RSS_MIN_MINUTES`] 的再看 RSS 斜率。全部结束后描述符、线程、存活堆回到基线。
 
 use super::*;
 
@@ -18,6 +19,13 @@ const RESIDENT: usize = 6;
 const WATCHED: usize = 2;
 /// 后半程 RSS 斜率上限（MB/小时）。分配器留着的空闲页会让 RSS 先涨到一个平台，平台之后不该再涨。
 const RSS_SLOPE_LIMIT: f64 = 2.0;
+/// RSS 斜率只在跑满这么久时判：11-22 的 6 小时长跑里 RSS 第 1 小时涨 12 MB、第 2 小时 2 MB 后才到平台，
+/// 1 小时的后半程还在这段爬坡里，斜率说明不了泄漏。短跑靠存活堆斜率判。
+const RSS_MIN_MINUTES: f64 = 180.0;
+/// 存活堆「地板」（一段时间里的最小值）最后四分之一比第二个四分之一最多高这么多（MB）。
+/// 采样那一刻常有正在转发的输出缓冲（来去的对话、机器忙时积压），单点会在 40↔44 MB 间跳，按斜率判会被噪声带偏；
+/// 泄漏的内存放不掉，会把地板一起抬高。
+const HEAP_FLOOR_RISE_LIMIT: f64 = 2.0;
 /// 后半程描述符、线程斜率上限（个/小时）：来来去去的连接会让瞬时值上下跳，但不能一直涨。
 const COUNT_SLOPE_LIMIT: f64 = 2.0;
 
@@ -39,6 +47,7 @@ struct Row {
     minute: f64,
     s: Sample,
     cpu: f64,
+    heap: u64,
 }
 
 /// 来来去去的那部分负载，直到 `stop`。返回做了多少轮。
@@ -168,14 +177,16 @@ fn soak() {
                 minute: start.elapsed().as_secs_f64() / 60.0,
                 s,
                 cpu: cpu_percent(&prev, &s, now - prev_at),
+                heap: heap_bytes(rig.pid),
             };
             let line = format!(
-                "{:.1},{:.1},{},{},{:.2}",
+                "{:.1},{:.1},{},{},{:.2},{:.1}",
                 row.minute,
                 mb(s.rss_kb),
                 s.fds,
                 s.threads,
-                row.cpu
+                row.cpu,
+                row.heap as f64 / 1048576.0
             );
             println!("SOAK|{line}");
             if let Some(f) = csv.as_mut() {
@@ -206,12 +217,16 @@ fn soak() {
         slope(&pts)
     };
     let rss_slope = fit(&|r| mb(r.s.rss_kb));
+    let heap_slope = fit(&|r| r.heap as f64 / 1048576.0);
+    let floor = |part: &[Row]| part.iter().map(|r| r.heap).min().unwrap_or(0) as f64 / 1048576.0;
+    let q = rows.len() / 4;
+    let heap_floor_rise = floor(&rows[rows.len() - q..]) - floor(&rows[q..2 * q]);
     let fd_slope = fit(&|r| r.s.fds as f64);
     let thread_slope = fit(&|r| r.s.threads as f64);
     let avg_cpu = rows.iter().map(|r| r.cpu).sum::<f64>() / rows.len().max(1) as f64;
     let peak = rows.iter().map(|r| r.s.rss_kb).max().unwrap_or(0);
     println!(
-        "SOAK|结果|{:.0} 分钟 {} 个点；后半程斜率 RSS {rss_slope:+.2} MB/h、描述符 {fd_slope:+.2}/h、线程 {thread_slope:+.2}/h；\
+        "SOAK|结果|{:.0} 分钟 {} 个点；后半程斜率 RSS {rss_slope:+.2} MB/h、存活堆 {heap_slope:+.2} MB/h（地板 {heap_floor_rise:+.2} MB）、描述符 {fd_slope:+.2}/h、线程 {thread_slope:+.2}/h；\
          RSS 峰值 {:.1} MB；平均 CPU {avg_cpu:.1}%；来去 {rounds} 轮、会话台请求 {requests} 轮",
         minutes,
         rows.len(),
@@ -233,16 +248,27 @@ fn soak() {
     );
     assert!(rows.len() >= 4, "点太少，算不了斜率");
     assert!(
-        rss_slope < RSS_SLOPE_LIMIT,
+        heap_floor_rise < HEAP_FLOOR_RISE_LIMIT,
+        "存活堆地板还在涨：最后四分之一比第二个四分之一高 {heap_floor_rise:+.2} MB"
+    );
+    assert!(
+        minutes < RSS_MIN_MINUTES || rss_slope < RSS_SLOPE_LIMIT,
         "后半程内存还在涨：{rss_slope:+.2} MB/h"
     );
+    // 描述符、线程也随采样那一刻有没有来去的对话在两三档之间跳（30/33/35）；短跑看地板，跑满 3 小时再加看斜率。
+    let rise = |f: &dyn Fn(&Row) -> usize| {
+        let lo = |part: &[Row]| part.iter().map(f).min().unwrap_or(0) as f64;
+        lo(&rows[rows.len() - q..]) - lo(&rows[q..2 * q])
+    };
+    let (fd_rise, thread_rise) = (rise(&|r| r.s.fds), rise(&|r| r.s.threads));
     assert!(
-        fd_slope < COUNT_SLOPE_LIMIT,
-        "后半程描述符还在涨：{fd_slope:+.2}/h"
+        fd_rise < COUNT_SLOPE_LIMIT && (minutes < RSS_MIN_MINUTES || fd_slope < COUNT_SLOPE_LIMIT),
+        "描述符还在涨：地板 {fd_rise:+.0}，后半程斜率 {fd_slope:+.2}/h"
     );
     assert!(
-        thread_slope < COUNT_SLOPE_LIMIT,
-        "后半程线程还在涨：{thread_slope:+.2}/h"
+        thread_rise < COUNT_SLOPE_LIMIT
+            && (minutes < RSS_MIN_MINUTES || thread_slope < COUNT_SLOPE_LIMIT),
+        "线程还在涨：地板 {thread_rise:+.0}，后半程斜率 {thread_slope:+.2}/h"
     );
     assert!(
         heap <= base_heap + HEAP_SLACK,

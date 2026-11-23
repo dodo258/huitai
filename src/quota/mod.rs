@@ -2,10 +2,15 @@
 //!
 //! 每家按 `rules.json` 里的顺序试渠道，前一个取不到或格式不认识就换下一个；
 //! 全部失败返回 `QuotaValue::Unavailable`（界面显示「暂时取不到」），不报错。
+//!
+//! API 余额和订阅额度（DeepSeek、Moonshot、OpenRouter、Kimi Code）走 `balance` 渠道：
+//! `balances(accounts) -> BalanceReport`，密钥只读自 pi / Hermes 的配置和环境变量（`keys`）。
 
+mod balance;
 mod claude;
 mod codex;
-mod exec;
+mod curl;
+mod keys;
 mod rules;
 mod time;
 mod tokens;
@@ -18,15 +23,20 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::core::{Config, QuotaReading, QuotaValue, QuotaWindow, Vendor, VendorDirs};
+use crate::core::{Account, Config, QuotaReading, QuotaValue, QuotaWindow, Vendor, VendorDirs};
 use rules::{Channel, Minutes, Rules, WindowRule};
 
-pub use claude::{UsageFetch, UsageRequest};
+pub use balance::{
+    Balance, BalanceReader, BalanceReport, BalanceRow, BalanceValue, CreditPeriod, HttpFetch,
+    Money, Provider, balances, defaults,
+};
+pub use claude::{UsageFetch, UsageRequest, usage_command};
+pub use keys::{Found, FoundKey, KeyOrigin, OriginAccount, Skipped, default_provider, find};
 
-/// 读当前机器上某家的额度。
-pub fn quota(vendor: Vendor) -> QuotaReading {
-    match QuotaReader::system() {
-        Some(reader) => reader.read(vendor),
+/// 读当前机器上某个账号的额度。
+pub fn quota(account: &Account) -> QuotaReading {
+    match QuotaReader::system_for(account) {
+        Some(reader) => reader.read(account.vendor),
         None => QuotaReading::unavailable(SystemTime::now()),
     }
 }
@@ -37,10 +47,19 @@ pub fn supported(vendor: Vendor) -> bool {
 }
 
 /// 给会话台启动的 Claude 加的 `--settings` 参数值（JSON 字符串）。
-/// 注入的状态栏命令把官方给状态栏的数据写进缓存，再原样调用用户原有的状态栏命令，不覆盖。
+/// 注入的状态栏命令把官方给状态栏的数据写进缓存（这个账号自己的那份），再原样调用用户原有的状态栏命令，不覆盖。
 /// `cwd` 是 Claude 的项目目录（用来找项目级的原有状态栏设置）。
-pub fn claude_settings(cwd: &Path) -> Option<String> {
-    QuotaReader::system().map(|r| r.claude_settings(cwd))
+pub fn claude_settings(account: &Account, cwd: &Path) -> Option<String> {
+    QuotaReader::system_for(account).map(|r| r.claude_settings(cwd))
+}
+
+/// 这个账号的额度缓存放哪：默认账号是会话台数据目录本身（老用户的缓存不动），别的账号在 `accounts/<短名>`。
+pub fn cache_dir(data_dir: &Path, account: &Account) -> PathBuf {
+    if account.is_default() {
+        data_dir.to_path_buf()
+    } else {
+        data_dir.join("accounts").join(&account.key)
+    }
 }
 
 /// 一个渠道试读的结果，给 `ai doctor` 报告每个渠道能不能用。
@@ -63,13 +82,31 @@ pub struct QuotaReader {
 }
 
 impl QuotaReader {
-    /// 本机环境：家目录、会话台数据目录、当前时间和时区、真实的钥匙串 + 联网。
+    /// 本机环境（各家目录照环境变量），给 `ai doctor` 一次试遍各家渠道；额度缓存用 Claude 主账号那份。
     pub fn system() -> Option<Self> {
         let home = PathBuf::from(env::var_os("HOME").filter(|h| !h.is_empty())?);
         let dirs = VendorDirs::from_env(&home);
-        // 改过数据目录的，额度缓存也分开放（和列表缓存同一个目录），免得看到另一个账号的额度。
-        // 目录由会话台打开列表缓存时按私有权限建好；这里不建（`ai doctor` 单独跑时缓存写不进就算了）。
-        let data_dir = dirs.cache_dir(&Config::data_dir()?, &home);
+        let claude = Account::new(
+            Vendor::Claude,
+            "",
+            dirs.dir(Vendor::Claude).to_path_buf(),
+            &home,
+        );
+        let data_dir = cache_dir(&Config::data_dir()?, &claude);
+        Some(
+            Self::new(home, data_dir, SystemTime::now(), time::local_utc_offset())
+                .with_fetch(Box::new(claude::fetch_usage))
+                .with_dirs(dirs),
+        )
+    }
+
+    /// 本机环境下读这个账号：家目录、这个账号的额度缓存目录（[`cache_dir`]）、当前时间和时区、真实的钥匙串 + 联网。
+    /// 这家的数据目录换成账号的目录，别的家照环境变量。
+    pub fn system_for(account: &Account) -> Option<Self> {
+        let home = PathBuf::from(env::var_os("HOME").filter(|h| !h.is_empty())?);
+        let dirs = VendorDirs::from_env(&home).with_dir(account.vendor, account.dir.clone());
+        // 每个账号的额度缓存分开放，免得看到另一个账号的额度。缓存写进去时按私有权限建目录。
+        let data_dir = cache_dir(&Config::data_dir()?, account);
         Some(
             Self::new(home, data_dir, SystemTime::now(), time::local_utc_offset())
                 .with_fetch(Box::new(claude::fetch_usage))

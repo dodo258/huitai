@@ -10,8 +10,8 @@ use super::jsonl::{self, str_field};
 use super::time::{from_millis, parse_rfc3339};
 use super::window::Window;
 use super::{
-    Command, Counted, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript, Trash,
-    TrashEntry, transcript,
+    Command, Counted, Moment, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript,
+    Trash, TrashEntry, moment, transcript,
 };
 use crate::core::{Session, SessionId, Vendor};
 
@@ -45,6 +45,10 @@ impl Source for PiSource {
 
     fn load_transcript(&self, session: &Session) -> io::Result<Transcript> {
         transcript::read(&session.path, parts)
+    }
+
+    fn load_moment(&self, session: &Session) -> io::Result<Moment> {
+        moment::read_jsonl(&session.path, |v| moment::parts(parts(v)))
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
@@ -177,6 +181,7 @@ pub(crate) fn read_session(path: &Path) -> io::Result<Option<Session>> {
         message_count,
         // pi 的会话文件不记是不是无头（`pi -p`）起的：头行只有 id、cwd、时间、版本（本机 pi 核对过）。
         automatic: false,
+        account: String::new(),
     }))
 }
 

@@ -1,8 +1,7 @@
 //! 会话台遇到不认订阅的旧版守护进程：订阅失败后降级成用 `List` 轮询托管对话。
 //!
-//! 旧版守护进程是测试里起的假守护进程，说真的旧协议：只认 `Ping`、`List`，别的请求（`Hello`、`Board`、
-//! `Events`…）读不懂就直接关连接，和没有握手的旧版 `ai daemon` 一样。另一种假守护进程会握手、报更老的版本，
-//! 但同样不认 `Board`，代表以后订阅格式改了的旧版。
+//! 旧版守护进程是测试里起的假守护进程：会握手、报给定的版本，此外只认 `Ping`、`List`，别的请求（`Board`、
+//! `Events`…）读不懂就直接关连接，代表以后订阅格式改了的旧版。
 
 mod host_support;
 
@@ -24,7 +23,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// 假守护进程。`hello` 为 `None` 时是没有握手的旧版；有值时握手报这个版本。drop 时删 socket、停下。
+/// 假守护进程，握手报 `hello` 这个版本。drop 时删 socket、停下。
 struct FakeDaemon {
     dir: PathBuf,
     hosted: Arc<Mutex<Vec<HostedInfo>>>,
@@ -32,7 +31,7 @@ struct FakeDaemon {
 }
 
 impl FakeDaemon {
-    fn start(hello: Option<Build>, hosted: Vec<HostedInfo>) -> Self {
+    fn start(hello: Build, hosted: Vec<HostedInfo>) -> Self {
         let dir = PathBuf::from(format!(
             "/tmp/htl-{}-{}",
             std::process::id(),
@@ -71,19 +70,16 @@ impl Drop for FakeDaemon {
     }
 }
 
-/// 一条连接：只认 `Ping`、`List`（握手版还认 `Hello`），别的就关连接。
-fn serve(mut conn: UnixStream, hello: Option<Build>, list: &Mutex<Vec<HostedInfo>>) {
+/// 一条连接：只认 `Hello`、`Ping`、`List`，别的就关连接。
+fn serve(mut conn: UnixStream, hello: Build, list: &Mutex<Vec<HostedInfo>>) {
     while let Ok(req) = protocol::read_json::<Request>(&mut conn, KIND_REQUEST) {
         let reply = match req {
-            Request::Hello(_) => match &hello {
-                Some(build) => Response::Hello(HelloReply {
-                    build: build.clone(),
-                    pid: std::process::id(),
-                    hosted: list.lock().unwrap().len(),
-                    refused: None,
-                }),
-                None => return,
-            },
+            Request::Hello(_) => Response::Hello(HelloReply {
+                build: hello.clone(),
+                pid: std::process::id(),
+                hosted: list.lock().unwrap().len(),
+                refused: None,
+            }),
             Request::Ping => Response::Pong {
                 pid: std::process::id(),
             },
@@ -126,13 +122,13 @@ fn older_build() -> Build {
 }
 
 #[test]
-fn legacy_daemon_without_subscription_falls_back_to_polling_list() {
-    let fake = FakeDaemon::start(None, vec![running("a")]);
+fn older_daemon_without_subscription_falls_back_to_polling_list() {
+    let fake = FakeDaemon::start(older_build(), vec![running("a")]);
 
     // 旧版不认会话台的订阅。
     assert!(host::board(&fake.dir, BoardInfo::default()).is_err());
     let info = host::probe(&fake.dir).unwrap();
-    assert!(info.build.is_none() && info.outdated());
+    assert!(info.outdated());
     assert_eq!(info.hosted, 1);
 
     let mut feed = board_feed(&fake.dir, BoardInfo::default(), POLL).expect("应该降级成轮询");
@@ -149,8 +145,8 @@ fn legacy_daemon_without_subscription_falls_back_to_polling_list() {
 }
 
 #[test]
-fn polling_stops_when_legacy_daemon_goes_away() {
-    let fake = FakeDaemon::start(None, vec![running("a")]);
+fn polling_stops_when_older_daemon_goes_away() {
+    let fake = FakeDaemon::start(older_build(), vec![running("a")]);
     let mut feed = board_feed(&fake.dir, BoardInfo::default(), POLL).unwrap();
     assert!(feed.polling());
     drop(fake);
@@ -158,20 +154,9 @@ fn polling_stops_when_legacy_daemon_goes_away() {
 }
 
 #[test]
-fn older_handshaking_daemon_that_rejects_board_also_falls_back() {
-    let fake = FakeDaemon::start(Some(older_build()), vec![running("a")]);
-    let info = host::probe(&fake.dir).unwrap();
-    assert!(info.build.is_some() && info.outdated());
-
-    let mut feed = board_feed(&fake.dir, BoardInfo::default(), POLL).expect("应该降级成轮询");
-    assert!(feed.polling());
-    assert_eq!(hosted_ids(feed.recv().unwrap()), ["a"]);
-}
-
-#[test]
 fn current_daemon_that_rejects_board_is_an_error_not_polling() {
     // 版本和当前程序一样却不认订阅：不是新旧之分，照常报错（会话台过一会儿再试）。
-    let fake = FakeDaemon::start(Some(host::version::current().clone()), vec![running("a")]);
+    let fake = FakeDaemon::start(host::version::current().clone(), vec![running("a")]);
     assert!(board_feed(&fake.dir, BoardInfo::default(), POLL).is_err());
 }
 

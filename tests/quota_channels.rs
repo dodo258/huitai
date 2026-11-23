@@ -395,8 +395,9 @@ fn pi_renamed_fields_or_missing_dir_are_unavailable() {
 }
 
 #[test]
-fn moved_claude_config_dir_never_uses_default_keychain_credentials() {
-    // 改过 CLAUDE_CONFIG_DIR：钥匙串里那份凭证认不出属于哪个账号，用量接口一次都不问，降级到下一个渠道。
+fn moved_claude_config_dir_asks_only_its_own_keychain_entry() {
+    // 改过 CLAUDE_CONFIG_DIR 的账号：用量接口只读它自己那份钥匙串条目
+    // （`Claude Code-credentials-<sha256(目录) 前 8 位>`），绝不拿默认条目（别的账号的）。
     let sb = Sandbox::new("cl-moved").with_home("claude/home");
     sb.put_data(
         "claude/statusline.json",
@@ -406,16 +407,99 @@ fn moved_claude_config_dir_never_uses_default_keychain_credentials() {
     let moved = huitai::core::VendorDirs::new(&sb.home(), &sb.home(), |k| {
         (k == "CLAUDE_CONFIG_DIR").then(|| "/elsewhere/.claude-work".into())
     });
-    let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = asked.clone();
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
     let r = sb
         .reader()
         .with_dirs(moved)
-        .with_fetch(Box::new(move |_| {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            Err("不该问".to_owned())
+        .with_fetch(Box::new(move |req| {
+            seen.lock().unwrap().push(req.keychain_service.to_owned());
+            Err("测试里不联网".to_owned())
         }))
         .read(Vendor::Claude);
-    assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+    // sha256("/elsewhere/.claude-work") = b7db8dd3…
+    assert_eq!(
+        *asked.lock().unwrap(),
+        ["Claude Code-credentials-b7db8dd3".to_owned()]
+    );
     assert_ne!(r.source, "用量接口");
+}
+
+/// Claude 用量接口的请求：系统自带的 curl、第一个参数 `-q`，`.curlrc` 里开的追踪不会把凭证写进文件；凭证只走标准输入。
+/// 对照：同一条命令去掉 `-q` 时追踪文件里就有凭证（证明这个 `.curlrc` 确实会被读）。
+#[test]
+fn usage_request_ignores_curlrc_trace() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::TcpListener;
+
+    const TOKEN: &str = "sk-ant-oat-fake-0042";
+    let sb = Sandbox::new("curlrc");
+    let rc = sb.root.join("rc");
+    fs::create_dir_all(&rc).unwrap();
+    let trace = rc.join("trace.txt");
+    fs::write(
+        rc.join(".curlrc"),
+        format!("trace-ascii = \"{}\"\n", trace.display()),
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/api/oauth/usage", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            let _ = reader.read(&mut [0; 1]);
+        }
+    });
+    let headers = ["anthropic-beta: oauth-2025-04-20".to_owned()];
+    let req = UsageRequest {
+        url: &url,
+        headers: &headers,
+        keychain_service: "unused",
+        token_pointer: "/unused",
+        expires_at_ms_pointer: "/unused",
+        timeout: Duration::from_secs(5),
+        now_secs: NOW as i64,
+    };
+    let (argv, stdin) = huitai::quota::usage_command(&req, TOKEN);
+    assert_eq!(argv[0], "/usr/bin/curl", "{argv:?}");
+    assert_eq!(argv[1], "-q", "-q 只有放在第一个参数才生效：{argv:?}");
+    assert!(
+        argv.iter().all(|a| !a.contains(TOKEN)),
+        "凭证不进命令行参数"
+    );
+    assert!(stdin.contains(TOKEN));
+
+    let run = |args: &[String]| {
+        let mut child = Command::new(&argv[0])
+            .args(args)
+            .env("CURL_HOME", &rc)
+            .env("HOME", &rc)
+            .env("XDG_CONFIG_HOME", &rc)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "{}");
+    };
+    run(&argv[1..]);
+    assert!(!trace.exists(), "-q 时不读 .curlrc，不该有追踪文件");
+    run(&argv[2..]);
+    let traced = fs::read_to_string(&trace).expect("不带 -q 时 .curlrc 生效");
+    assert!(traced.contains(TOKEN), "对照：不带 -q 时凭证进了追踪文件");
 }

@@ -4,9 +4,7 @@
 //! 也会盖掉程序文件，守护进程启动时记下的修改时间比现在文件上的旧，就是旧版。程序文件不同（开发时的
 //! debug 和装好的 release）只比版本号。
 //!
-//! 环境变量（只给测试用，伪造另一个版本的构建）：
-//! - `HUITAI_FAKE_VERSION=<版本号>`：报这个版本号。
-//! - `HUITAI_FAKE_PROTOCOL=<数字>`：报这个协议版本；`0` 让守护进程装成没有握手的旧版（不认 `Hello`）。
+//! 环境变量 `HUITAI_FAKE_VERSION=<版本号>`（只给测试用，伪造另一个版本的构建）：报这个版本号。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +14,6 @@ use std::time::SystemTime;
 use super::protocol::{Build, PROTOCOL};
 
 pub const FAKE_VERSION: &str = "HUITAI_FAKE_VERSION";
-pub const FAKE_PROTOCOL: &str = "HUITAI_FAKE_PROTOCOL";
 
 /// 本进程是哪一版。第一次调用时读程序文件的修改时间，守护进程启动时就要调一次（之后文件可能被新版盖掉）。
 pub fn current() -> &'static Build {
@@ -40,9 +37,7 @@ fn modified(path: &Path) -> u64 {
 pub fn detect(env: impl Fn(&str) -> Option<String>, exe: Option<PathBuf>, built: u64) -> Build {
     let set = |k| env(k).filter(|v: &String| !v.is_empty());
     Build {
-        protocol: set(FAKE_PROTOCOL)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(PROTOCOL),
+        protocol: PROTOCOL,
         version: set(FAKE_VERSION).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
         exe,
         built,
@@ -143,14 +138,13 @@ mod tests {
     }
 
     #[test]
-    fn env_fakes_version_and_protocol() {
-        let env = |k: &str| match k {
-            FAKE_VERSION => Some("0.0.1".to_owned()),
-            FAKE_PROTOCOL => Some("0".to_owned()),
-            _ => None,
-        };
+    fn env_fakes_version() {
+        let env = |k: &str| (k == FAKE_VERSION).then(|| "0.0.1".to_owned());
         let b = detect(env, None, 5);
-        assert_eq!((b.protocol, b.version.as_str(), b.built), (0, "0.0.1", 5));
+        assert_eq!(
+            (b.protocol, b.version.as_str(), b.built),
+            (PROTOCOL, "0.0.1", 5)
+        );
         let real = detect(|_| Some(String::new()), None, 0);
         assert_eq!(real.protocol, PROTOCOL);
         assert_eq!(real.version, env!("CARGO_PKG_VERSION"));

@@ -111,7 +111,7 @@ fn status_counts_own_conversations_across_vendors() {
 }
 
 #[test]
-fn waiting_blinks_slowly_unless_turned_off() {
+fn unseen_results_blink_slowly_unless_turned_off() {
     let mut app = demo_app(Vendor::Claude);
     let waiting_fg = |app: &mut App| {
         let buf = render(app, W, H);
@@ -159,12 +159,19 @@ fn waiting_blinks_slowly_unless_turned_off() {
     assert!(!app.blink_dim, "关掉后一直亮着");
     assert_eq!(waiting_fg(&mut app), bright);
 
-    // 没有等你回复的就不闪。
+    // 都看过了（只剩「等你回复」）：照样计数，不闪。
     app.config.blink_waiting = true;
-    for id in ["c-shop-2", "c-blog-1", "p-blog-1"] {
+    for id in ["c-shop-2", "p-blog-1"] {
         app.states.remove(&SessionId::from(id));
     }
     app.tick_blink(BLINK_HALF);
+    assert!(!app.blink_dim, "只剩看过的不闪");
+    assert!(top(&mut app, W).contains("◆1 等你"), "{}", top(&mut app, W));
+    assert_eq!(waiting_fg(&mut app), bright);
+
+    // 没有等你回复的就不闪。
+    app.states.remove(&SessionId::from("c-blog-1"));
+    app.tick_blink(BLINK_HALF * 3);
     assert!(!app.blink_dim, "没有等你回复的不闪");
 }
 
