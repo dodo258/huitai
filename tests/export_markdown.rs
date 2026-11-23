@@ -4,9 +4,7 @@
 mod sources_common;
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use huitai::core::{Account, Session, SessionId, Vendor};
 use huitai::export::{self, Meta};
@@ -22,20 +20,11 @@ fn east8(_: i64) -> i64 {
     8 * 3600
 }
 
+/// 用会话台自带的 SQLite（rusqlite bundled）建样例库：CI 机器上的系统 `sqlite3` 不带 FTS5。
 fn build_db(path: &Path, sql: &str) {
-    let mut child = Command::new("sqlite3")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("测试需要 sqlite3（macOS 自带）");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
+    rusqlite::Connection::open(path)
+        .and_then(|db| db.execute_batch(sql))
+        .unwrap_or_else(|e| panic!("建样例库 {} 失败：{e}", path.display()));
 }
 
 /// 一家的样例来源。
