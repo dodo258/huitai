@@ -362,7 +362,7 @@ pub(super) fn centered(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::list::snippet_spans;
-    use super::top_bar::with_tab_forms;
+    use super::top_bar::{TabForm, with_tab_forms};
     use super::{Snippet, Style, clip, width};
     use ratatui::style::Modifier;
 
@@ -431,17 +431,26 @@ mod tests {
     }
 
     #[test]
-    fn tabs_shrink_first_only_with_five_or_more() {
-        // 少于五家：每种写法都用全名，最后再加一种缩写的。
+    fn tabs_keep_short_names_until_quota_details_are_gone() {
+        use TabForm::{Full, Marks, Short};
+        // 少于五家：每种写法都用全名，最后再写短名、缩成标记。
         assert_eq!(
-            with_tab_forms(vec![1, 2, 3], 4),
-            [(1, false), (2, false), (3, false), (3, true)]
+            with_tab_forms(vec![1, 2, 3], 4, 1),
+            [(1, Full), (2, Full), (3, Full), (3, Short), (3, Marks)]
         );
-        // 五家以上：最全的写法先试全名，放不下就缩标签，之后都是缩写的。
+        // 五家以上：最全的写法先试全名，放不下别家写短名，一直缩到 plain 那种（这里是第 2 种），
+        // 还放不下才缩成标记，再从最全的写法试起。
         assert_eq!(
-            with_tab_forms(vec![1, 2, 3], 5),
-            [(1, false), (1, true), (2, true), (3, true)]
+            with_tab_forms(vec![1, 2, 3], 5, 1),
+            [
+                (1, Full),
+                (1, Short),
+                (2, Short),
+                (1, Marks),
+                (2, Marks),
+                (3, Marks)
+            ]
         );
-        assert!(with_tab_forms(Vec::<u8>::new(), 5).is_empty());
+        assert!(with_tab_forms(Vec::<u8>::new(), 5, 0).is_empty());
     }
 }

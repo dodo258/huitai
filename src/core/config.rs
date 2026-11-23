@@ -35,6 +35,8 @@ pub struct Config {
     pub auto_upgrade_clis: bool,
     /// 备份全部 Claude 对话（Claude Code 会删掉超过 `cleanupPeriodDays` 天没动的）；关着只备在会话台里置顶、改名、归档过的。
     pub backup_all_claude: bool,
+    /// 在 `ai attach` 里（当前窗口或新标签页接着的对话）回到会话台的键，CLI 留在后台；可以关掉。
+    pub back_key: BackKey,
     /// 手动加的账号（同一家另一个数据目录）。默认位置、环境变量指的目录和 Hermes 的 profile 不用加，自动认。
     /// 全部账号存在 `accounts.json`（0.1.3 不读、不会丢）；`config.json` 里 `accounts` 那一项是用户手动管的，
     /// 读的时候照它同步（见 [`Config::load`]）。
@@ -46,6 +48,86 @@ pub struct Config {
     /// `accounts.json` 里解不了的条目（以后的版本加的厂商）：不用，原样写回。
     #[serde(skip)]
     pub unknown_accounts: Vec<serde_json::Value>,
+}
+
+/// 回到会话台的键：`ai attach` 客户端自己认的键，认到就不转给 CLI，脱开这条 attach（CLI 留在后台）。
+/// `config.json` 里写 `"ctrl_backslash"`、`"ctrl_q"`、`"ctrl_bracket"`、`"off"`；认不得的写法（以后的版本加的）按默认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum BackKey {
+    /// ⌃\：八家 CLI 默认都没用它（出处见 DECISIONS.md）。
+    #[default]
+    CtrlBackslash,
+    /// ⌃Q：单手好按，但 Hermes（经典界面里等于 ⌃C）和 Kimi Code（输出时把输入排队）默认用它。
+    CtrlQ,
+    /// ⌃]：telnet、docker attach 的脱离键；Codex（跳过问题）、pi 和 Kimi Code（跳到字符）默认用它。
+    CtrlBracket,
+    /// 不认任何键，只有 CLI 退出才回到会话台。
+    Off,
+}
+
+impl BackKey {
+    /// 设置页里切换的顺序。
+    pub const ALL: [Self; 4] = [
+        Self::CtrlBackslash,
+        Self::CtrlQ,
+        Self::CtrlBracket,
+        Self::Off,
+    ];
+
+    /// 终端传统写法下这个键的那个字节。
+    pub fn byte(self) -> Option<u8> {
+        match self {
+            Self::CtrlBackslash => Some(0x1c),
+            Self::CtrlQ => Some(0x11),
+            Self::CtrlBracket => Some(0x1d),
+            Self::Off => None,
+        }
+    }
+
+    /// kitty 键盘协议、xterm modifyOtherKeys 里和 Ctrl 一起报的键码（不带 Shift 的字符）。
+    pub fn code(self) -> Option<u32> {
+        match self {
+            Self::CtrlBackslash => Some(u32::from(b'\\')),
+            Self::CtrlQ => Some(u32::from(b'q')),
+            Self::CtrlBracket => Some(u32::from(b']')),
+            Self::Off => None,
+        }
+    }
+
+    /// 给人看的写法；关掉时 `None`。
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::CtrlBackslash => Some("⌃\\"),
+            Self::CtrlQ => Some("⌃Q"),
+            Self::CtrlBracket => Some("⌃]"),
+            Self::Off => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::CtrlBackslash => "ctrl_backslash",
+            Self::CtrlQ => "ctrl_q",
+            Self::CtrlBracket => "ctrl_bracket",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl From<String> for BackKey {
+    fn from(s: String) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.name() == s)
+            .unwrap_or_default()
+    }
+}
+
+impl From<BackKey> for String {
+    fn from(k: BackKey) -> Self {
+        k.name().to_owned()
+    }
 }
 
 /// 账号放在 `config.json` 同目录的这个文件里，0.1.3 不读它。
@@ -94,6 +176,7 @@ impl Default for Config {
             check_updates: true,
             auto_upgrade_clis: true,
             backup_all_claude: false,
+            back_key: BackKey::default(),
             accounts: Vec::new(),
             accounts_in_config: Vec::new(),
             unknown_accounts: Vec::new(),
@@ -291,6 +374,7 @@ mod tests {
             check_updates: false,
             auto_upgrade_clis: false,
             backup_all_claude: true,
+            back_key: BackKey::Off,
             accounts: vec![AccountSetting {
                 vendor: crate::core::Vendor::Codex,
                 name: "工作号".to_owned(),
@@ -321,7 +405,32 @@ mod tests {
             cfg.auto_upgrade_clis,
             "旧配置没有这一项时默认自动升级各家 CLI"
         );
+        assert_eq!(
+            cfg.back_key,
+            BackKey::CtrlBackslash,
+            "旧配置没有这一项时用 ⌃\\"
+        );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn back_key_reads_each_choice_and_falls_back_on_unknown() {
+        for (json, key) in [
+            (r#"{"back_key": "ctrl_backslash"}"#, BackKey::CtrlBackslash),
+            (r#"{"back_key": "ctrl_q"}"#, BackKey::CtrlQ),
+            (r#"{"back_key": "ctrl_bracket"}"#, BackKey::CtrlBracket),
+            (r#"{"back_key": "off"}"#, BackKey::Off),
+            (r#"{"back_key": "ctrl_x"}"#, BackKey::CtrlBackslash),
+        ] {
+            let cfg: Config = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.back_key, key, "{json}");
+        }
+        let text = serde_json::to_string(&Config {
+            back_key: BackKey::CtrlBracket,
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(text.contains(r#""back_key":"ctrl_bracket""#), "{text}");
     }
 
     #[test]

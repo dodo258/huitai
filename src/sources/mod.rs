@@ -98,6 +98,12 @@ pub trait Source: Send + Sync {
         with_wal(&session.path)
     }
 
+    /// 厂商记录里这一轮是不是确实答完了（给答完不发提醒信号的 CLI 做闲置收回用）：`Some(true)` 答完、在等你；
+    /// `Some(false)` 还没答完（最后是工具调用、刚发的话）；`None` 这家判断不了，或记录里看不出来。只读文件尾部。
+    fn turn_done(&self, _session: &Session) -> io::Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// 精确的用户发言条数（会读完整个文件，按需调用）。
     fn count_messages(&self, session: &Session) -> io::Result<usize>;
 

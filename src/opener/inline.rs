@@ -1,4 +1,4 @@
-//! 其他终端：在当前窗口跑 attach，attach 结束（CLI 退出或按脱离键）后回到会话台。
+//! 其他终端：在当前窗口跑 attach，attach 结束（CLI 退出，或按 ⌃] 脱开、CLI 留在后台）后回到会话台。
 
 use std::io;
 use std::process;

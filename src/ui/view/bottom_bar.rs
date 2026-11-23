@@ -86,11 +86,17 @@ pub(super) fn bottom_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme,
         let running = entries.len() - waiting;
         let left = vec![
             sp("s ", bold(accent)),
-            sp(format!("等你 {waiting} · 在跑 {running}"), fg(t.title)),
+            sp(format!("待处理 {waiting} · 在跑 {running}"), fg(t.title)),
         ];
+        // 只给现在按了有用的键：空汇总只能返回，没有待处理的就不给 `!`。
+        let keys = match (entries.len(), waiting) {
+            (0, _) => "Esc 返回",
+            (_, 0) => "⏎ 打开 · Esc 返回",
+            _ => "⏎ 打开 · ! 下一条待处理 · Esc 返回",
+        };
         let right = match &app.status {
             Some(s) => vec![sp(s.clone(), fg(t.text))],
-            None => key_hints("⏎ 打开 · ! 下一条等你 · Esc 返回", t, accent),
+            None => key_hints(keys, t, accent),
         };
         row(buf, inner, left, right);
         return;

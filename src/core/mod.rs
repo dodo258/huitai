@@ -11,7 +11,7 @@ mod session;
 mod vendor;
 
 pub use account::{Account, AccountSetting};
-pub use config::Config;
+pub use config::{BackKey, Config};
 pub use dirs::{EnvAssign, VendorDirs};
 pub use quota::{QuotaReading, QuotaValue, QuotaWindow};
 pub use session::{QUIET_AFTER, REDRAW_GRACE, Session, SessionId, SessionState};

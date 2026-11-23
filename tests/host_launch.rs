@@ -175,3 +175,170 @@ fn daemon_drops_inherited_descriptors() {
         "守护进程还拿着继承来的管道写端（poll={ready}, read={n}）"
     );
 }
+
+/// 起一条假 CLI（把收到的字节写进 `in.bin`）并用真的 `ai attach` 接上；`config` 是 config.json 的内容。
+fn attach_recording(name: &str, config: Option<&str>) -> (Home, SessionId, std::process::Child) {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut home = Home::new(name);
+    home.ensure_daemon();
+    if let Some(config) = config {
+        fs::write(home.data.join("config.json"), config).unwrap();
+    }
+    let id = SessionId::from(format!("{name}-1"));
+    let spec = SpawnSpec {
+        id: id.clone(),
+        vendor: Vendor::Claude,
+        project: "proj".to_owned(),
+        cwd: home.home.clone(),
+        command: "stty raw -echo; printf READY; exec cat > in.bin".to_owned(),
+    };
+    assert_eq!(
+        host::request(&home.data, &Request::Spawn(spec)).unwrap(),
+        Response::Ok
+    );
+
+    let mut child = home
+        .ai()
+        .args(["attach", id.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = out.read(&mut buf) {
+            if n == 0 {
+                return;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            if String::from_utf8_lossy(&seen).contains("READY") {
+                let _ = tx.send(());
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("等不到假 CLI 起来");
+    (home, id, child)
+}
+
+/// 等假 CLI 收满 `want` 那么多字节（最多 10 秒），返回收到的。
+fn received(home: &Home, want: usize) -> Vec<u8> {
+    use std::time::{Duration, Instant};
+    let file = home.home.join("in.bin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = fs::read(&file).unwrap_or_default();
+        if got.len() >= want || Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 按了脱离键：`delivered` 是它前面该到 CLI 的，`key` 和后面的 `zz` 不该到。attach 以 0 退出，
+/// CLI 留在守护进程里接着跑（还在 List 里、有进程号、没人接着）。
+fn assert_detaches(name: &str, config: Option<&str>, delivered: &[u8], key: &[u8]) {
+    use std::time::{Duration, Instant};
+
+    let (home, id, mut child) = attach_recording(name, config);
+    let mut input = delivered.to_vec();
+    input.extend_from_slice(key);
+    input.extend_from_slice(b"zz");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&input).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = host::request(&home.data, &Request::Kill { id: id.clone() });
+            panic!("按了脱离键 {key:?} 10 秒 attach 还没结束");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(stdin);
+    assert_eq!(status.code(), Some(0), "按脱离键脱开时 attach 退出码为 0");
+
+    let got = received(&home, delivered.len());
+    assert_eq!(
+        got,
+        delivered,
+        "CLI 收到 {:?}",
+        String::from_utf8_lossy(&got)
+    );
+
+    let Response::List(list) = host::request(&home.data, &Request::List).unwrap() else {
+        panic!("List 应答不对");
+    };
+    let info = list
+        .iter()
+        .find(|h| h.id == id)
+        .expect("脱开后对话应还在托管");
+    assert!(info.pid.is_some(), "CLI 应还在跑：{info:?}");
+    assert!(!info.attached, "脱开后不该还有人接着：{info:?}");
+    // 再等一会儿：脱离键后面的字也不会迟到。
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fs::read(home.home.join("in.bin")).unwrap(), delivered);
+
+    assert_eq!(
+        host::request(&home.data, &Request::Kill { id }).unwrap(),
+        Response::Ok
+    );
+}
+
+/// `ai attach` 里按默认的脱离键 ⌃\（没有 config.json）：前面打的字照常到 CLI，⌃\ 本身和后面的不到；
+/// 括号粘贴里的 0x1c 是粘贴内容照转，旧键 ⌃] 不再脱开、照转给 CLI。
+#[test]
+fn ai_attach_detach_key_leaves_the_cli_running() {
+    assert_detaches("detach", None, b"ab\x1d\x1b[200~p\x1cq\x1b[201~", b"\x1c");
+}
+
+/// 设置里把回到会话台的键换成 ⌃Q 或 ⌃]：按它脱开，默认的 ⌃\ 照转给 CLI。
+#[test]
+fn ai_attach_detach_key_follows_the_setting() {
+    assert_detaches(
+        "detach-q",
+        Some(r#"{"back_key": "ctrl_q"}"#),
+        b"ab\x1c\x1d",
+        b"\x11",
+    );
+    assert_detaches(
+        "detach-br",
+        Some(r#"{"back_key": "ctrl_bracket"}"#),
+        b"ab\x1c\x11",
+        b"\x1d",
+    );
+}
+
+/// 设置里关掉回到会话台的键：⌃\、⌃Q、⌃] 都照转给 CLI，attach 一直接着，直到对话结束。
+#[test]
+fn ai_attach_detach_key_off_forwards_both_keys() {
+    use std::time::{Duration, Instant};
+
+    let (home, id, mut child) = attach_recording("detach-off", Some(r#"{"back_key": "off"}"#));
+    let sent = b"a\x1cb\x11c\x1dd";
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(sent).unwrap();
+    let got = received(&home, sent.len());
+    assert_eq!(got, sent, "CLI 收到 {:?}", String::from_utf8_lossy(&got));
+    assert!(child.try_wait().unwrap().is_none(), "关掉后不该脱开");
+
+    assert_eq!(
+        host::request(&home.data, &Request::Kill { id }).unwrap(),
+        Response::Ok
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "对话结束 10 秒 attach 还没退出");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(stdin);
+}

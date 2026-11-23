@@ -18,7 +18,7 @@
 | `src/core/` | 共享类型和配置：Vendor（每家静态信息在 `VENDORS` 一张表，别处查表）、Session、SessionId、SessionState、QuotaReading、Config；带超时跑子进程只有 `core/exec.rs` 一份，用 curl 发 GET 只有 `core/http.rs` 一份 | 纯数据 + 无依赖的小工具（`exec::run`、`http::get`） |
 | `src/sources/` | 各家适配器（每家一个文件）：扫描、元数据、预览、恢复/新建命令、回收站；Claude 对话的备份和放回（`backup.rs`） | `trait Source` |
 | `src/index/` | 缓存、增量扫描（FSEvents）、全文搜索、会话台自己的标注（改名/置顶/归档）、按标注挑要备份的 Claude 对话（`backup.rs`） | `Index` |
-| `src/host/` | 守护进程：PTY 托管、原样转发、终端状态机重连恢复、标题改写、通知序列识别、防休眠、闲置收回、socket 协议和版本握手 | `Hello/Spawn/Attach/Detach/Kill/List/Events` |
+| `src/host/` | 守护进程：PTY 托管、原样转发、终端状态机重连恢复、标题改写、通知序列识别、防休眠、闲置收回、socket 协议和版本握手 | `Hello/Spawn/Attach/Detach/Kill/Reclaim/List/Events` |
 | `src/opener/` | 识别终端、开新标签页、聚焦已开标签页 | `trait Opener` |
 | `src/quota/` | 多渠道额度读取与降级，规则文件 | `quota(vendor) -> QuotaReading` |
 | `src/notify/` | 状态变化 → 通知 | `notify(event)` |
@@ -40,6 +40,7 @@
 - 只读厂商数据；唯一会移动厂商文件的是「删除进回收站」，唯一会往厂商目录写的是主人按 `P` 把只剩备份的 Claude 对话放回原处（不覆盖已有文件，`sources/backup.rs`）。Claude 备份存在会话台数据目录 `backups/claude/`（0700，zstd），只读复制。绝不修改 `~/.claude/settings.json`、`~/.codex/config.toml`、`~/.pi/agent/*`。
 - 托管层对 PTY 字节原样转发，只允许改写窗口标题序列（OSC 0/1/2，加「状态 项目 · 厂商 · 」前缀）；状态变了可以补发一条完整的标题序列，但只插在输出停在完整的地方（`Scanner::at_boundary`）。其余任何改写都会破坏粘贴、换行、键盘协议。
   - 例外：`ai attach` 客户端为了知道标签页在不在前台（在前台就不提醒），CLI 没开焦点上报时自己在真终端开 `CSI ?1004h`（断开时关），并把终端因此发来的 `ESC [ I` / `ESC [ O` 从输入里去掉、改用协议的 `F` 帧告诉守护进程（守护进程广播成 `HostEvent::Focus`）；CLI 自己开了 ?1004 时不开不关，序列原样转给它。这是撤掉我们自己要来的序列，不改 CLI 收发的任何字节。
+  - 例外：脱离键 ⌃]（0x1d；CLI 开了 kitty 键盘协议时是 `CSI 93;5u`）是 `ai attach` 客户端自己的键，认到就不转给 CLI、请守护进程脱开这条 attach（CLI 留在后台），括号粘贴里的照转（`host/client.rs` 的 `DetachKey`）。这是 attach 客户端撤掉自己的键，不改 CLI 收发的其他任何字节。
 - 守护进程必须从终端里拉起（setsid 脱离），不能用 launchd：否则 CLI 的辅助功能/屏幕录制/浏览器权限归属会变。
 - CLI 子进程用登录 shell（`$SHELL -lc`）在项目目录启动，环境变量继承第一次打开它的终端标签页。
 - 测试和截图不得把本机真实会话内容写进仓库；fixtures 一律手写脱敏样例。

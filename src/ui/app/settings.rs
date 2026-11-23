@@ -3,6 +3,14 @@
 use super::*;
 
 impl App {
+    /// 在当前窗口接上对话前，底栏亮一下的「⌃\ 回到会话台」；设置里关了回到会话台的键就没有。
+    pub fn back_key_hint(&self) -> Option<String> {
+        self.config
+            .back_key
+            .label()
+            .map(|key| format!("{key} 回到会话台"))
+    }
+
     pub(super) fn settings_key(&mut self, key: KeyEvent, cursor: usize) -> Vec<Effect> {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -52,6 +60,20 @@ impl App {
             6 => self.config.backup_all_claude = !self.config.backup_all_claude,
             7 => self.config.check_updates = !self.config.check_updates,
             8 => self.config.auto_upgrade_clis = !self.config.auto_upgrade_clis,
+            9 => {
+                let all = BackKey::ALL;
+                let i = all
+                    .iter()
+                    .position(|k| *k == self.config.back_key)
+                    .unwrap_or(0);
+                let n = all.len();
+                let next = if forward {
+                    (i + 1) % n
+                } else {
+                    (i + n - 1) % n
+                };
+                self.config.back_key = all[next];
+            }
             3 => {
                 let now = self.config.idle_reclaim_minutes;
                 // 手改 config.json 写了列表外的数：从不小于它的那一档接着走。

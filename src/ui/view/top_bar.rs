@@ -6,7 +6,7 @@ use crate::ui::text::resets_in;
 /// 顶栏印章后的全局状态写成什么样（窄了一步步缩）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusForm {
-    /// `◐3 在跑  ◆1 等你  ●2 别处`
+    /// `◐3 在跑  ◆1 待处理  ●2 别处`
     Full,
     /// `◐3 ◆1 ●2`
     Counts,
@@ -25,7 +25,7 @@ struct QuotaCut {
 }
 
 /// 顶栏的写法，从全到简。窄终端依次去掉：额度来源 → 第二个额度窗口 → 重置倒计时 → 状态数字只留点 → 「额度」两字，
-/// 再放不下额度让位（后台是旧版、有新版的提示比额度优先），再放不下先去掉「别处」、留着「在跑 / 等你」，最后状态也不显示。
+/// 再放不下额度让位（后台是旧版、有新版的提示比额度优先），再放不下先去掉「别处」、留着「在跑 / 待处理」，最后状态也不显示。
 /// 每项是（状态写法，额度留哪些，带不带提示，带不带「别处」）。
 fn top_layouts(hint: bool) -> Vec<(StatusForm, Option<QuotaCut>, bool, bool)> {
     let cut = |label, second, source, reset| {
@@ -52,38 +52,55 @@ fn top_layouts(hint: bool) -> Vec<(StatusForm, Option<QuotaCut>, bool, bool)> {
         out.push((StatusForm::Dots, None, true, true));
     }
     out.push((StatusForm::Dots, None, false, true));
-    // 「别处」是自己托管的之外多出来的，挤不下先让它走，「等你」那个点（单击跳过去）留到最后。
+    // 「别处」是自己托管的之外多出来的，挤不下先让它走，「待处理」那个点（单击跳过去）留到最后。
     out.push((StatusForm::Dots, None, false, false));
     out.push((StatusForm::Hidden, None, false, false));
     out
 }
 
-/// 标签几时缩成标记：装了五家以上时，放不下先缩标签（当前这家留全名），再按 `layouts` 依次去掉别的；
-/// 少于五家时标签一直写全名，别的都去掉了还放不下才缩。
-pub(super) fn with_tab_forms<L: Copy>(layouts: Vec<L>, tabs: usize) -> Vec<(L, bool)> {
+/// 各家标签写成什么样（窄了一步步缩）；当前这家一直写「标记 全名」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TabForm {
+    /// 每家「标记 全名」：`✻ Claude │ ◎ Codex │ K Kimi Code`
+    Full,
+    /// 别家去掉标记、只写短名：`✻ Claude │ Codex │ Kimi`
+    Short,
+    /// 别家只剩标记：`✻ Claude │ ◎ │ K`
+    Marks,
+}
+
+/// 标签和右边一起怎么缩。装了五家以上时，放不下先把别家写成短名，再按 `layouts` 依次去掉额度细节；
+/// 到 `plain`（额度细节都去掉了、状态还写全的那一种）还放不下，别家才缩成标记，再从最全的写法试起
+/// （名字让出来的地方还给额度细节，和原来一样）。少于五家时标签一直写全名，别的都去掉了还放不下才写短名、再缩成标记。
+pub(super) fn with_tab_forms<L: Copy>(
+    layouts: Vec<L>,
+    tabs: usize,
+    plain: usize,
+) -> Vec<(L, TabForm)> {
     const MANY_TABS: usize = 5;
     let Some(&last) = layouts.last() else {
         return Vec::new();
     };
-    let mut out: Vec<(L, bool)> = Vec::new();
-    for (i, l) in layouts.into_iter().enumerate() {
-        if tabs >= MANY_TABS {
-            if i == 0 {
-                out.push((l, false));
-            }
-            out.push((l, true));
-        } else {
-            out.push((l, false));
-        }
-    }
     if tabs < MANY_TABS {
-        out.push((last, true));
+        let mut out: Vec<_> = layouts.into_iter().map(|l| (l, TabForm::Full)).collect();
+        out.extend([(last, TabForm::Short), (last, TabForm::Marks)]);
+        return out;
     }
+    let plain = plain.min(layouts.len() - 1);
+    let mut out = vec![(layouts[0], TabForm::Full)];
+    out.extend(layouts[..=plain].iter().map(|&l| (l, TabForm::Short)));
+    out.extend(layouts.iter().map(|&l| (l, TabForm::Marks)));
     out
 }
 
-/// 全局状态，分两段（各自单击做的事不同）：会话台自己托管的在跑（绿）、等你回复（黄，慢闪的暗半拍换暗色），
-/// 和别处在用（柔绿；有正在干活的就转圈）。都没有就是空的。
+/// 别家标签的短名：全名的第一个词（「Kimi Code」→「Kimi」），本来就短的照写。
+fn short_name(v: Vendor) -> &'static str {
+    v.name().split(' ').next().unwrap_or(v.name())
+}
+
+/// 全局状态，分两段（各自单击做的事不同）：会话台自己托管的在跑（绿）、待处理（等回复、待读、失败，黄），
+/// 和别处在用（柔绿；有正在干活的就转圈）。都没有就是空的。符号和计数用状态色，后面的字用次要色；
+/// 待处理慢闪时只有 ◆ 在暗半拍变暗，数字和字一直稳着（照 gitui 加载时只动一个字符）。
 fn status_spans(
     app: &App,
     form: StatusForm,
@@ -91,39 +108,51 @@ fn status_spans(
 ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let (open, busy) = app.elsewhere_counts();
     let dot = if busy > 0 { SPIN_MARK } else { '●' };
-    let elsewhere = chips(&[(open, dot, "别处", t.elsewhere())], form);
+    let c = t.elsewhere();
+    let elsewhere = chips(&[(open, dot, "别处", c, c)], form, t);
     (own_status(app, form, t), elsewhere)
 }
 
-/// 自己托管的：在跑、等你回复。
+/// 自己托管的：在跑、待处理（和列表状态列补短词的三种、`s` 汇总数的是同一批）。
 fn own_status(app: &App, form: StatusForm, t: &Theme) -> Vec<Span<'static>> {
     let (running, waiting) = app.global_counts();
-    let wait_color = if app.blink_dim {
-        t.faint
+    let run = t.state(SessionState::Running);
+    let wait = t.state(SessionState::Waiting);
+    let wait_mark = if app.blink_dim {
+        t.blink_dim(wait)
     } else {
-        t.state(SessionState::Waiting)
+        wait
     };
     let parts = [
-        (running, SPIN_MARK, "在跑", t.state(SessionState::Running)),
-        (waiting, '◆', "等你", wait_color),
+        (running, SPIN_MARK, "在跑", run, run),
+        (waiting, '◆', "待处理", wait, wait_mark),
     ];
-    chips(&parts, form)
+    chips(&parts, form, t)
 }
 
-/// 「◐3 在跑」这样一个个排开，按 `form` 缩写；数是 0 的不写。
-fn chips(parts: &[(usize, char, &str, Color)], form: StatusForm) -> Vec<Span<'static>> {
+/// 「◐3 在跑」这样一个个排开，按 `form` 缩写；数是 0 的不写。每项是（数，符号，字，计数的颜色，符号的颜色）。
+fn chips(
+    parts: &[(usize, char, &str, Color, Color)],
+    form: StatusForm,
+    t: &Theme,
+) -> Vec<Span<'static>> {
     let mut out = Vec::new();
-    for &(n, dot, word, color) in parts.iter().filter(|p| p.0 > 0) {
-        let (text, gap) = match form {
-            StatusForm::Full => (format!("{dot}{n} {word}"), "  "),
-            StatusForm::Counts => (format!("{dot}{n}"), " "),
-            StatusForm::Dots => (dot.to_string(), " "),
+    for &(n, dot, word, color, mark) in parts.iter().filter(|p| p.0 > 0) {
+        let gap = match form {
+            StatusForm::Full => "  ",
+            StatusForm::Counts | StatusForm::Dots => " ",
             StatusForm::Hidden => return Vec::new(),
         };
         if !out.is_empty() {
             out.push(sp(gap, Style::default()));
         }
-        out.push(sp(text, fg(color)));
+        out.push(sp(dot.to_string(), fg(mark)));
+        if form != StatusForm::Dots {
+            out.push(sp(n.to_string(), fg(color)));
+        }
+        if form == StatusForm::Full {
+            out.push(sp(format!(" {word}"), fg(t.muted)));
+        }
     }
     out
 }
@@ -135,15 +164,16 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
     app.areas.elsewhere = Rect::default();
     let accent = t.accent(app.vendor);
     let seal = " 会话台 ";
-    // 缩写的标签：别的家只写标记字符，当前这家写全名。
-    let tabs_of = |compact: bool| -> Vec<(Vendor, String)> {
+    // 当前这家一直写「标记 全名」，别家按 `form` 缩。
+    let tabs_of = |form: TabForm| -> Vec<(Vendor, String)> {
         app.shown
             .iter()
             .map(|&v| {
-                let label = if compact && v != app.vendor {
-                    v.mark().to_string()
-                } else {
-                    format!("{} {}", v.mark(), v.name())
+                let label = match form {
+                    _ if v == app.vendor => format!("{} {}", v.mark(), v.name()),
+                    TabForm::Full => format!("{} {}", v.mark(), v.name()),
+                    TabForm::Short => short_name(v).to_string(),
+                    TabForm::Marks => v.mark().to_string(),
                 };
                 (v, label)
             })
@@ -160,8 +190,7 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
             .sum::<usize>()
             + width(TAB_DIVIDER) * tabs.len().saturating_sub(1)
     };
-    let full_w = tabs_width(&tabs_of(false));
-    let compact_w = tabs_width(&tabs_of(true));
+    let form_w = [TabForm::Full, TabForm::Short, TabForm::Marks].map(|f| tabs_width(&tabs_of(f)));
     // 后台是旧版的提示比新版提醒要紧，两条只放一条。
     let hint = app
         .old_host
@@ -197,15 +226,23 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
         let (a, b) = (line_width(own), line_width(other));
         a + b + if a > 0 && b > 0 { 2 } else { 0 }
     };
-    let left_w = |status: &(Vec<Span>, Vec<Span>), compact: bool| {
+    let left_w = |status: &(Vec<Span>, Vec<Span>), form: TabForm| {
         let sw = status_w(status);
-        let tabs_w = if compact { compact_w } else { full_w };
+        let tabs_w = form_w[form as usize];
         1 + width(seal) + if sw > 0 { 1 + sw } else { 0 } + gap.len() + tabs_w
     };
     // 从全到简挑第一种放得下的；连最简的都放不下（很窄）就只有印章和标签。
-    let (status, right, compact) = with_tab_forms(top_layouts(hint.is_some()), app.shown.len())
+    let layouts = top_layouts(hint.is_some());
+    // 别家的名字比额度细节（来源、第二个窗口、重置倒计时）要紧，比状态的字和额度百分比次要。
+    let plain = layouts
+        .iter()
+        .position(|&(form, cut, ..)| {
+            form == StatusForm::Full && matches!(cut, Some(c) if !c.source && !c.second && !c.reset)
+        })
+        .unwrap_or(0);
+    let (status, right, tab_form) = with_tab_forms(layouts, app.shown.len(), plain)
         .into_iter()
-        .map(|((form, cut, with_hint, with_elsewhere), compact)| {
+        .map(|((form, cut, with_hint, with_elsewhere), tab_form)| {
             let mut status = status_spans(app, form, t);
             if !with_elsewhere {
                 status.1.clear();
@@ -237,14 +274,14 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
                 let lead = if right.is_empty() { "" } else { "  " };
                 right.splice(0..0, [b.clone(), sp(lead, Style::default())]);
             }
-            (status, right, compact)
+            (status, right, tab_form)
         })
-        .find(|(status, right, compact)| {
+        .find(|(status, right, tab_form)| {
             let rw = line_width(right);
-            left_w(status, *compact) + if rw > 0 { 2 + rw } else { 0 } < total
+            left_w(status, *tab_form) + if rw > 0 { 2 + rw } else { 0 } < total
         })
-        .unwrap_or_else(|| (Default::default(), Vec::new(), true));
-    let tabs = tabs_of(compact);
+        .unwrap_or_else(|| (Default::default(), Vec::new(), TabForm::Marks));
+    let tabs = tabs_of(tab_form);
 
     // 印章：反白，底色是当前这家的强调色，字是顶栏底色。整个界面唯一的大胆元素。
     let mut x = area.x + 1;

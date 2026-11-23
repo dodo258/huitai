@@ -325,6 +325,7 @@ fn help_page() {
     let text = dump(&buf);
     for k in [
         "⌥⏎",
+        "从对话回会话台（设置可改）",
         "恢复上次所有标签",
         "进回收站",
         "看改了哪些文件",
@@ -532,6 +533,35 @@ fn cli_update_mark_after_the_tab() {
     assert!(!top(&mut app, W).contains('↑'), "关了检查就不标");
 }
 
+/// 八家同屏：放不下时别家先写短名、先省额度细节（来源、第二个窗口）；状态的字和额度百分比也放不下了，别家才缩成标记。
+#[test]
+fn other_tabs_keep_short_names_before_turning_into_marks() {
+    let mut app = demo_app(Vendor::Claude);
+    let top = |app: &mut App, w| row_text(&render(app, w, H), 0);
+    let names = "✻ Claude │ Codex │ pi │ Hermes │ Kimi │ Gemini │ OpenCode │ Antigravity";
+    for w in [132, 150] {
+        let t = top(&mut app, w);
+        assert!(
+            t.contains(names) && t.contains("3 在跑") && t.contains("23%"),
+            "{w} 列：{t}"
+        );
+        if w == 132 {
+            assert!(!t.contains("7 天"), "第二个窗口先让给名字：{t}");
+        }
+    }
+    let narrow = top(&mut app, W);
+    assert!(
+        narrow.contains("✻ Claude │ ◎ │ π │ ☤ │ K") && narrow.contains("3 在跑"),
+        "{narrow}"
+    );
+    // 全名放得下就照旧写全名。
+    let wide = top(&mut app, 240);
+    assert!(
+        wide.contains("◎ Codex │ π pi │ ☤ Hermes │ K Kimi Code"),
+        "{wide}"
+    );
+}
+
 /// 后台是旧版：顶栏右侧额度前一句暗色提示，条数跟着托管的对话走；放不下额度时额度让位。
 #[test]
 fn old_daemon_hint_in_top_bar() {
@@ -690,4 +720,110 @@ fn context_use_on_rows_and_preview_head() {
         .position(|l| l.contains("结算页首屏加载慢") && l.contains("上下文 97%"))
         .expect("c-shop-3 有读数") as u16;
     assert_eq!(color_at(&buf, y, "上下文"), Theme::DARK.alert());
+}
+
+/// 状态列给要你处理的状态补短词（「✓ 待读」）；窄到补了标题就剩不到 24 格（约 12 个汉字）时退回只写符号，标题不让位。
+#[test]
+fn status_words_fall_back_to_glyphs_when_tight() {
+    let row = |w: u16| {
+        let mut app = demo_app(Vendor::Claude);
+        let text = dump(&render(&mut app, w, 20));
+        text.lines()
+            .find(|l| l.contains("把优惠券"))
+            .unwrap_or_else(|| panic!("宽 {w}：{text}"))
+            .to_owned()
+    };
+    for w in [W, 70] {
+        assert!(row(w).contains("✓ 待读"), "宽 {w}：{}", row(w));
+    }
+    for w in [56, 48] {
+        let r = row(w);
+        assert!(r.contains('✓') && !r.contains("待读"), "宽 {w}：{r}");
+    }
+}
+
+#[test]
+fn list_weights_nest_and_narrow_fallback() {
+    use huitai::core::Account;
+    use huitai::quota::ContextUse;
+    use ratatui::style::Modifier;
+
+    let col_of = |line: &str, s: &str| {
+        line[..line.find(s).unwrap_or_else(|| panic!("没有 {s}：{line}"))]
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum::<u16>()
+    };
+    // 列表里的那一处（预览区也会写标题，在右半边）。
+    let find = |buf: &ratatui::buffer::Buffer, s: &str| {
+        let text = dump(buf);
+        let (y, line) = text
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(s) && col_of(l, s) < 40)
+            .unwrap_or_else(|| panic!("列表里没有 {s}：{text}"));
+        (col_of(line, s), y as u16, line.to_owned())
+    };
+
+    // 宽屏：只有项目名和选中的对话粗体，普通对话标题色常规字重；对话比组名多缩两格，动态跟着标题。
+    let mut app = demo_app(Vendor::Claude);
+    with_moments(&mut app);
+    select_id(&mut app, "c-shop-1");
+    let buf = render(&mut app, W, H);
+    let t = Theme::DARK;
+    let (x, y, _) = find(&buf, "购物车结算按钮点了没反应");
+    assert_eq!(x, 6, "宽屏对话标题从第 6 格起");
+    assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "选中的加粗");
+    let (dx, _, line) = find(&buf, "Bash · npm run e2e");
+    assert_eq!(dx, 6, "动态和标题对齐：{line}");
+    let (x, y, _) = find(&buf, "结算页首屏加载慢");
+    assert_eq!(x, 6);
+    assert!(
+        !buf[(x, y)].modifier.contains(Modifier::BOLD),
+        "普通对话不加粗"
+    );
+    assert_eq!(buf[(x, y)].fg, t.title, "普通对话用标题色");
+    let (x, y, _) = find(&buf, "shop");
+    assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "项目名加粗");
+
+    // 窄屏：先收缩进，再收普通上下文和账号；快满的上下文留着；标题至少 12 格。
+    let home = std::path::Path::new(HOME);
+    let main = Account::new(Vendor::Claude, "默认", home.join(".claude"), home);
+    let work = Account::new(Vendor::Claude, "工作号", home.join(".claude-work"), home);
+    let mut app = demo_app(Vendor::Claude);
+    app.set_accounts(vec![main, work]);
+    let ctx = |percent| ContextUse { percent, at: now() };
+    app.contexts.insert(SessionId::from("c-shop-1"), ctx(40.0));
+    app.contexts.insert(SessionId::from("c-shop-2"), ctx(85.0));
+
+    let buf = render(&mut app, 72, 12);
+    let (x, _, line) = find(&buf, "购物车结算按钮");
+    assert_eq!(x, 6, "放得下时还缩：{line}");
+    assert!(line.contains("默认  上下文 40%"), "{line}");
+
+    let buf = render(&mut app, 66, 12);
+    let (x, _, line) = find(&buf, "购物车结算");
+    assert_eq!(x, 4, "先收缩进：{line}");
+    assert!(line.contains("默认  上下文 40%"), "后缀还在：{line}");
+
+    let buf = render(&mut app, 60, 12);
+    let (_, _, line) = find(&buf, "购物车结算");
+    assert!(!line.contains("上下文"), "再收普通上下文：{line}");
+    assert!(line.contains("默认"), "账号后收：{line}");
+    let (_, _, line) = find(&buf, "把优惠券");
+    assert!(line.contains("上下文 85%"), "快满的留着：{line}");
+
+    for w in [56, 48, 40] {
+        let buf = render(&mut app, w, 12);
+        for title in ["购物车结算", "把优惠券接", "结算页首屏"] {
+            let (x, _, line) = find(&buf, title);
+            let title_w = line[line.find(title).unwrap()..]
+                .split("  ")
+                .next()
+                .map_or(0, unicode_width::UnicodeWidthStr::width);
+            assert_eq!(x, 4, "{w} 列：{line}");
+            // 12 格里放不下半个汉字时空一格。
+            assert!(title_w >= 11, "{w} 列标题至少留 12 格：{line}");
+        }
+    }
 }

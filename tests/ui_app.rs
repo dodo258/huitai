@@ -4,7 +4,7 @@ mod ui_support;
 
 use std::time::{Duration, Instant};
 
-use huitai::core::{SessionId, Vendor};
+use huitai::core::{BackKey, SessionId, SessionState, Vendor};
 use huitai::index::Edit;
 use huitai::ui::app::{Effect, Overlay, Prompt};
 use ratatui::crossterm::event::{
@@ -424,13 +424,13 @@ fn settings_toggle_update_check() {
     }
 }
 
-/// 设置最后一项「自动升级」（各家 CLI）：默认开，←→ 切换，Esc 存进配置；关了检查新版本时写明要先开它。
+/// 设置「自动升级」（各家 CLI，倒数第二项）：默认开，←→ 切换，Esc 存进配置；关了检查新版本时写明要先开它。
 #[test]
 fn settings_toggle_auto_upgrade() {
     let mut app = demo_app(Vendor::Claude);
     assert!(app.config.auto_upgrade_clis, "默认开");
     press(&mut app, ',');
-    for _ in 0..10 {
+    for _ in 0..8 {
         app.key(key(KeyCode::Down));
     }
     assert!(
@@ -447,6 +447,52 @@ fn settings_toggle_auto_upgrade() {
         [Effect::SaveConfig(cfg)] => assert!(cfg.auto_upgrade_clis),
         other => panic!("{other:?}"),
     }
+}
+
+/// 设置最后一项「回会话台」：默认 ⌃\，→ 依次换成 ⌃Q、⌃]、关，再转回 ⌃\；Esc 存进配置。
+/// 当前窗口接上前底栏的提示跟着换，关了就没有提示。
+#[test]
+fn settings_switch_back_key() {
+    let mut app = demo_app(Vendor::Claude);
+    assert_eq!(app.config.back_key, BackKey::CtrlBackslash, "默认 ⌃\\");
+    assert_eq!(app.back_key_hint().as_deref(), Some("⌃\\ 回到会话台"));
+    press(&mut app, ',');
+    for _ in 0..20 {
+        app.key(key(KeyCode::Down));
+    }
+    assert!(
+        dump(&render(&mut app, 120, 30))
+            .contains("回会话台    ‹ ⌃\\ · 对话里按它回来，对话在后台继续 ›")
+    );
+    for (want, hint) in [
+        (BackKey::CtrlQ, Some("⌃Q 回到会话台")),
+        (BackKey::CtrlBracket, Some("⌃] 回到会话台")),
+        (BackKey::Off, None),
+        (BackKey::CtrlBackslash, Some("⌃\\ 回到会话台")),
+    ] {
+        app.key(key(KeyCode::Right));
+        assert_eq!(app.config.back_key, want);
+        assert_eq!(app.back_key_hint().as_deref(), hint);
+    }
+    app.key(key(KeyCode::Left));
+    assert_eq!(app.config.back_key, BackKey::Off, "← 反着转");
+    assert!(dump(&render(&mut app, 120, 30)).contains("关 · 对话结束才回到会话台"));
+    match app.key(key(KeyCode::Esc)).as_slice() {
+        [Effect::SaveConfig(cfg)] => assert_eq!(cfg.back_key, BackKey::Off),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 当前窗口接上对话前，底栏写「⌃\\ 回到会话台」。
+#[test]
+fn bottom_bar_shows_back_key_hint() {
+    let mut app = demo_app(Vendor::Claude);
+    app.status = app.back_key_hint();
+    let text = dump(&render(&mut app, 120, 30));
+    assert!(
+        text.lines().last().unwrap().contains("⌃\\ 回到会话台"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -641,4 +687,50 @@ fn conversation_without_a_local_workdir_is_view_only() {
         app.key(key(KeyCode::Enter)).as_slice(),
         [Effect::Open { .. }]
     ));
+}
+
+/// 答完不发提醒的 CLI 闲置收回：交给收回线程看记录的是托管着、没有标签页连着的，给守护进程里的 id；
+/// 设置里关了就一条也没有。
+#[test]
+fn reclaim_targets_are_hosted_and_detached() {
+    let mut app = demo_app(Vendor::Pi);
+    let ids = |app: &huitai::ui::App| {
+        let mut v: Vec<(String, String)> = app
+            .reclaim_targets()
+            .into_iter()
+            .map(|(h, e)| (h.as_str().to_owned(), e.session.id.as_str().to_owned()))
+            .collect();
+        v.sort();
+        v
+    };
+    let all = ids(&app);
+    assert!(all.iter().any(|(_, e)| e == "p-blog-1"), "{all:?}");
+    assert!(all.iter().any(|(_, e)| e == "c-shop-2"));
+    assert!(
+        !all.iter().any(|(_, e)| e == "c-shop-1"),
+        "演示数据里它开着标签页"
+    );
+    assert!(!all.iter().any(|(_, e)| e == "c-shop-3"), "已停的不看");
+
+    app.attached.insert(SessionId::from("p-blog-1"));
+    assert!(
+        !ids(&app).iter().any(|(_, e)| e == "p-blog-1"),
+        "有标签页连着不看"
+    );
+
+    // 认领到临时 id 下的：给守护进程的是临时 id。
+    let (real, temp) = (
+        SessionId::from("x-api-2"),
+        SessionId::from("new-codex-1000000000"),
+    );
+    app.states.insert(temp.clone(), SessionState::Waiting);
+    app.set_aliases(std::collections::HashMap::from([(real, temp)]));
+    assert!(
+        ids(&app).contains(&("new-codex-1000000000".to_owned(), "x-api-2".to_owned())),
+        "{:?}",
+        ids(&app)
+    );
+
+    app.config.idle_reclaim_minutes = 0;
+    assert!(app.reclaim_targets().is_empty());
 }

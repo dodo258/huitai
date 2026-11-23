@@ -377,7 +377,8 @@ fn every_column_header_has_content_under_it() {
         // 对话行的状态灯在状态列里、不在标题前面。
         let row = lines
             .iter()
-            .find(|l| l.contains("▎   购物车"))
+            // 选中的那条对话（宽屏比组名多缩两格，窄屏不缩）。
+            .find(|l| l.starts_with('▎') && l.contains("购物车"))
             .unwrap_or_else(|| panic!("宽 {width}\n{text}"));
         let status_end = w(&head[..head.find("状态").unwrap() + "状态".len()]);
         let light = row.find('◐').unwrap();

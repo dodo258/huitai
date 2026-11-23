@@ -1,5 +1,5 @@
 //! 守护进程：PTY 托管、原样转发、终端状态机重连恢复、标题改写、通知序列识别、防休眠、闲置收回、socket 协议。
-//! 对外接口：`Hello/Retire/Spawn/Attach/Detach/Kill/List/Events/Board/Seen/Snapshot/Interrupted/Dismiss`（见 [`protocol`]），客户端函数在 [`client`]。只依赖 `core`。
+//! 对外接口：`Hello/Retire/Spawn/Attach/Detach/Kill/Reclaim/List/Events/Board/Seen/Snapshot/Interrupted/Dismiss`（见 [`protocol`]），客户端函数在 [`client`]。只依赖 `core`。
 
 pub mod client;
 pub mod daemon;

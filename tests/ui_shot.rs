@@ -1615,6 +1615,12 @@ fn real_terminal_screenshots() {
     run.wait_for("跳过 pi 默认");
     run.save(&out, "17-balance");
     run.press(b"\x1b");
+    // s：这时没有托管的对话，汇总是空的，底栏只给 Esc 返回。
+    run.send(b"s");
+    run.wait_for("没有待处理或在跑的对话");
+    run.wait_for("待处理 0 · 在跑 0");
+    run.save(&out, "16a-board-empty");
+    run.press(b"\x1b");
     run.quit();
 
     // 桌面端开着「订单服务超时排查」：起一个命令行里带着 `--resume <id>` 的进程，会话台从进程表认出来，
@@ -1691,7 +1697,7 @@ fn real_terminal_screenshots() {
     run.wait_for("Running…");
     run.wait_for("5 在跑");
     fs::write(&go, "").unwrap();
-    run.wait_for("◆2 等你");
+    run.wait_for("◆2 待处理");
     // 等「刚停下」那一下整行高亮淡完再截，不然看着像选中了两行。
     thread::sleep(huitai::ui::app::FLASH + Duration::from_millis(300));
     run.save(&out, "7-live");
@@ -1719,12 +1725,12 @@ fn real_terminal_screenshots() {
     run.save(&out, "11f-seal-antigravity");
     // !：跳到等你回复的那条，跨家换回 Claude。
     run.send(b"!");
-    run.wait_for("· ◆ 等你回复");
+    run.wait_for("等你回复 · ");
     run.save(&out, "12-jump-waiting");
     // s：三家等你回复和在跑的列在一起，按 要输入 > 失败 > 做完待看 > 在跑 排；在跑和刚停的两行一条。
     run.send(b"s");
-    run.wait_for("等你回复和在跑的 · 各家");
-    run.wait_for("等你 2 · 在跑 3");
+    run.wait_for("待处理和在跑的 · 各家");
+    run.wait_for("待处理 2 · 在跑 3");
     run.wait_for("失败 · 被打断");
     run.wait_for("优惠券接口换成 v2 了");
     run.wait_for("shell · cargo test -p orders");
@@ -1740,6 +1746,23 @@ fn real_terminal_screenshots() {
     run.wait_for("计划 2/5");
     run.wait_for("在跑 · ");
     run.save(&out, "17-plan");
+    run.send(b"\x1b");
+    run.quit();
+    // 同一条在 18 行的矮窗口里：计划收成一行「计划 2/5 · ▸ 当前步骤」，下面多留几行给消息。
+    let run = Run::start_sized(&home, false, COLS, 18);
+    run.wait_for("此刻的画面");
+    run.send(b"s");
+    run.wait_for("待处理和在跑的 · 各家");
+    let row = run
+        .text()
+        .lines()
+        .position(|l| l.contains("给订单列表接口补单元测试"))
+        .expect("汇总里有在跑的 Codex")
+        + 1;
+    run.send(format!("\x1b[<0;12;{row}M\x1b[<0;12;{row}m").as_bytes());
+    run.wait_for("计划 2/5 · ▸");
+    run.wait_for("在跑 · ");
+    run.save(&out, "17b-plan-short");
     run.send(b"\x1b");
     run.quit();
     drop(daemon);
@@ -2011,7 +2034,7 @@ fn hero_shot(daemon: &LiveHost, home: &Path, out: &Path, light: bool, name: &str
     // 两条一起响铃停下（没人看着，算刚做完），再像在标签页里看过一眼那样连上又断开 blog 那条：它变成等你回复。
     fs::write(go, "").unwrap();
     run.wait_for("3 在跑");
-    run.wait_for("◆2 等你");
+    run.wait_for("◆2 待处理");
     daemon.peek(home, uuid(0x600));
     let deadline = Instant::now() + Duration::from_secs(5);
     while !(run.text().contains('✓') && run.text().matches('◆').count() >= 2) {

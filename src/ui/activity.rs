@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::core::SessionState;
@@ -29,15 +29,16 @@ pub(super) fn doing_row(
     app: &App,
     e: &Entry,
     doing: &Doing,
+    nest: u16,
     selected: bool,
     t: &Theme,
     accent: Color,
 ) {
     row_bg(buf, area, selected, app.flash(&e.session.id), t, accent);
-    // 动态从标题那一列（第 4 格）起。
+    // 动态从标题那一列（第 4 格起，分组列表里和标题一起再缩 `nest` 格）。
     let r = Rect {
-        x: area.x + 4,
-        width: area.width.saturating_sub(5),
+        x: area.x + 4 + nest,
+        width: area.width.saturating_sub(5 + nest),
         ..area
     };
     let spans = match doing {
@@ -114,11 +115,12 @@ pub(super) fn head_status(app: &App, e: &Entry, t: &Theme) -> Option<(String, Co
 }
 
 /// 预览里消息上面的计划块：标题「计划 2/5」，最多 [`PLAN_STEPS`] 步，从正在做的前一步起。
-/// 做完的 `✔` 压暗加删除线，正在做的 `□` 强调色加粗，没做的 `□` 压暗。没有计划返回空。
+/// 三态脱色也认得出：做完的 `✓` 压暗加删除线，正在做的 `▸` 强调色加粗，没做的 `□` 压暗。没有计划返回空。
 pub(super) fn plan_lines(m: &Moment, w: usize, t: &Theme, accent: Color) -> Vec<Line<'static>> {
-    let Some((done, total)) = m.plan_progress() else {
+    let Some(progress) = m.plan_progress() else {
         return Vec::new();
     };
+    let total = progress.1;
     let current = m
         .plan
         .iter()
@@ -127,27 +129,54 @@ pub(super) fn plan_lines(m: &Moment, w: usize, t: &Theme, accent: Color) -> Vec<
     let start = current
         .saturating_sub(1)
         .min(total.saturating_sub(PLAN_STEPS));
-    let mut out = vec![Line::from(vec![
-        sp("计划 ", bold(t.muted)),
-        sp(format!("{done}/{total}"), bold(t.text)),
-    ])];
+    let mut out = vec![Line::from(plan_title(progress, t))];
     for s in m.plan.iter().skip(start).take(PLAN_STEPS) {
-        let (mark, style) = match s.status {
-            StepStatus::Done => ("✔", fg(t.faint).add_modifier(Modifier::CROSSED_OUT)),
-            StepStatus::Doing => ("□", bold(accent)),
-            StepStatus::Todo => ("□", fg(t.faint)),
-        };
-        let mark_style = if s.status == StepStatus::Done {
-            fg(t.faint)
-        } else {
-            style
-        };
+        let (mark, mark_style, style) = step_style(s.status, t, accent);
         out.push(Line::from(vec![
             sp(format!("{mark} "), mark_style),
             sp(truncate(&s.step, w.saturating_sub(2)), style),
         ]));
     }
     out
+}
+
+/// 矮窗口里收成一行的计划：「计划 2/5 · ▸ 当前步骤」。当前步骤是正在做的那步，没有就是下一步没做的；
+/// 全做完了只写「计划 5/5」。没有计划为 `None`。
+pub(super) fn plan_line(m: &Moment, w: usize, t: &Theme, accent: Color) -> Option<Line<'static>> {
+    let progress = m.plan_progress()?;
+    let mut spans = plan_title(progress, t);
+    let step = m
+        .plan
+        .iter()
+        .find(|s| s.status == StepStatus::Doing)
+        .or_else(|| m.plan.iter().find(|s| s.status != StepStatus::Done));
+    if let Some(s) = step {
+        let (mark, mark_style, style) = step_style(s.status, t, accent);
+        spans.push(sp(" · ", fg(t.faint)));
+        spans.push(sp(format!("{mark} "), mark_style));
+        spans.push(sp(s.step.clone(), style));
+    }
+    Some(Line::from(clip(spans, w)))
+}
+
+fn plan_title((done, total): (usize, usize), t: &Theme) -> Vec<Span<'static>> {
+    vec![
+        sp("计划 ", bold(t.muted)),
+        sp(format!("{done}/{total}"), bold(t.text)),
+    ]
+}
+
+/// 一步的符号、符号样式、文字样式。
+fn step_style(status: StepStatus, t: &Theme, accent: Color) -> (&'static str, Style, Style) {
+    match status {
+        StepStatus::Done => (
+            "✓",
+            fg(t.faint),
+            fg(t.faint).add_modifier(Modifier::CROSSED_OUT),
+        ),
+        StepStatus::Doing => ("▸", bold(accent), bold(accent)),
+        StepStatus::Todo => ("□", fg(t.faint), fg(t.faint)),
+    }
 }
 
 /// 失败原因的说法：Codex 用户按 Esc 打断是 `interrupted`；空串不写。

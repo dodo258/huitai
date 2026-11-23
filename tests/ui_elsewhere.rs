@@ -108,7 +108,9 @@ fn file_written_within_two_minutes_is_elsewhere_with_fake_clock() {
     scan_writes(&mut app);
     assert!(app.elsewhere(&e));
     let text = screen(&mut app);
-    assert!(text.contains("◐ 别处在跑"), "文件还在写：柔绿转圈\n{text}");
+    // 文件还在写：预览标题行写「别处在跑」，元信息行不再重复状态灯。
+    assert!(text.lines().nth(1).unwrap().ends_with("别处在跑"), "{text}");
+    assert!(!text.contains("◐ 别处在跑"), "{text}");
     assert!(!text.contains("已停"), "{text}");
 
     // 假时钟往前走 2 分钟：文件已经 2 分 30 秒没写了，回到已停。
@@ -292,7 +294,7 @@ fn top_bar_counts_conversations_open_elsewhere() {
     assert!(top.contains("●1 别处"), "{top}");
     // 在「在跑 / 等你」后面，各点各的。
     assert!(
-        top.find("等你").unwrap() < top.find("别处").unwrap(),
+        top.find("待处理").unwrap() < top.find("别处").unwrap(),
         "{top}"
     );
     render(&mut app, 120, 30);
@@ -348,7 +350,7 @@ fn narrow_top_bar_drops_elsewhere_before_waiting() {
         let top = |s: &str| s.lines().next().unwrap_or_default().to_owned();
         if top(&before).contains('◆') {
             assert!(top(&after).contains('◆'), "宽 {w}：{}", top(&after));
-            assert!(!both.areas.status.is_empty(), "宽 {w}：「等你」要点得到");
+            assert!(!both.areas.status.is_empty(), "宽 {w}：「待处理」要点得到");
         }
     }
 }

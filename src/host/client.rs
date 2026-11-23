@@ -22,7 +22,7 @@ use super::protocol::{
 };
 use super::pty;
 use super::version;
-use crate::core::SessionId;
+use crate::core::{BackKey, Config, SessionId};
 
 /// 普通请求等应答的上限。
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -423,8 +423,13 @@ impl EventStream {
     }
 }
 
-/// `ai attach <id>`：把当前终端和守护进程里的 PTY 接起来，直到 CLI 退出或被别处接走。返回进程退出码。
+/// `ai attach <id>`：把当前终端和守护进程里的 PTY 接起来，直到 CLI 退出、被别处接走或按回到会话台的键脱开
+/// （CLI 留在后台；默认 ⌃\，设置里可改，见 [`BackKey`]）。返回进程退出码（脱开是 0）。
 pub fn attach_terminal(dir: &Path, id: &SessionId, launch: Command) -> io::Result<i32> {
+    // 设置读不出来（坏了）也照样接上，用默认键。
+    let back_key = Config::load(&dir.join("config.json"))
+        .map(|c| c.back_key)
+        .unwrap_or_default();
     ensure_daemon(dir, launch)?;
     let stdout = io::stdout();
     let (cols, rows) = pty::size_of(&stdout).unwrap_or((80, 24));
@@ -437,15 +442,20 @@ pub fn attach_terminal(dir: &Path, id: &SessionId, launch: Command) -> io::Resul
     let cli_focus = Arc::new(AtomicBool::new(false));
     let writer = att.writer();
     let input_focus = Arc::clone(&cli_focus);
+    let (dir, id) = (dir.to_path_buf(), id.clone());
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0u8; 8192];
+        let mut key = DetachKey::new(back_key);
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) => return,
                 Ok(n) => {
-                    let (bytes, focus) =
-                        split_focus(&buf[..n], input_focus.load(Ordering::Acquire));
+                    let hit = key.find(&buf[..n]);
+                    let (bytes, focus) = split_focus(
+                        &buf[..hit.unwrap_or(n)],
+                        input_focus.load(Ordering::Acquire),
+                    );
                     if !bytes.is_empty() && writer.input(&bytes).is_err() {
                         return;
                     }
@@ -453,6 +463,10 @@ pub fn attach_terminal(dir: &Path, id: &SessionId, launch: Command) -> io::Resul
                         if writer.focus(front).is_err() {
                             return;
                         }
+                    }
+                    if hit.is_some() {
+                        detach_self(&dir, &id, &writer);
+                        return;
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -484,6 +498,115 @@ pub fn attach_terminal(dir: &Path, id: &SessionId, launch: Command) -> io::Resul
         Some(EndReason::Detached) => Ok(0),
         None => Err(io::Error::other("和守护进程的连接断了")),
     }
+}
+
+/// 括号粘贴的开头和结尾。
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// 在终端输入里认回到会话台的键（脱离键，默认 ⌃\）。这是 attach 客户端自己的键：认到的那个按键不转给 CLI。
+/// 括号粘贴里的不算；一次粘贴可能分好几次读到，粘贴到哪了记在这里。
+#[derive(Debug)]
+struct DetachKey {
+    key: BackKey,
+    pasting: bool,
+}
+
+impl DetachKey {
+    fn new(key: BackKey) -> Self {
+        Self {
+            key,
+            pasting: false,
+        }
+    }
+
+    /// 返回脱离键在 `input` 里的位置：前面的字节照常转给 CLI，它和它后面的都不转（就要脱开了）。没有返回 `None`。
+    /// 认三种编码（以默认的 ⌃\ 为例）：单独一个字节 0x1c；CLI 开了 kitty 键盘协议时的 `CSI 92;5u`（可带事件类型和
+    /// 大写/数字锁定，只认按下）；xterm modifyOtherKeys 的 `CSI 27;5;92~`。只认同一次读里完整的序列，
+    /// 和 [`split_focus`] 一样。设置里关掉了就什么都不认。
+    fn find(&mut self, input: &[u8]) -> Option<usize> {
+        let (byte, code) = self.key.byte().zip(self.key.code())?;
+        let mut i = 0;
+        while i < input.len() {
+            let rest = &input[i..];
+            if self.pasting {
+                if rest.starts_with(PASTE_END) {
+                    self.pasting = false;
+                    i += PASTE_END.len();
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if rest.starts_with(PASTE_START) {
+                self.pasting = true;
+                i += PASTE_START.len();
+                continue;
+            }
+            if rest[0] == byte || encoded_ctrl(rest, code) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+/// `rest` 开头是不是 kitty 键盘协议或 modifyOtherKeys 编码的「按下 Ctrl + 键码 `code`」。
+fn encoded_ctrl(rest: &[u8], code: u32) -> bool {
+    let Some(body) = rest.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    let Some(end) = body.iter().take(32).position(|b| (0x40..=0x7e).contains(b)) else {
+        return false;
+    };
+    let num = |f: &[u8]| -> Option<u32> { std::str::from_utf8(f).ok()?.parse().ok() };
+    // 修饰键字段是「1 + 位掩码[:事件]」：只按了 Ctrl（4），大写锁定 64、数字锁定 128 不管；事件没写或 1 是按下。
+    let ctrl_press = |field: &[u8]| {
+        let mut parts = field.split(|&b| b == b':');
+        let mods = parts.next().and_then(num);
+        let event = parts.next().map(num);
+        matches!(mods, Some(m) if m >= 1 && (m - 1) & !(64 | 128) == 4)
+            && matches!(event, None | Some(Some(1)))
+    };
+    let fields: Vec<&[u8]> = body[..end].split(|&b| b == b';').collect();
+    match (body[end], fields.as_slice()) {
+        // 键码后面可能带「:另一种写法」。
+        (b'u', [key, mods, ..]) => {
+            key.split(|&b| b == b':').next().and_then(num) == Some(code) && ctrl_press(mods)
+        }
+        (b'~', [lead, mods, key]) => {
+            num(lead) == Some(27) && num(key) == Some(code) && ctrl_press(mods)
+        }
+        _ => false,
+    }
+}
+
+/// 按了脱离键：请守护进程脱开这条 attach，CLI 留在后台接着跑。Detach 走另一条连接，所以先确认这条连接上
+/// 已经发出去的输入守护进程都收下了：发一个「被切走」的焦点帧当记号（脱开后这个标签页本来也不再看着它），
+/// 等它作为事件广播回来，最多等 [`REPLY_TIMEOUT`]，免得紧挨着脱离键打的字被丢掉。
+/// 脱开后守护进程发来结束原因 `Detached`，转发那边照常撤掉 CLI 开着的终端模式。
+fn detach_self(dir: &Path, id: &SessionId, writer: &AttachWriter) {
+    let mut events = subscribe(dir).ok();
+    if writer.focus(false).is_err() {
+        // 连接已经断了，转发那边会收尾。
+        return;
+    }
+    if let Some(events) = events.as_mut() {
+        let deadline = Instant::now() + REPLY_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match events.next(Some(left)) {
+                Ok(Some(HostEvent::Focus { id: got, front })) if got == *id && !front => break,
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+    }
+    let _ = request(dir, &Request::Detach { id: id.clone() });
 }
 
 /// 终端焦点上报：开、关，以及开着时终端发来的「到了前台」「被切走」。
@@ -982,6 +1105,119 @@ mod tests {
             assert_eq!(&*bytes, input);
             assert!(focus.is_empty());
         }
+    }
+
+    fn detach_with(key: BackKey, chunks: &[&[u8]]) -> Vec<Option<usize>> {
+        let mut key = DetachKey::new(key);
+        chunks.iter().map(|c| key.find(c)).collect()
+    }
+
+    /// 默认键 ⌃\。
+    fn detach_at(chunks: &[&[u8]]) -> Vec<Option<usize>> {
+        detach_with(BackKey::default(), chunks)
+    }
+
+    #[test]
+    fn detach_key_alone() {
+        assert_eq!(BackKey::default(), BackKey::CtrlBackslash);
+        assert_eq!(detach_at(&[b"\x1c"]), [Some(0)]);
+    }
+
+    #[test]
+    fn detach_key_in_the_middle_of_typing_keeps_what_came_before() {
+        assert_eq!(detach_at(&[b"ab\x1ccd"]), [Some(2)]);
+        assert_eq!(detach_at(&[b"plain \x1b[A\x03\x1b[13;2u"]), [None]);
+    }
+
+    #[test]
+    fn detach_key_inside_bracketed_paste_is_pasted() {
+        // 粘贴分三次读到，中间那块里的 0x1c 和 kitty 编码都是粘贴内容；粘完再按才算。
+        assert_eq!(
+            detach_at(&[b"x\x1b[200~p\x1c", b"q\x1b[92;5u", b"r\x1b[201~y\x1c"]),
+            [None, None, Some(8)]
+        );
+        assert_eq!(detach_at(&[b"\x1b[200~\x1c\x1b[201~"]), [None]);
+    }
+
+    #[test]
+    fn detach_key_in_kitty_and_modify_other_keys_encodings() {
+        for hit in [
+            &b"\x1b[92;5u"[..],
+            b"\x1b[92;5:1u",
+            b"\x1b[92;69u",
+            b"\x1b[92:124;5u",
+            b"\x1b[27;5;92~",
+        ] {
+            let mut input = b"a".to_vec();
+            input.extend_from_slice(hit);
+            assert_eq!(detach_at(&[&input]), [Some(1)], "{hit:?}");
+        }
+        // 松开、重复、带别的修饰键、别的键（包括旧的 ⌃] 和 ⌃Q）都不算。
+        for miss in [
+            &b"\x1b[92;5:3u"[..],
+            b"\x1b[92;5:2u",
+            b"\x1b[92;7u",
+            b"\x1b[92u",
+            b"\x1b[93;5u",
+            b"\x1b[113;5u",
+            b"\x1b[27;5;93~",
+            b"\x1b[92;5",
+            b"\x1d",
+            b"\x11",
+        ] {
+            assert_eq!(detach_at(&[miss]), [None], "{miss:?}");
+        }
+    }
+
+    /// 设置里换成 ⌃Q：认 0x11 和它的两种编码（kitty 里大写锁定、带 Shift 写法也算），别的键照转给 CLI。
+    #[test]
+    fn detach_key_set_to_ctrl_q() {
+        let key = BackKey::CtrlQ;
+        for hit in [
+            &b"a\x11"[..],
+            b"a\x1b[113;5u",
+            b"a\x1b[113:81;69u",
+            b"a\x1b[27;5;113~",
+        ] {
+            assert_eq!(detach_with(key, &[hit]), [Some(1)], "{hit:?}");
+        }
+        for miss in [
+            &b"a\x1c"[..],
+            b"a\x1d",
+            b"a\x1b[92;5u",
+            b"\x1b[200~\x11\x1b[201~",
+        ] {
+            assert_eq!(detach_with(key, &[miss]), [None], "{miss:?}");
+        }
+    }
+
+    /// 设置里换成 ⌃]：认 0x1d 和它的两种编码，别的键照转给 CLI。
+    #[test]
+    fn detach_key_set_to_ctrl_bracket() {
+        let key = BackKey::CtrlBracket;
+        for hit in [&b"a\x1d"[..], b"a\x1b[93;5u", b"a\x1b[27;5;93~"] {
+            assert_eq!(detach_with(key, &[hit]), [Some(1)], "{hit:?}");
+        }
+        for miss in [
+            &b"a\x11"[..],
+            b"a\x1c",
+            b"a\x1b[113;5u",
+            b"\x1b[200~\x1d\x1b[201~",
+        ] {
+            assert_eq!(detach_with(key, &[miss]), [None], "{miss:?}");
+        }
+    }
+
+    /// 设置里关掉：哪个键都不认，全转给 CLI。
+    #[test]
+    fn detach_key_off_lets_everything_through() {
+        assert_eq!(
+            detach_with(
+                BackKey::Off,
+                &[b"\x1c\x11\x1d\x1b[92;5u\x1b[113;5u\x1b[93;5u"]
+            ),
+            [None]
+        );
     }
 
     fn count(hay: &str, needle: &str) -> usize {

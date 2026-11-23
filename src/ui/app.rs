@@ -11,7 +11,9 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use crate::core::{Account, Config, QuotaReading, Session, SessionId, SessionState, Vendor};
+use crate::core::{
+    Account, BackKey, Config, QuotaReading, Session, SessionId, SessionState, Vendor,
+};
 use crate::host::ScreenSnapshot;
 use crate::index::{Edit, Entry, Hit, ProjectEdit, ProjectNote, Snippet};
 use crate::quota::{Balance, BalanceReport, BalanceRow, ContextUse};
@@ -34,6 +36,7 @@ mod input;
 mod menu;
 mod mouse;
 mod nav;
+mod reclaim;
 mod search;
 mod settings;
 
@@ -43,8 +46,9 @@ pub use cli_upgrade::{CliReport, CliResult, CliUpgrade};
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// 滚轮一格移动几行。
 const WHEEL_STEP: usize = 3;
-/// 设置页里可以改的项数（首选终端、回收站天数、开机自动打开、闲置收回、等你闪烁、自动切英文、备份对话、检查新版本、自动升级各家 CLI）。
-const SETTINGS_ITEMS: usize = 9;
+/// 设置页里可以改的项数（首选终端、回收站天数、开机自动打开、闲置收回、等你闪烁、自动切英文、备份对话、检查新版本、自动升级各家 CLI、
+/// 回到会话台的键）。
+const SETTINGS_ITEMS: usize = 10;
 /// 首选终端可选值：跟随当前终端、Ghostty、Kaku。
 pub const TERMINAL_CHOICES: [Option<&str>; 3] = [None, Some("ghostty"), Some("kaku")];
 /// 不归会话台托管的对话，会话文件在这之内写过就算它在别处在用（桌面端、别的终端、后台任务里跑着）：
@@ -53,7 +57,7 @@ pub const TERMINAL_CHOICES: [Option<&str>; 3] = [None, Some("ghostty"), Some("ka
 pub const CONTEXT_STALE: Duration = Duration::from_secs(10 * 60);
 /// 会话台看不到那边的进程，只能看文件。
 pub const ELSEWHERE_ACTIVE: Duration = Duration::from_secs(120);
-/// 顶栏「◆N 等你」慢闪的半拍：亮 0.8 秒、暗 0.8 秒，1.6 秒一次。只在有没看过的新结果（✓ 刚做完）时闪。
+/// 顶栏「◆N 待处理」慢闪的半拍：亮 0.8 秒、暗 0.8 秒，1.6 秒一次。只在有没看过的新结果（✓ 刚做完）时闪。
 pub const BLINK_HALF: Duration = Duration::from_millis(800);
 /// 在会话台里选中一条「刚做完」的对话、看它的预览满这么久，就算看过了（方向键路过不算）。
 pub const SEEN_AFTER: Duration = Duration::from_secs(2);
@@ -233,7 +237,7 @@ pub enum SnippetState {
     Missing,
 }
 
-/// `s` 打开的「等你回复」汇总：三家自己的对话（不算自动运行的）里等你回复的排前、在跑的排后，
+/// `s` 打开的「待处理」汇总：三家自己的对话（不算自动运行的）里等你回复的排前、在跑的排后，
 /// 各自最近聊过的在前（[`App::board_entries`]）。列表每次现算，状态一变就跟着变；选中的那条按 id 跟着走。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Board {
@@ -358,7 +362,7 @@ pub struct Areas {
     pub spin: Vec<Position>,
     /// 底栏左侧「后台 M 在跑」，单击切换显示后台对话。
     pub background: Rect,
-    /// 顶栏印章后的全局状态「◐N 在跑 ◆N 等你」，单击等同 `!`。
+    /// 顶栏印章后的全局状态「◐N 在跑 ◆N 待处理」，单击等同 `!`。
     pub status: Rect,
     /// 顶栏「●N 别处」（桌面端、别的终端里开着的），单击跳到下一条。
     pub elsewhere: Rect,
@@ -414,7 +418,7 @@ pub struct App {
     pub search: Option<Search>,
     /// 开着的整段对话（只读滚动视图），盖住列表和预览。
     pub reader: Option<Reader>,
-    /// 「等你回复」汇总开着（和搜索互斥）。
+    /// 「待处理」汇总开着（和搜索互斥）。
     pub board: Option<Board>,
     pub prompt: Option<Prompt>,
     pub overlay: Overlay,
@@ -446,7 +450,7 @@ pub struct App {
     pub cli_ready: Vec<Vendor>,
     /// 「更新」按钮的状态。
     pub cli_upgrade: CliUpgrade,
-    /// 顶栏「◆N 等你」和「刚做完」那几行慢闪的暗半拍（运行层按时间翻转；没有没看过的、或设置里关了闪烁就一直是假）。
+    /// 顶栏「◆N 待处理」和「刚做完」那几行慢闪的暗半拍（运行层按时间翻转；没有没看过的、或设置里关了闪烁就一直是假）。
     pub blink_dim: bool,
     /// 转圈走到第几帧（有东西在跑时运行层按时间推进，没有就停在 0）。
     pub spin: usize,
@@ -1044,7 +1048,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// 三家合计、只算自己的（不是自动运行的）对话：(在跑, 等你回复) 各几条。「刚做完」也算等你回复（还没看过）。
+    /// 三家合计、只算自己的（不是自动运行的）对话：(在跑, 待处理) 各几条。待处理是等你回复和「刚做完」（还没看过，失败的也在里面）。
     pub fn global_counts(&self) -> (usize, usize) {
         let (mut running, mut waiting) = (0, 0);
         for e in self.lists.iter().flat_map(|l| &l.entries) {

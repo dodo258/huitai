@@ -1,9 +1,9 @@
-//! 「等你回复」汇总（`s`），和 `!` 跳到下一条等你回复的对话。
+//! 「待处理」汇总（`s`），和 `!` 跳到下一条待处理的对话。
 
 use super::*;
 
 impl App {
-    /// `!`：从选中处往下找下一条等你回复的自己的对话，这家找完接着找下一家（Tab 的顺序），绕一圈回来。
+    /// `!`：从选中处往下找下一条待处理（等回复、待读、失败）的自己的对话，这家找完接着找下一家（Tab 的顺序），绕一圈回来。
     /// 在别家就换过去，在收起的组里就展开它。
     /// 汇总开着时只在汇总里往下找（绕一圈回来），不离开汇总。
     pub(super) fn next_waiting(&mut self) -> Vec<Effect> {
@@ -16,13 +16,13 @@ impl App {
                 .find(|&i| waits(self.state_of(&entries[i].session.id)));
             match next {
                 Some(i) => self.select(i),
-                None => self.status = Some("没有等你回复的对话".to_owned()),
+                None => self.status = Some("没有待处理的对话".to_owned()),
             }
             return Vec::new();
         }
         self.next_where(
             |app, e| !e.session.automatic && waits(app.state_of(&e.session.id)),
-            "没有等你回复的对话",
+            "没有待处理的对话",
         )
     }
 
@@ -97,7 +97,7 @@ impl App {
         effects
     }
 
-    /// 汇总里列的对话：三家自己的、托管着没停的（和顶栏「在跑 / 等你」数的是同一批），
+    /// 汇总里列的对话：三家自己的、托管着没停的（和顶栏「在跑 / 待处理」数的是同一批），
     /// 按 要输入 > 失败 > 做完待看 > 在跑 排（[`App::board_rank`]），各自最近聊过的在前。
     pub fn board_entries(&self) -> Vec<&Entry> {
         let mut out: Vec<&Entry> = self

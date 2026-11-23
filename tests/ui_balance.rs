@@ -268,7 +268,8 @@ fn panel_scrolls_when_short() {
 #[test]
 fn pi_top_bar_shows_default_provider_balance() {
     let mut app = app_with_balance(Vendor::Pi);
-    let top = dump(&render(&mut app, W, H))
+    // 宽一点：八家同屏时来源让给别家短名，120 列只写得下余额。
+    let top = dump(&render(&mut app, 160, H))
         .lines()
         .next()
         .unwrap()

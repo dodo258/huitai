@@ -98,8 +98,8 @@ fn preview_head_and_plan_block_follow_the_state() {
         .iter()
         .position(|l| l.contains("计划 2/5"))
         .unwrap_or_else(|| panic!("没有计划块：\n{text}"));
-    assert!(lines[plan + 1].contains("✔ 找到结算按钮被禁用的原因"));
-    assert!(lines[plan + 3].contains("□ 跑 e2e 测试"));
+    assert!(lines[plan + 1].contains("✓ 找到结算按钮被禁用的原因"));
+    assert!(lines[plan + 3].contains("▸ 跑 e2e 测试"));
     assert!(lines[plan + 5].contains("□ 补一条回归测试"));
 
     select_id(&mut app, "c-shop-2");
@@ -123,6 +123,88 @@ fn preview_head_and_plan_block_follow_the_state() {
             .contains("等你回复 · 1 小时 35 分"),
         "{text}"
     );
+}
+
+/// 预览右边那栏（列表那栏会有「等回复」「待读」这些短词）。
+fn preview_col(line: &str) -> String {
+    line.chars().skip(76).collect()
+}
+
+/// 预览最上面一行在跑 / 等你回复 / 做完的文字不变；下面的元信息行不再重复状态，
+/// 时间写「最近活跃」；标题行不写状态的（已停）元信息行照旧写状态灯。
+#[test]
+fn meta_line_leaves_the_state_to_the_head_line() {
+    let mut app = app_with_moments(Vendor::Claude);
+    let shown = |app: &mut App, id: &str| {
+        select_id(app, id);
+        load_preview(app);
+        dump(&render(app, W, H))
+    };
+    let meta_of = |text: &str| {
+        text.lines()
+            .map(preview_col)
+            .find(|l| l.contains("最近活跃"))
+            .unwrap_or_else(|| panic!("没有元信息行：\n{text}"))
+    };
+    let check = |text: &str, head: &str, word: &str| {
+        assert!(text.lines().nth(1).unwrap().ends_with(head), "{text}");
+        let meta = meta_of(text);
+        assert!(!meta.contains(word), "{meta}");
+        assert!(!meta.contains("条消息"), "{meta}");
+    };
+    check(&shown(&mut app, "c-shop-1"), "在跑 · 4 分 12 秒", "在跑");
+    check(&shown(&mut app, "c-shop-2"), "做完 · 用时 6 分钟", "做完");
+
+    let text = shown(&mut app, "c-shop-3");
+    assert!(text.lines().nth(1).unwrap().ends_with("对话预览"), "{text}");
+    assert!(
+        meta_of(&text).contains("你发了 57 条 · 最近活跃 昨天 · ○ 已停"),
+        "{text}"
+    );
+
+    app.key(key(KeyCode::Down));
+    app.key(key(KeyCode::Enter)); // 展开 blog
+    let text = shown(&mut app, "c-blog-1");
+    check(&text, "等你回复 · 1 小时 35 分", "等你");
+}
+
+/// 计划三态 ✓ / ▸ / □。高窗口展开；矮窗口里展开会让实时画面不足 4 行时收成一行「计划 2/5 · ▸ 当前步骤」，
+/// 标题行照旧。
+#[test]
+fn plan_collapses_to_one_line_in_short_windows() {
+    let mut app = app_with_moments(Vendor::Claude);
+    app.live = Some((SessionId::from("c-shop-1"), live_screen()));
+    let head = "在跑 · 4 分 12 秒 · 此刻的画面";
+
+    let tall = dump(&render(&mut app, W, 34));
+    assert!(tall.lines().nth(1).unwrap().ends_with(head), "{tall}");
+    for step in ["✓ 找到结算按钮被禁用的原因", "▸ 跑 e2e 测试", "□ 看移动端"]
+    {
+        assert!(tall.contains(step), "{step}\n{tall}");
+    }
+    assert!(!tall.contains("计划 2/5 ·"), "{tall}");
+    assert_snapshot("plan-tall", &tall);
+
+    let short = dump(&render(&mut app, W, 18));
+    assert!(short.lines().nth(1).unwrap().ends_with(head), "{short}");
+    assert!(short.contains("计划 2/5 · ▸ 跑 e2e 测试"), "{short}");
+    assert!(!short.contains("找到结算按钮被禁用的原因"), "{short}");
+    assert!(short.contains("Running…"), "{short}");
+    assert_snapshot("plan-short", &short);
+
+    // 只看高度：展开时实时画面最后 4 行（coupon、RUN、空行、Running…）都在；一旦展开，再高也一直展开。
+    let mut expanded_from = None;
+    for h in 12..=40 {
+        let text = dump(&render(&mut app, W, h));
+        let collapsed = text.contains("计划 2/5 ·");
+        if !collapsed {
+            expanded_from.get_or_insert(h);
+            assert!(text.contains("coupon.spec.ts"), "高 {h}：\n{text}");
+        } else {
+            assert!(expanded_from.is_none(), "高 {h} 又收起来了");
+        }
+    }
+    assert!(expanded_from.is_some());
 }
 
 #[test]

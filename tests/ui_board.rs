@@ -118,7 +118,7 @@ fn bang_cycles_waiting_ones_inside_the_board() {
         set_state(&mut app, id, SessionState::Running);
     }
     app.key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT));
-    assert_eq!(app.status.as_deref(), Some("没有等你回复的对话"));
+    assert_eq!(app.status.as_deref(), Some("没有待处理的对话"));
 }
 
 #[test]
@@ -214,14 +214,21 @@ fn renders_vendor_marks_projects_and_counts() {
     load_preview(&mut app);
     let text = dump(&render(&mut app, W, H));
     let lines: Vec<&str> = text.lines().collect();
-    assert!(lines[1].contains("等你回复和在跑的 · 各家"), "{}", lines[1]);
+    assert!(lines[1].contains("待处理和在跑的 · 各家"), "{}", lines[1]);
     // 每行标题前是那家的标记，后面是项目名；状态灯在右边状态列。
     let (title, status) = lines[2]
         .split_once("✻ 给博客加 RSS 订阅  blog")
         .unwrap_or_else(|| panic!("{}", lines[2]));
     assert!(!title.contains('◆'), "{}", lines[2]);
-    assert!(status.contains('◆'), "{}", lines[2]);
+    // 要你处理的状态在灯后写短词，和顶栏「待处理」一套说法；在跑的只有转圈。
+    assert!(status.contains("◆ 等回复"), "{}", lines[2]);
     assert!(lines[3].contains("π RSS 初稿  blog"), "{}", lines[3]);
+    assert!(lines[3].contains("✓ 待读"), "{}", lines[3]);
+    assert!(
+        !lines[6].contains("待读") && !lines[6].contains("等回复"),
+        "{}",
+        lines[6]
+    );
     assert!(
         lines[4].contains("✻ 把优惠券接口换成新版  shop"),
         "{}",
@@ -233,7 +240,7 @@ fn renders_vendor_marks_projects_and_counts() {
         lines[6]
     );
     let bottom = lines[H as usize - 1];
-    assert!(bottom.contains("s 等你 3 · 在跑 3"), "{bottom}");
+    assert!(bottom.contains("s 待处理 3 · 在跑 3"), "{bottom}");
     assert!(bottom.contains("Esc 返回"), "{bottom}");
     // 预览显示选中那条（pi 的）的消息。
     assert!(text.contains("RSS 初稿"), "{text}");
@@ -248,8 +255,27 @@ fn empty_board_says_so() {
     assert!(app.selected_entry().is_none());
     assert!(app.key(key(KeyCode::Enter)).is_empty());
     let text = dump(&render(&mut app, W, H));
-    assert!(text.contains("没有等你回复或在跑的对话"), "{text}");
-    assert!(text.contains("s 等你 0 · 在跑 0"), "{text}");
+    assert!(text.contains("没有待处理或在跑的对话"), "{text}");
+    let bottom = text.lines().last().unwrap();
+    assert!(bottom.contains("s 待处理 0 · 在跑 0"), "{bottom}");
+    // 空汇总只给现在按了有用的键：返回。
+    assert!(bottom.ends_with("Esc 返回"), "{bottom}");
+    assert!(!bottom.contains('⏎') && !bottom.contains('!'), "{bottom}");
+    assert_snapshot("board-empty", &text);
+}
+
+#[test]
+fn board_without_waiting_ones_drops_the_bang_hint() {
+    let mut app = demo_app(Vendor::Claude);
+    for id in ["p-blog-1", "c-shop-2", "c-blog-1"] {
+        set_state(&mut app, id, SessionState::Running);
+    }
+    press(&mut app, 's');
+    let text = dump(&render(&mut app, W, H));
+    let bottom = text.lines().last().unwrap();
+    assert!(bottom.contains("s 待处理 0 · 在跑"), "{bottom}");
+    assert!(bottom.ends_with("⏎ 打开 · Esc 返回"), "{bottom}");
+    assert!(!bottom.contains('!'), "{bottom}");
 }
 
 #[test]

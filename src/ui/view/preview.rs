@@ -3,6 +3,9 @@
 use super::list::{background_notes, key_hints, newest};
 use super::*;
 
+/// 计划块下面至少给画面或消息留几行；留不够就把计划收成一行。
+const PLAN_ROOM: usize = 4;
+
 /// 预览区的标题行：这一栏此刻在显示什么。
 /// 选中的是托管着或别处在跑的对话时，标题跟着状态走：「在跑 · 4 分 12 秒」「做完 · 用时 6 分钟」
 /// 「等你回复 · 3 分钟」「失败」，用状态的颜色。选中的对话报过上下文占用时后面接「 · 上下文 72%」。
@@ -100,21 +103,10 @@ pub(super) fn preview(buf: &mut Buffer, area: Rect, app: &App, t: &Theme, accent
     } else {
         Line::from(sp(truncate(VIEW_ONLY, w), fg(t.text)))
     });
-    let mut meta = Vec::new();
-    if let Some(b) = &e.session.git_branch {
-        meta.push(sp(format!("{b} · "), fg(t.muted)));
-    }
-    meta.push(sp(
-        format!(
-            "{} 条消息 · {} · ",
-            e.session.message_count,
-            ago(e.session.last_active, app.now)
-        ),
-        fg(t.muted),
-    ));
-    let (glyph, label, color) = light(app, e, t, t.muted);
-    meta.push(sp(format!("{glyph} {label}"), fg(color)));
-    lines.push(Line::from(clip(meta, w)));
+    let git = matches!(&app.git, Some((dir, _)) if *dir == e.session.cwd);
+    // 标题行已经写了状态（在跑 / 等你回复 / 做完 / 失败）就不再写状态灯。
+    let show_light = git || activity::head_status(app, e, t).is_none();
+    lines.push(meta_line(app, e, show_light, w, t));
     if app.attached.contains(&e.session.id) {
         lines.push(Line::from(
             vec![
@@ -141,9 +133,13 @@ pub(super) fn preview(buf: &mut Buffer, area: Rect, app: &App, t: &Theme, accent
             w,
         )));
     }
-    let git = matches!(&app.git, Some((dir, _)) if *dir == e.session.cwd);
     if let Some(m) = app.moments.get(&e.session.id).filter(|_| !git) {
-        let plan = activity::plan_lines(m, w, t, accent);
+        let mut plan = activity::plan_lines(m, w, t, accent);
+        // 展开的计划会让下面的画面或消息不足 PLAN_ROOM 行（计划前后各空一行）就收成一行。
+        let left = usize::from(inner.height).saturating_sub(lines.len() + plan.len() + 2);
+        if plan.len() > 1 && left < PLAN_ROOM {
+            plan = activity::plan_line(m, w, t, accent).into_iter().collect();
+        }
         if !plan.is_empty() {
             lines.push(Line::default());
             lines.extend(plan);
@@ -164,6 +160,41 @@ pub(super) fn preview(buf: &mut Buffer, area: Rect, app: &App, t: &Theme, accent
     let start = body.len().saturating_sub(room + scroll);
     lines.extend(body.into_iter().skip(start).take(room));
     put_lines(buf, inner, lines);
+}
+
+/// 预览元信息行：「分支 · 你发了 N 条 · 最近活跃 4 分钟前 · ○ 已停」。各家的计数都是用户发言条数。
+/// 放不下先省计数、再省分支，最近活跃和状态灯留着。
+fn meta_line(app: &App, e: &Entry, show_light: bool, w: usize, t: &Theme) -> Line<'static> {
+    let branch = e.session.git_branch.as_deref();
+    let count = format!("你发了 {} 条", e.session.message_count);
+    let active = format!("最近活跃 {}", ago(e.session.last_active, app.now));
+    let lamp = show_light.then(|| light(app, e, t, t.muted));
+    let light_text = lamp.map(|(glyph, label, _)| format!("{glyph} {label}"));
+    let fits = |with_branch: bool, with_count: bool| {
+        let parts = [
+            branch.filter(|_| with_branch),
+            Some(count.as_str()).filter(|_| with_count),
+            Some(active.as_str()),
+            light_text.as_deref(),
+        ];
+        let parts: Vec<&str> = parts.into_iter().flatten().collect();
+        width(&parts.join(" · ")) <= w
+    };
+    let with_count = fits(true, true);
+    let mut text: Vec<String> = Vec::new();
+    if fits(true, with_count) {
+        text.extend(branch.map(str::to_owned));
+    }
+    if with_count {
+        text.push(count);
+    }
+    text.push(active);
+    let mut spans = vec![sp(text.join(" · "), fg(t.muted))];
+    if let (Some((_, _, color)), Some(l)) = (lamp, light_text) {
+        spans.push(sp(" · ", fg(t.muted)));
+        spans.push(sp(l, fg(color)));
+    }
+    Line::from(clip(spans, w))
 }
 
 /// 状态灯：字符、说法、颜色；「已停」用 `stopped` 色（列表里比预览再暗一档）。
@@ -192,7 +223,7 @@ pub(super) fn light(
     };
     let color = match s {
         SessionState::Stopped => stopped,
-        // 没看过的「刚做完」和顶栏「◆ 等你」一起慢闪；看过的「等你回复」不闪。
+        // 没看过的「刚做完」和顶栏「◆ 待处理」一起慢闪；看过的「等你回复」不闪。
         SessionState::Done if app.blink_dim => t.faint,
         s => t.state(s),
     };

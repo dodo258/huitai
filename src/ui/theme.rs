@@ -9,6 +9,8 @@
 //! - 其余是灰阶：标题、正文、次要（表头、组名以外的说明）、暗字（时间、路径、账号名、动态行）。
 //!   四级灰阶在底色、选中底色、栏底色、预览底色和展开组的垫色上对比度都不低于 4.5:1（WCAG AA），
 //!   相邻两级至少差 1.2 倍，主次靠亮度梯度和粗细分，不靠把暗字压到看不清（测试 `grays_readable_and_ordered`）。
+//! - 当字用的状态色（在跑、等你、别处）在底色、选中底色、栏底色、预览底色上同样不低于 4.5:1（测试 `state_words_readable`）。
+//!   已停是故意压暗的灯，不算。
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -81,11 +83,11 @@ impl Theme {
         muted: rgb(0x4b4a45),
         faint: rgb(0x64625c),
         light: true,
-        running: rgb(0x2e8f4c),
-        waiting: rgb(0xa8740f),
+        running: rgb(0x166e38),
+        waiting: rgb(0x815800),
         done: rgb(0x16808f),
         stopped: rgb(0xb5b2aa),
-        elsewhere: rgb(0x5e9a6f),
+        elsewhere: rgb(0x466b4f),
         alert: rgb(0xc23a2f),
     };
 
@@ -106,6 +108,11 @@ impl Theme {
             SessionState::Done => self.done,
             SessionState::Stopped => self.stopped,
         }
+    }
+
+    /// 慢闪暗半拍时状态符号的颜色：同一个色往顶栏底色退六成，色相不变、只是暗下去。
+    pub fn blink_dim(&self, color: Color) -> Color {
+        mix(color, self.bar, 0.6)
     }
 
     /// 展开的组标题整行垫的底色：列表底色带一点这家的强调色，深浅色下都看得出，又和选中行的中性灰分得开。
@@ -301,6 +308,24 @@ mod tests {
                         pair[0],
                         pair[1]
                     );
+                }
+            }
+        }
+    }
+
+    /// 在跑、等你、别处这三个状态色会当字用（顶栏计数、列表的「等回复」、动态行），在顶栏和列表会出现的底色上都要读得清。
+    #[test]
+    fn state_words_readable() {
+        for t in [Theme::DARK, Theme::LIGHT] {
+            let words = [
+                t.state(SessionState::Running),
+                t.state(SessionState::Waiting),
+                t.elsewhere(),
+            ];
+            for bg in [t.bar, t.base, t.select, t.preview] {
+                for fg in words {
+                    let c = contrast(fg, bg);
+                    assert!(c >= 4.5, "{fg:?} 在 {bg:?} 上只有 {c:.2}:1");
                 }
             }
         }

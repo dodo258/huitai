@@ -2,8 +2,12 @@
 //!
 //! 收回条件（全满足才收）：没有标签页连着；状态是「等你回复」或「已完成」（最后一次提醒信号之后只有收尾重画，
 //! 和状态灯同一个判断；改窗口大小、焦点切换引起的重画也不算开跑）；超过设置的时长没有新输出。
-//! 正在跑的（信号之后又有输出，或从没发过信号）绝不收。安静多久都不算停了：pi 隐藏工作指示器、Codex 关了动画时，
+//! 正在跑的（信号之后又有输出，或从没发过信号）守护进程自己绝不收。安静多久都不算停了：pi 隐藏工作指示器、Codex 关了动画时，
 //! 干活中也可能几十秒乃至更久没输出（2026-11-23 审计实测），收回会杀掉还在干的活；状态灯的安静超时（`QUIET_AFTER`）只改灯。
+//!
+//! 答完不发提醒信号的 CLI（pi）：守护进程不读厂商记录，由会话台读（`Source::turn_done`），记录显示这一轮答完、
+//! 而且记录也超过时长没变时发 `Request::Reclaim`；守护进程再核对没有标签页连着、超过时长没新输出（[`Activity::quiet`]），
+//! 满足就按同样的步骤结束。
 //!
 //! 结束步骤：按厂商正常退出方式连按两下 Ctrl+C（三家空闲时都是这样退出），等 [`QUIT_GRACE`]；
 //! 还在就 SIGTERM 进程组，再等 [`TERM_GRACE`]；还在才 SIGKILL。对话记录在厂商自己的文件里，不受影响。
@@ -106,8 +110,14 @@ impl Activity {
 
     /// 该不该收回。`limit` 为 `None` 表示设置里关了。
     pub fn should_reclaim(&self, attached: bool, now: Instant, limit: Option<Duration>) -> bool {
+        self.settled && self.quiet(attached, now, limit)
+    }
+
+    /// 没有标签页连着、超过 `limit` 没新输出（不管发没发过提醒信号）。会话台凭厂商记录说这一轮答完了、
+    /// 请求收回时看这一条。`limit` 为 `None` 表示设置里关了。
+    pub fn quiet(&self, attached: bool, now: Instant, limit: Option<Duration>) -> bool {
         let Some(limit) = limit else { return false };
-        !attached && self.settled && now.saturating_duration_since(self.last_output) >= limit
+        !attached && now.saturating_duration_since(self.last_output) >= limit
     }
 }
 
@@ -163,6 +173,24 @@ mod tests {
         a.signal(t0 + 5 * MIN);
         assert!(!a.should_reclaim(false, t0 + 34 * MIN, LIMIT));
         assert!(a.should_reclaim(false, t0 + 35 * MIN, LIMIT));
+    }
+
+    #[test]
+    fn quiet_ignores_signals_but_not_output_or_tabs() {
+        let t0 = Instant::now();
+        let mut a = Activity::new(t0);
+        // 从没发过信号（pi）：守护进程自己不收，但够安静了。
+        assert!(!a.should_reclaim(false, t0 + 60 * MIN, LIMIT));
+        assert!(a.quiet(false, t0 + 30 * MIN, LIMIT));
+        assert!(!a.quiet(false, t0 + 29 * MIN, LIMIT));
+        assert!(!a.quiet(true, t0 + 60 * MIN, LIMIT), "有标签页连着");
+        assert!(!a.quiet(false, t0 + 600 * MIN, None), "设置里关了");
+        a.output(t0 + 20 * MIN);
+        assert!(
+            !a.quiet(false, t0 + 49 * MIN, LIMIT),
+            "之后又有输出，从那时重新算"
+        );
+        assert!(a.quiet(false, t0 + 50 * MIN, LIMIT));
     }
 
     #[test]

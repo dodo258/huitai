@@ -1,9 +1,9 @@
-//! 「等你回复」汇总（`s`）。
+//! 「待处理」汇总（`s`）。
 
-use super::list::{Cells, Table, Tag, item, item_cells, list_head};
+use super::list::{Table, Tag, item, item_cells, item_table, list_head};
 use super::*;
 
-/// 「等你回复」汇总（`s`）：三家的对话混在一行行里，每行标题前是那家的标记，后面是项目名。
+/// 「待处理」汇总（`s`）：三家的对话混在一行行里，每行标题前是那家的标记，后面是项目名。
 pub(super) fn board(
     buf: &mut Buffer,
     head: Rect,
@@ -13,7 +13,7 @@ pub(super) fn board(
     t: &Theme,
     accent: Color,
 ) {
-    const LABEL: &str = "等你回复和在跑的 · 各家";
+    const LABEL: &str = "待处理和在跑的 · 各家";
     let line = |i: u16| Rect {
         y: area.y + i,
         height: 1,
@@ -25,7 +25,7 @@ pub(super) fn board(
         row(
             buf,
             line(1),
-            vec![sp("  没有等你回复或在跑的对话", fg(t.muted))],
+            vec![sp("  没有待处理或在跑的对话", fg(t.muted))],
             vec![],
         );
         row(
@@ -40,8 +40,12 @@ pub(super) fn board(
         return;
     }
     let selected = app.board_index(&entries).unwrap_or(0);
-    let cells: Vec<Cells> = entries.iter().map(|e| item_cells(app, e, t)).collect();
-    let table = Table::new(&cells, usize::from(area.width));
+    let (table, cells) = item_table(usize::from(area.width), |words| {
+        entries
+            .iter()
+            .map(|e| item_cells(app, e, t, words))
+            .collect()
+    });
     list_head(buf, head, LABEL, &table, t);
     let mut y = 0;
     for (i, (e, c)) in entries.iter().zip(cells).enumerate().skip(offset) {
@@ -55,6 +59,7 @@ pub(super) fn board(
             app,
             e,
             tag,
+            0,
             i == selected,
             &table,
             c,
@@ -64,7 +69,7 @@ pub(super) fn board(
         if let Some(d) = app.doing(e) {
             y += 1;
             if y < area.height {
-                activity::doing_row(buf, line(y), app, e, &d, i == selected, t, accent);
+                activity::doing_row(buf, line(y), app, e, &d, 0, i == selected, t, accent);
             }
         }
         y += 1;

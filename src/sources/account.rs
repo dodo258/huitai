@@ -206,6 +206,10 @@ impl Source for AccountSource {
         self.inner.moment_files(&self.native(session))
     }
 
+    fn turn_done(&self, session: &Session) -> io::Result<Option<bool>> {
+        self.inner.turn_done(&self.native(session))
+    }
+
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
         self.inner.count_messages(&self.native(session))
     }

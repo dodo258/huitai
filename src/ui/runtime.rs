@@ -37,7 +37,7 @@ use crate::ime::{Switcher, Tis};
 use crate::index::{self, Entry, Index, Snippet, Update};
 use crate::notify::{self, Activity, Desktop, Message, Notifier, OscKind, SystemNotifier};
 use crate::opener::{
-    self, InlineOpener, KakuOpener, LoginItem, Opener, Outcome, Tabs, Terminal as Term,
+    self, InlineOpener, KakuOpener, LoginItem, Opened, Opener, Outcome, Tabs, Terminal as Term,
 };
 use crate::quota;
 use crate::sources::{self, Command, Delivery, Moment, Source, Transcript, Trash};
@@ -52,15 +52,19 @@ use super::theme::Theme;
 use super::view;
 
 mod jobs;
+mod reclaim;
 mod workers;
 
 use jobs::{Job, job_worker};
+use reclaim::reclaim_worker;
 use workers::{
     CliRequest, backup_worker, balance_worker, cli_versions_worker, context_worker, forward,
     host_watcher, live_worker, moment_worker, preview_worker, procs_worker, quota_worker,
     seen_worker, snippet_worker, system_alert, transcript_worker,
 };
 
+/// 当前窗口接上对话前，底栏「⌃\ 回到会话台」亮多久再把屏幕交给 CLI。
+const BACK_KEY_HINT: Duration = Duration::from_secs(1);
 /// 预览读几条消息。
 const PREVIEW_MESSAGES: usize = 8;
 /// 搜索最多列几条。
@@ -199,6 +203,7 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
     forward(updates, tx.clone(), Msg::Index);
     let previews = preview_worker(ctx.clone(), tx.clone());
     let moments = moment_worker(ctx.clone(), tx.clone());
+    let reclaims = reclaim_worker(ctx.clone());
     let transcripts = transcript_worker(ctx.clone(), tx.clone());
     let snippets = snippet_worker(index.clone(), tx.clone());
     let live = live_worker(ctx.data_dir.clone(), tx.clone());
@@ -251,6 +256,8 @@ pub fn run(update_check: UpdateCheck) -> io::Result<()> {
         previews,
         moments,
         moment_sent: Vec::new(),
+        reclaims,
+        reclaim_sent: (None, Vec::new()),
         frame: None,
         transcripts,
         snippets,
@@ -808,6 +815,10 @@ struct Loop {
     moments: Sender<Vec<Entry>>,
     /// 上次发给它的那批（id 和会话文件）。
     moment_sent: Vec<(SessionId, PathBuf)>,
+    /// 答完不发提醒的 CLI 闲置收回的线程（[`reclaim`]）：闲置时长和要看的对话（变了才发）。
+    reclaims: Sender<reclaim::Targets>,
+    /// 上次发给它的闲置时长、守护进程里的 id 和会话文件。
+    reclaim_sent: (Option<Duration>, Vec<(SessionId, PathBuf)>),
     /// 上一次整帧画出来的样子：只有转圈换帧时拿它改那几格再交给终端（见 [`view::respin`]）。
     frame: Option<Buffer>,
     /// 读整段对话的线程。
@@ -915,6 +926,7 @@ impl Loop {
                 let _ = self.snippets.send(req);
             }
             self.send_moment_targets();
+            self.send_reclaim_targets();
             self.set_live(self.app.live_target());
             dirty |= self.mark_seen();
         }
@@ -948,6 +960,23 @@ impl Loop {
         if keys != self.moment_sent {
             let _ = self.moments.send(targets);
             self.moment_sent = keys;
+        }
+    }
+
+    /// 要看记录能不能收回的对话、闲置时长变了才告诉收回线程。
+    fn send_reclaim_targets(&mut self) {
+        let limit = self.app.config.idle_reclaim();
+        let targets = self.app.reclaim_targets();
+        let keys = (
+            limit,
+            targets
+                .iter()
+                .map(|(id, e)| (id.clone(), e.session.path.clone()))
+                .collect(),
+        );
+        if keys != self.reclaim_sent {
+            let _ = self.reclaims.send((limit, targets));
+            self.reclaim_sent = keys;
         }
     }
 
@@ -1361,7 +1390,7 @@ impl Loop {
         Ok(())
     }
 
-    /// 在当前窗口接上对话，CLI 退出或被别处接走后回到会话台。
+    /// 在当前窗口接上对话，CLI 退出、被别处接走或按回到会话台的键脱开后回到会话台。
     /// 回来时告诉守护进程看过了：接着期间它就在这个窗口里，答完的最后一轮主人看着呢，不该回来还闪。
     /// 走守护进程再广播回来，排在接着期间的状态事件后面，不会被它们盖掉。
     fn open_here(&mut self, tui: &mut Tui, s: &Session) -> io::Result<String> {
@@ -1373,12 +1402,9 @@ impl Loop {
             Ok((id, c, _)) => (id, c),
             Err(e) => return Ok(format!("没打开：{e}")),
         };
+        self.hint_back_key(tui)?;
         let result = self.suspend(tui, || InlineOpener.open(&cmd, ""))?;
-        let _ = self.seen.send(id);
-        Ok(match result {
-            Ok(_) => "已回到会话台".to_owned(),
-            Err(e) => format!("对话结束：{e}"),
-        })
+        Ok(self.back_here(id, result))
     }
 
     fn new_here(&mut self, tui: &mut Tui, v: Vendor, cwd: &Path) -> io::Result<String> {
@@ -1391,13 +1417,37 @@ impl Loop {
             Ok(x) => x,
             Err(e) => return Ok(format!("没新建：{e}")),
         };
+        self.hint_back_key(tui)?;
         let result = self.suspend(tui, || InlineOpener.open(&cmd, ""))?;
-        // 和 `open_here` 一样：回来时它的最后一轮主人看过了。
+        Ok(self.back_here(id, result))
+    }
+
+    /// 屏幕交给当前窗口里的 CLI 之前，底栏先亮 [`BACK_KEY_HINT`]「⌃\ 回到会话台」：交出去以后会话台说不上话了。
+    /// 设置里关了回到会话台的键就不亮、不等。
+    fn hint_back_key(&mut self, tui: &mut Tui) -> io::Result<()> {
+        let Some(hint) = self.app.back_key_hint() else {
+            return Ok(());
+        };
+        self.app.status = Some(hint);
+        tui.terminal
+            .draw(|f| view::draw(f, &mut self.app, &self.theme))?;
+        thread::sleep(BACK_KEY_HINT);
+        Ok(())
+    }
+
+    /// 当前窗口里接的对话交回会话台之后：告诉守护进程看过了（见 `open_here`），给底栏一句话。
+    /// CLI 还在跑说明是按回到会话台的键脱开的（CLI 退出时守护进程先注销再结束 attach），之后回车或 w 接回去。
+    fn back_here(&self, id: SessionId, result: io::Result<Opened>) -> String {
+        let running = result.is_ok()
+            && hosted_list(&self.ctx)
+                .iter()
+                .any(|h| h.id == id && h.pid.is_some());
         let _ = self.seen.send(id);
-        Ok(match result {
+        match result {
+            Ok(_) if running => "已回到会话台，对话在后台继续".to_owned(),
             Ok(_) => "已回到会话台".to_owned(),
             Err(e) => format!("对话结束：{e}"),
-        })
+        }
     }
 
     fn receive(&mut self, msg: Msg) {

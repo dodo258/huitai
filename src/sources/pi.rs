@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::jsonl::{self, str_field};
 use super::time::{from_millis, parse_rfc3339};
-use super::window::Window;
+use super::window::{self, Window};
 use super::{
     Command, Counted, Moment, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript,
     Trash, TrashEntry, moment, transcript,
@@ -49,6 +49,10 @@ impl Source for PiSource {
 
     fn load_moment(&self, session: &Session) -> io::Result<Moment> {
         moment::read_jsonl(&session.path, |v| moment::parts(parts(v)))
+    }
+
+    fn turn_done(&self, session: &Session) -> io::Result<Option<bool>> {
+        turn_done(&session.path)
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
@@ -233,6 +237,28 @@ fn parts(v: &Value) -> Vec<Part> {
         _ => {}
     }
     out
+}
+
+/// 这一轮答完了没有：看文件尾部（[`moment::MOMENT_TAIL_BYTES`]）最后一条 `message`。
+/// AI 的回复、停止原因不是工具调用（`stopReason` 不是 `toolUse`，也没带 `toolCall` 块）算答完：
+/// pi 1.6 的 `stop`（说完了）、`aborted`（按 Esc 打断）、`error`、`length` 之后都停着等你。
+/// 用户消息、工具返回（`toolResult`）和别的角色都算没答完；尾部一条消息都没有就看不出来（`None`）。
+pub(crate) fn turn_done(path: &Path) -> io::Result<Option<bool>> {
+    let (buf, _) = window::read_tail_lines(path, moment::MOMENT_TAIL_BYTES)?;
+    let last = window::lines(&buf)
+        .rev()
+        .filter_map(jsonl::parse)
+        .find(|v| str_field(v, "type") == Some("message"));
+    Ok(last.map(|v| {
+        let Some(m) = v.get("message") else {
+            return false;
+        };
+        let calls_tool = str_field(m, "stopReason") == Some("toolUse")
+            || m.get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|c| c.iter().any(|it| str_field(it, "type") == Some("toolCall")));
+        str_field(m, "role") == Some("assistant") && !calls_tool
+    }))
 }
 
 /// `<时间>_<id>.jsonl` → id。

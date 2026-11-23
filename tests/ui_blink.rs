@@ -46,6 +46,11 @@ fn blinks(app: &mut App) -> bool {
 
 /// 列表里这一条的状态灯颜色（左边列表里标题所在那一行的 ✓ 或 ◆）。
 fn light_fg(app: &mut App) -> Color {
+    light_and_word_fg(app).0
+}
+
+/// 状态灯和灯后短词（「待读」「等回复」的第一个字）的颜色。
+fn light_and_word_fg(app: &mut App) -> (Color, Color) {
     let title = app
         .list()
         .entries
@@ -68,7 +73,8 @@ fn light_fg(app: &mut App) -> Color {
     let x = (0..W * 3 / 5)
         .find(|&x| matches!(buf[(x, y)].symbol(), "✓" | "◆"))
         .expect("这一行有状态灯");
-    buf[(x, y)].fg
+    // 灯后一格空，再是短词。
+    (buf[(x, y)].fg, buf[(x + 2, y)].fg)
 }
 
 fn top(app: &mut App) -> String {
@@ -106,11 +112,13 @@ fn answered_and_not_seen_blinks() {
         t0 + Duration::from_secs(30),
     );
     assert_eq!(app.state_of(&SessionId::from(ID)), SessionState::Done);
-    assert!(top(&mut app).contains("◆1 等你"), "{}", top(&mut app));
+    assert!(top(&mut app).contains("◆1 待处理"), "{}", top(&mut app));
     assert!(blinks(&mut app), "答完没看：顶栏闪");
     // 这一行的 ✓ 也跟着闪：暗半拍是暗色，亮半拍是本色。
+    // 灯后的「待读」不跟着闪，暗半拍也是本色。
     app.tick_blink(BLINK_HALF);
-    assert_eq!(light_fg(&mut app), Theme::DARK.faint);
+    let done = Theme::DARK.state(SessionState::Done);
+    assert_eq!(light_and_word_fg(&mut app), (Theme::DARK.faint, done));
     app.tick_blink(BLINK_HALF * 2);
     assert_eq!(light_fg(&mut app), Theme::DARK.state(SessionState::Done));
 }
@@ -154,7 +162,7 @@ fn selecting_it_for_two_seconds_counts_as_seen_and_stops_blinking() {
 
     // 看过：顶栏照样计数，◆ 不闪。
     assert_eq!(app.state_of(&SessionId::from(ID)), SessionState::Waiting);
-    assert!(top(&mut app).contains("◆1 等你"), "{}", top(&mut app));
+    assert!(top(&mut app).contains("◆1 待处理"), "{}", top(&mut app));
     assert!(!blinks(&mut app), "看过的不闪");
     app.tick_blink(BLINK_HALF * 9);
     assert_eq!(
@@ -228,7 +236,7 @@ fn answered_while_its_tab_is_in_front_never_blinks() {
     );
     assert_eq!(app.state_of(&SessionId::from(ID)), SessionState::Waiting);
     assert!(!blinks(&mut app), "前台时答完直接不闪");
-    assert!(top(&mut app).contains("◆1 等你"), "{}", top(&mut app));
+    assert!(top(&mut app).contains("◆1 待处理"), "{}", top(&mut app));
 
     // 切走后的下一轮答完：没看过，闪。
     feed(

@@ -331,3 +331,89 @@ fn registrations_never_attached_expire_so_an_old_daemon_can_step_aside() {
     assert_eq!(h.daemon.expire_pending(), vec![renewed]);
     assert_eq!(h.host.request(&Request::Retire), Response::Ok);
 }
+
+/// 像 pi：答完不响铃，从没发过提醒信号。会话台凭厂商记录说这一轮答完了，发 `Reclaim`。
+const QUIET_CLI: &str = "trap 'echo bye; exit 0' INT; printf ready; while [ ! -f go ]; do sleep 0.05; done; printf more; while :; do sleep 0.05; done";
+
+fn reclaim(h: &IdleHost, id: &SessionId) -> Response {
+    h.host.request(&Request::Reclaim { id: id.clone() })
+}
+
+#[test]
+fn record_says_done_reclaims_a_quiet_cli_after_the_limit() {
+    let h = IdleHost::start(30);
+    let mut events = h.host.subscribe();
+    let id = h.launch_detached("quiet", QUIET_CLI);
+    // 守护进程自己不收没发过信号的。
+    h.advance(120 * MIN);
+    assert!(h.daemon.reclaim_idle().is_empty());
+    assert_eq!(reclaim(&h, &id), Response::Ok);
+    assert_eq!(wait_exit(&mut events, &id), Some(0), "两下 Ctrl+C 正常退出");
+    assert!(h.host.info(&id).is_none());
+    assert!(h.running_ids().is_empty(), "收回不算被中断");
+    assert!(interrupt::take_over(&h.host.dir).unwrap().is_empty());
+}
+
+#[test]
+fn record_says_done_but_pty_recent_or_attached_or_off_is_kept() {
+    let h = IdleHost::start(30);
+    let mut events = h.host.subscribe();
+    let id = h.launch_detached("recent", QUIET_CLI);
+    h.advance(29 * MIN);
+    assert!(
+        matches!(reclaim(&h, &id), Response::Error(_)),
+        "不到 30 分钟不收"
+    );
+
+    // 之后又有输出：从那时重新算。
+    h.host.file("go", b"");
+    let deadline = Instant::now() + WAIT;
+    while !screen_text(&h, &id).contains("more") {
+        assert!(Instant::now() < deadline, "等不到新输出");
+        thread::sleep(Duration::from_millis(20));
+    }
+    h.advance(15 * MIN);
+    assert!(matches!(reclaim(&h, &id), Response::Error(_)));
+    stays_alive(&h, &id, Duration::from_millis(300));
+
+    // 有标签页连着不收。
+    let att = h.host.attach(&id, 60, 12);
+    h.host
+        .wait_info(&id, "标签页接上", |i| i.is_some_and(|i| i.attached));
+    h.advance(120 * MIN);
+    assert!(matches!(reclaim(&h, &id), Response::Error(_)));
+    stays_alive(&h, &id, Duration::from_millis(300));
+    drop(att);
+    h.host
+        .wait_info(&id, "标签页断开", |i| i.is_some_and(|i| !i.attached));
+
+    // 设置里关了（0）不收。
+    Config {
+        idle_reclaim_minutes: 0,
+        ..Config::default()
+    }
+    .save(&h.host.dir.join("config.json"))
+    .unwrap();
+    h.advance(120 * MIN);
+    assert!(matches!(reclaim(&h, &id), Response::Error(_)));
+    stays_alive(&h, &id, Duration::from_millis(300));
+
+    // 打开、没人连着、够久：收。
+    Config {
+        idle_reclaim_minutes: 30,
+        ..Config::default()
+    }
+    .save(&h.host.dir.join("config.json"))
+    .unwrap();
+    assert_eq!(reclaim(&h, &id), Response::Ok);
+    assert_eq!(wait_exit(&mut events, &id), Some(0));
+}
+
+#[test]
+fn reclaim_unknown_session_is_an_error() {
+    let h = IdleHost::start(30);
+    assert!(matches!(
+        reclaim(&h, &SessionId::from("nope")),
+        Response::Error(_)
+    ));
+}

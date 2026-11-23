@@ -591,6 +591,10 @@ fn serve(
             let r = shared.kill(&id);
             reply(&mut stream, r)
         }
+        Request::Reclaim { id } => {
+            let r = shared.reclaim_quiet(&id);
+            reply(&mut stream, r)
+        }
         Request::List => {
             let mut list = shared.list();
             list.retain(|h| known(h.vendor));
@@ -1008,16 +1012,14 @@ impl Shared {
     /// 查一遍：闲置的对话标上「正在收回」，各起一个线程按步骤结束它。返回这次开始收回的对话。
     /// 设置每次现读，会话台里改了不用重启守护进程；读不到就这一轮不收（宁可不收也不误收）。
     fn reclaim_idle(self: &Arc<Self>) -> Vec<SessionId> {
-        let limit = match Config::load(&self.dir.join("config.json")) {
-            Ok(cfg) => cfg.idle_reclaim(),
+        let limit = match self.idle_limit() {
+            Ok(Some(limit)) => Some(limit),
+            Ok(None) => return Vec::new(),
             Err(e) => {
-                eprintln!("huitai daemon: 设置没读到，这一轮不收回闲置对话: {e}");
+                eprintln!("huitai daemon: {e}，这一轮不收回闲置对话");
                 return Vec::new();
             }
         };
-        if limit.is_none() {
-            return Vec::new();
-        }
         let now = self.clock.now();
         let sessions: Vec<_> = lock(&self.sessions).values().cloned().collect();
         let mut picked = Vec::new();
@@ -1032,17 +1034,67 @@ impl Shared {
                 })
             };
             let Some((pid, input)) = target else { continue };
-            let shared = Arc::clone(self);
             let id = hosted.spec.id.clone();
-            match spawn("huitai-reclaim", move || {
-                shared.reclaim(&hosted, pid, &input)
-            }) {
+            match self.start_reclaim(hosted, pid, input) {
                 Ok(()) => picked.push(id),
                 Err(e) => eprintln!("huitai daemon: 起不了线程收回 {id}: {e}"),
             }
         }
         picked.sort();
         picked
+    }
+
+    /// 会话台按厂商记录认定这一轮答完了（`Request::Reclaim`）：没有标签页连着、超过闲置时长没新输出就收回，
+    /// 不要求发过提醒信号。已经在收回的回 `Ok`。
+    fn reclaim_quiet(self: &Arc<Self>, id: &SessionId) -> Response {
+        let limit = match self.idle_limit() {
+            Ok(Some(limit)) => Some(limit),
+            Ok(None) => return Response::Error("设置里关了闲置收回".to_owned()),
+            Err(e) => return Response::Error(e),
+        };
+        let Some(hosted) = self.find(id) else {
+            return not_found(id);
+        };
+        let now = self.clock.now();
+        let target = {
+            let mut st = lock(&hosted.state);
+            let attached = st.client.is_some();
+            let Some(run) = st.run.as_mut() else {
+                return Response::Error(format!("{id} 没在跑"));
+            };
+            if run.reclaiming {
+                return Response::Ok;
+            }
+            if !run.activity.quiet(attached, now, limit) {
+                return Response::Error(format!("{id} 有标签页连着，或闲置时长之内还有输出"));
+            }
+            run.reclaiming = true;
+            (run.pid, Arc::clone(&run.input))
+        };
+        match self.start_reclaim(hosted, target.0, target.1) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error(format!("起不了线程收回 {id}: {e}")),
+        }
+    }
+
+    /// 设置里的闲置时长（`None` 是关了），每次现读，会话台里改了不用重启守护进程。
+    fn idle_limit(&self) -> Result<Option<Duration>, String> {
+        Config::load(&self.dir.join("config.json"))
+            .map(|cfg| cfg.idle_reclaim())
+            .map_err(|e| format!("设置没读到: {e}"))
+    }
+
+    /// 起一个线程按步骤结束已标上「正在收回」的对话。
+    fn start_reclaim(
+        self: &Arc<Self>,
+        hosted: Arc<Hosted>,
+        pid: u32,
+        input: Arc<Outbox>,
+    ) -> io::Result<()> {
+        let shared = Arc::clone(self);
+        spawn("huitai-reclaim", move || {
+            shared.reclaim(&hosted, pid, &input)
+        })
     }
 
     /// 按厂商正常退出方式结束一条闲置对话：两下 Ctrl+C → 等 → SIGTERM 进程组 → 等 → SIGKILL。

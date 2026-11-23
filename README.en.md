@@ -61,7 +61,7 @@ Not sure everything is set up? Run `ai doctor`. It checks how each CLI was insta
 
 **Find a conversation**: `Tab` switches tool, `↑↓` or `jk` moves, `←→` collapses or expands a project, Enter on a project goes straight to its first conversation, `1-9` jumps to a project. `/` searches titles and message text in the current tool; if you do not remember which tool it was, press `⌃A` while searching to search every tool at once (results are ranked together, each row marked with its tool, Enter opens it as usual), and press it again or `Tab` to another tool to go back to one tool.
 
-**Continue a conversation**: Enter opens it in a new tab; if it is already open, that tab comes to the front instead of a second one. Press `w` to chat in the current window; when the conversation ends you are back in the list.
+**Continue a conversation**: Enter opens it in a new tab; if it is already open, that tab comes to the front instead of a second one. Press `w` to chat in the current window; when the conversation ends you are back in the list. To get back to the list mid-conversation, press `⌃\` (the bottom bar reminds you for a second as you attach): the conversation keeps running in the background, and Enter or `w` picks it up again. `⌃\` in a new tab detaches the same way: the conversation keeps going and the tab closes. The character inside pasted text does not count. You can change the key to `⌃Q` or `⌃]`, or turn it off, under "回会话台" in Settings (`,`). `⌃\` is the default because none of the supported CLIs use it; `⌃Q` is used by Hermes, Kimi Code and Qwen Code, and `⌃]` by Codex and pi, so with one of those picked, that key no longer reaches that CLI.
 
 **New or existing projects**: `n` starts a new conversation in the selected project. `m` starts one in another directory, with `Tab` completion; a bare name is created under `~/projects`, and you are asked before a missing directory is created. On a project, `o` opens it in your editor, `f` shows it in Finder, `g` lists changed files.
 
@@ -128,6 +128,7 @@ Every action is a single key. The bottom bar shows the most common ones; `?` sho
 | | `b` | Show / hide background conversations |
 | Open | `⏎` | Open in a new tab |
 | | `w` / `⌥⏎` | Open in the current window (`⌥⏎` needs Option as Alt) |
+| | `⌃\` (in a conversation) | Back to the list; the conversation keeps running (Settings can switch it to `⌃Q`, `⌃]` or off) |
 | | `n` | New conversation in this project |
 | | `m` | New project, or a conversation in another directory (`Tab` completes) |
 | | `R` | Resume everything interrupted; otherwise reopen last session's tabs |

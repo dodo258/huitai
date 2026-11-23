@@ -135,3 +135,61 @@ fn trash_and_restore() {
     src.restore(&entry).unwrap();
     assert_eq!(by_id(&src.scan().sessions, NORMAL), s);
 }
+
+/// 闲置收回用的「这一轮答完了」：看最后一条消息（pi 1.6 的 `stopReason`）。
+#[test]
+fn turn_done_reads_the_last_message() {
+    const HEAD: &str = r#"{"type":"session","version":3,"id":"aaaaaaaa-0000-4000-8000-0000000000a1","timestamp":"2026-11-20T10:00:00.000Z","cwd":"/Users/demo/projects/blog"}"#;
+    const USER: &str = r#"{"type":"message","id":"u1","timestamp":"2026-11-20T10:01:00.000Z","message":{"role":"user","content":[{"type":"text","text":"跑一下测试"}],"timestamp":1795168860000}}"#;
+    const TOOL_USE: &str = r#"{"type":"message","id":"a1","timestamp":"2026-11-20T10:01:30.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"..."},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"cargo test"}}],"stopReason":"toolUse","timestamp":1795168890000}}"#;
+    const RESULT: &str = r#"{"type":"message","id":"r1","timestamp":"2026-11-20T10:01:31.000Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"ok"}],"timestamp":1795168891000}}"#;
+    const STOP: &str = r#"{"type":"message","id":"a2","timestamp":"2026-11-20T10:02:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"测试都过了，随时叫我。"}],"stopReason":"stop","timestamp":1795168920000}}"#;
+    const ABORTED: &str = r#"{"type":"message","id":"a3","timestamp":"2026-11-20T10:02:00.000Z","message":{"role":"assistant","content":[],"stopReason":"aborted","timestamp":1795168920000}}"#;
+    // 老版本没写停止原因：带 toolCall 块的就是在调工具。
+    const OLD_CALL: &str = r#"{"type":"message","id":"a4","timestamp":"2026-11-20T10:01:30.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"read","arguments":{}}],"timestamp":1795168890000}}"#;
+    const INFO: &str =
+        r#"{"type":"session_info","id":"i1","timestamp":"2026-11-20T10:02:10.000Z","name":"测试"}"#;
+
+    let check = |name: &str, lines: &[&str]| {
+        let root = temp_dir(&format!("pi-turn-{name}"));
+        let dir = root.join("--Users-demo-projects-blog--");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-11-20T10-00-00-000Z_aaaaaaaa-0000-4000-8000-0000000000a1.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let src = source(&root, &format!("pi-turn-{name}-src"));
+        let scan = src.scan();
+        assert_eq!(scan.sessions.len(), 1, "{name}: {:?}", scan.problems);
+        src.turn_done(&scan.sessions[0]).unwrap()
+    };
+
+    assert_eq!(
+        check("done", &[HEAD, USER, TOOL_USE, RESULT, STOP]),
+        Some(true)
+    );
+    assert_eq!(
+        check("done-then-info", &[HEAD, USER, STOP, INFO]),
+        Some(true),
+        "答完之后的非消息行（改名、换模型）不算"
+    );
+    assert_eq!(
+        check("aborted", &[HEAD, USER, ABORTED]),
+        Some(true),
+        "Esc 打断后也停着等你"
+    );
+    assert_eq!(
+        check("tool-use", &[HEAD, USER, TOOL_USE]),
+        Some(false),
+        "最后是工具调用"
+    );
+    assert_eq!(
+        check("tool-result", &[HEAD, USER, TOOL_USE, RESULT]),
+        Some(false)
+    );
+    assert_eq!(check("old-call", &[HEAD, USER, OLD_CALL]), Some(false));
+    assert_eq!(
+        check("asked", &[HEAD, USER, STOP, USER]),
+        Some(false),
+        "又发了一句"
+    );
+    assert_eq!(check("empty", &[HEAD, INFO]), None, "没有消息看不出来");
+}

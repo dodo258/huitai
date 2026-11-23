@@ -49,7 +49,8 @@ fn later(secs: u64) -> Option<SystemTime> {
 #[test]
 fn top_bar_shows_countdown_next_to_each_window() {
     let mut app = claude_with(later(80 * 60), later(3 * 86_400 + 5 * 3600));
-    let line = top(&mut app, 180);
+    // 八家同屏时别家短名比来源、第二个窗口要紧：宽到 210 列才全写得下。
+    let line = top(&mut app, 210);
     assert!(line.contains("23% · 1 小时 20 分后重置"), "{line}");
     assert!(line.contains("41% · 3 天 5 小时后重置"), "{line}");
     assert!(line.contains("状态栏 · 2 分钟前"), "{line}");

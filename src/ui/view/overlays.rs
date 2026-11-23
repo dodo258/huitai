@@ -204,7 +204,7 @@ pub(super) fn settings(
         })
         .collect();
     let account_lines = multi.len().max(1) as u16;
-    let boxr = centered(area, 64, 17 + account_lines);
+    let boxr = centered(area, 64, 18 + account_lines);
     fill(buf, boxr, t.bar);
     let inner = Rect {
         x: boxr.x + 3,
@@ -281,6 +281,13 @@ pub(super) fn settings(
             }
             .to_owned(),
         ),
+        (
+            "回会话台",
+            match cfg.back_key.label() {
+                Some(key) => format!("{key} · 对话里按它回来，对话在后台继续"),
+                None => "关 · 对话结束才回到会话台".to_owned(),
+            },
+        ),
     ];
     for (i, (name, value)) in items.iter().enumerate() {
         let r = line(2 + i as u16);
@@ -306,7 +313,7 @@ pub(super) fn settings(
     }
     row(
         buf,
-        line(11),
+        line(12),
         vec![
             sp(format!("{:<8}", "呼出键"), fg(t.muted)),
             sp(cfg.hotkey.clone(), fg(t.text)),
@@ -317,7 +324,7 @@ pub(super) fn settings(
     if multi.is_empty() {
         row(
             buf,
-            line(12),
+            line(13),
             vec![
                 sp(format!("{:<8}", "账号"), fg(t.muted)),
                 sp("每家一个", fg(t.text)),
@@ -331,7 +338,7 @@ pub(super) fn settings(
         let label = if i == 0 { "账号" } else { "" };
         row(
             buf,
-            line(12 + i as u16),
+            line(13 + i as u16),
             vec![
                 sp(format!("{label:<8}"), fg(t.muted)),
                 sp(format!("{} ", v.mark()), fg(t.accent(*v))),
@@ -342,13 +349,13 @@ pub(super) fn settings(
     }
     row(
         buf,
-        line(13 + account_lines),
+        line(14 + account_lines),
         vec![sp("↑↓ 选择 · ←→ 修改 · Esc 保存并关闭", fg(t.faint))],
         vec![],
     );
     row(
         buf,
-        line(14 + account_lines),
+        line(15 + account_lines),
         vec![sp(
             "其余在 ~/Library/Application Support/huitai/config.json",
             fg(t.faint),

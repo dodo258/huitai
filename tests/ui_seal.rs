@@ -82,21 +82,25 @@ fn status_counts_own_conversations_across_vendors() {
     set_state(&mut app, "c-auto-4", SessionState::Done);
     assert_eq!(app.global_counts(), (3, 3));
     let t = top(&mut app, W);
-    assert!(t.contains("◐3 在跑") && t.contains("◆3 等你"), "{t}");
+    assert!(t.contains("◐3 在跑") && t.contains("◆3 待处理"), "{t}");
     // 停在哪家都显示三家合计。
     app.key(key(KeyCode::Tab));
-    assert!(top(&mut app, W).contains("◐3 在跑  ◆3 等你"));
+    assert!(top(&mut app, W).contains("◐3 在跑  ◆3 待处理"));
 
-    // 状态颜色：在跑绿、等你黄。
+    // 状态颜色：在跑绿、等你黄，符号和数字是状态色，后面的字是次要色。
     let buf = render(&mut app, W, H);
-    assert_eq!(
-        buf[cell_of(&buf, "◐")].fg,
-        Theme::DARK.state(SessionState::Running)
+    let (run, wait) = (
+        Theme::DARK.state(SessionState::Running),
+        Theme::DARK.state(SessionState::Waiting),
     );
-    assert_eq!(
-        buf[cell_of(&buf, "◆")].fg,
-        Theme::DARK.state(SessionState::Waiting)
-    );
+    let at = cell_of(&buf, "◐");
+    assert_eq!(buf[at].fg, run);
+    assert_eq!(buf[(at.0 + 1, at.1)].fg, run, "在跑的数字");
+    assert_eq!(buf[cell_of(&buf, "在")].fg, Theme::DARK.muted);
+    let at = cell_of(&buf, "◆");
+    assert_eq!(buf[at].fg, wait);
+    assert_eq!(buf[(at.0 + 1, at.1)].fg, wait, "待处理的数字");
+    assert_eq!(buf[cell_of(&buf, "待")].fg, Theme::DARK.muted);
 
     // 只剩在跑的：只显示在跑；都没有就都不显示。
     for id in ["c-shop-2", "c-blog-1", "p-blog-1"] {
@@ -122,7 +126,16 @@ fn unseen_results_blink_slowly_unless_turned_off() {
     assert!(!app.tick_blink(Duration::ZERO));
     assert_eq!(waiting_fg(&mut app), bright);
     assert!(app.tick_blink(BLINK_HALF));
-    assert_eq!(waiting_fg(&mut app), Theme::DARK.faint);
+    assert_eq!(waiting_fg(&mut app), Theme::DARK.blink_dim(bright));
+    // 暗半拍只动 ◆：后面的数字和「待处理」颜色不变。
+    let buf = render(&mut app, W, H);
+    let mark = cell_of(&buf, "◆");
+    assert_eq!(buf[(mark.0 + 1, mark.1)].fg, bright, "数字不闪");
+    assert_eq!(
+        buf[cell_of(&buf, "待")].fg,
+        Theme::DARK.muted,
+        "「待处理」不闪"
+    );
     // 半拍内一直暗着（有在跑的对话时转圈照样换帧，所以这里不看返回值）。
     app.tick_blink(BLINK_HALF + Duration::from_millis(500));
     assert!(app.blink_dim, "半拍内一直暗着");
@@ -166,7 +179,11 @@ fn unseen_results_blink_slowly_unless_turned_off() {
     }
     app.tick_blink(BLINK_HALF);
     assert!(!app.blink_dim, "只剩看过的不闪");
-    assert!(top(&mut app, W).contains("◆1 等你"), "{}", top(&mut app, W));
+    assert!(
+        top(&mut app, W).contains("◆1 待处理"),
+        "{}",
+        top(&mut app, W)
+    );
     assert_eq!(waiting_fg(&mut app), bright);
 
     // 没有等你回复的就不闪。
@@ -220,7 +237,7 @@ fn bang_without_waiting_says_so() {
     let before = selected(&app);
     assert!(bang(&mut app).is_empty());
     assert_eq!(selected(&app), before);
-    assert_eq!(app.status.as_deref(), Some("没有等你回复的对话"));
+    assert_eq!(app.status.as_deref(), Some("没有待处理的对话"));
 }
 
 #[test]
@@ -356,7 +373,7 @@ fn help_lists_new_keys() {
     let mut app = demo_app(Vendor::Claude);
     app.key(key(KeyCode::Char('?')));
     let text = dump(&render(&mut app, W, 40));
-    for k in ["下一条等你回复的", "复制恢复命令", "顶栏 ◆"] {
+    for k in ["下一条待处理的", "复制恢复命令", "顶栏 ◆"] {
         assert!(text.contains(k), "帮助页缺「{k}」：{text}");
     }
 }
