@@ -2,6 +2,7 @@
 //! 缓存在会话台数据目录的 `cli-versions.json`，按厂商记数据源、上次查的时间、查到的版本和 ETag。
 
 use std::collections::BTreeMap;
+use std::env::consts::ARCH;
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -19,6 +20,9 @@ pub const CACHE_FILE: &str = "cli-versions.json";
 pub const CHECK_EVERY: Duration = Duration::from_secs(20 * 60 * 60);
 /// 每个请求的超时。
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 厂商 → 上次查到的。
+type Cache = BTreeMap<String, Entry>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -48,8 +52,7 @@ impl Status {
     /// 比本机新的最新版。版本号认不出（预发布后缀之类）不算新，免得误报。
     pub fn newer(&self) -> Option<&str> {
         let latest = self.latest.as_deref()?;
-        let current = self.install.version.as_deref()?;
-        release::is_newer(latest, current).then_some(latest)
+        self.install.older_than(latest).then_some(latest)
     }
 }
 
@@ -61,22 +64,14 @@ pub fn check(
     bases: &Bases,
     timeout: Duration,
 ) -> Vec<Status> {
-    let path = data_dir.join(CACHE_FILE);
-    let mut cache: BTreeMap<String, Entry> = fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let arch = std::env::consts::ARCH;
+    let mut cache = load(data_dir);
     let mut changed = false;
     let out = thread::scope(|s| {
         let jobs: Vec<_> = installs
             .into_iter()
             .map(|install| {
-                let feed = feed_for(&install, arch);
-                let old = cache
-                    .get(install.vendor.key())
-                    .filter(|e| feed.as_ref().is_some_and(|f| f.key() == e.feed))
-                    .cloned();
+                let feed = feed_for(&install, ARCH);
+                let old = feed.as_ref().and_then(|f| cached(&cache, &install, f));
                 let job = feed
                     .clone()
                     .filter(|_| {
@@ -110,30 +105,9 @@ pub fn check(
                         latest: e.latest,
                     };
                 };
-                let fresh = job.join().ok().flatten();
                 let mut entry = old.unwrap_or_default();
                 entry.feed = feed.map(|f| f.key()).unwrap_or_default();
-                entry.checked_at = now;
-                // 304（没变）或失败：沿用上次的。
-                if let Some((latest, etag)) = fresh {
-                    if latest.is_some() {
-                        if latest != entry.latest {
-                            entry.seen_at = behind_since(
-                                entry.latest.as_deref(),
-                                entry.seen_at,
-                                install.version.as_deref(),
-                                now,
-                            );
-                        }
-                        entry.latest = latest;
-                    }
-                    if etag.is_some() {
-                        entry.etag = etag;
-                    }
-                }
-                if entry.seen_at == 0 && entry.latest.is_some() {
-                    entry.seen_at = now;
-                }
+                entry.update(job.join().ok().flatten(), &install, now);
                 cache.insert(install.vendor.key().to_owned(), entry.clone());
                 changed = true;
                 Status {
@@ -145,14 +119,80 @@ pub fn check(
             .collect()
     });
     if changed {
-        // 写不进去只是下次再问一次，不打扰。先写临时文件再改名，两个会话台同时写也不会写出半个文件。
-        let tmp = data_dir.join(format!(".{CACHE_FILE}.{}", std::process::id()));
-        let _ = fs::create_dir_all(data_dir)
-            .and_then(|()| fs::write(&tmp, serde_json::to_vec_pretty(&cache).unwrap_or_default()))
-            .and_then(|()| fs::rename(&tmp, &path));
-        let _ = fs::remove_file(&tmp);
+        save(data_dir, &cache);
     }
     out
+}
+
+/// 马上重查一家的最新版，不看 20 小时缓存（升之前用：装法不能指定版本的，装上的是它那边此刻的最新版）。
+/// 查到的写回缓存，界面和 `ai doctor` 跟着变；没问到是 `None`，缓存不动。
+pub(super) fn recheck(
+    data_dir: &Path,
+    install: &Install,
+    now: u64,
+    bases: &Bases,
+    timeout: Duration,
+) -> Option<String> {
+    let feed = feed_for(install, ARCH)?;
+    let mut cache = load(data_dir);
+    let mut entry = cached(&cache, install, &feed).unwrap_or_default();
+    let fresh = ask(&feed, bases, entry.etag.as_deref(), timeout)?;
+    entry.feed = feed.key();
+    entry.update(Some(fresh), install, now);
+    let latest = entry.latest.clone();
+    cache.insert(install.vendor.key().to_owned(), entry);
+    save(data_dir, &cache);
+    latest
+}
+
+impl Entry {
+    /// 记下这次问的结果：304（没变）或失败（`None`）沿用上次的。
+    fn update(&mut self, fresh: Option<Answer>, install: &Install, now: u64) {
+        self.checked_at = now;
+        if let Some((latest, etag)) = fresh {
+            if latest.is_some() {
+                if latest != self.latest {
+                    self.seen_at = behind_since(
+                        self.latest.as_deref(),
+                        self.seen_at,
+                        install.version.as_deref(),
+                        now,
+                    );
+                }
+                self.latest = latest;
+            }
+            if etag.is_some() {
+                self.etag = etag;
+            }
+        }
+        if self.seen_at == 0 && self.latest.is_some() {
+            self.seen_at = now;
+        }
+    }
+}
+
+fn load(data_dir: &Path) -> Cache {
+    fs::read(data_dir.join(CACHE_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// 这家在缓存里的那条；换了数据源（装法变了）的不算。
+fn cached(cache: &Cache, install: &Install, feed: &Feed) -> Option<Entry> {
+    cache
+        .get(install.vendor.key())
+        .filter(|e| e.feed == feed.key())
+        .cloned()
+}
+
+/// 写不进去只是下次再问一次，不打扰。先写临时文件再改名，两个会话台同时写也不会写出半个文件。
+fn save(data_dir: &Path, cache: &Cache) {
+    let tmp = data_dir.join(format!(".{CACHE_FILE}.{}", std::process::id()));
+    let _ = fs::create_dir_all(data_dir)
+        .and_then(|()| fs::write(&tmp, serde_json::to_vec_pretty(cache).unwrap_or_default()))
+        .and_then(|()| fs::rename(&tmp, data_dir.join(CACHE_FILE)));
+    let _ = fs::remove_file(&tmp);
 }
 
 /// 查到的最新版换了一个时，本机「落后」从什么时候算：上次查到的那一版就已经比本机新（本机一直没跟上），
@@ -165,13 +205,11 @@ fn behind_since(old_latest: Option<&str>, old_since: u64, current: Option<&str>,
     }
 }
 
-/// 问一次：成功给出（查到的版本，新的 ETag），304 时版本是 `None`；连不上、超时、格式不认识都是 `None`。
-fn ask(
-    feed: &Feed,
-    bases: &Bases,
-    etag: Option<&str>,
-    timeout: Duration,
-) -> Option<(Option<String>, Option<String>)> {
+/// 问到的（查到的版本，新的 ETag）；304 时版本是 `None`。
+type Answer = (Option<String>, Option<String>);
+
+/// 问一次；连不上、超时、格式不认识都是 `None`。
+fn ask(feed: &Feed, bases: &Bases, etag: Option<&str>, timeout: Duration) -> Option<Answer> {
     let if_none = etag
         .filter(|_| feed.uses_etag())
         .map(|e| format!("If-None-Match: {e}"));

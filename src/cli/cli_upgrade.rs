@@ -2,7 +2,6 @@
 //! 和 `ai doctor` 一样用登录 shell 的 PATH 找；点名的那家只要有新版、会话台能替它跑就升（自带自动更新的也升，
 //! 主人点了名）；`--all` 只升界面上「更新」按钮会升的那几家。
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use crate::clis::{self, Runner, Status};
@@ -38,25 +37,18 @@ pub fn run(vendor: Option<Vendor>, data_dir: &Path, mut say: impl FnMut(Line)) {
         Ok(t) => t,
         Err(msg) => return say(msg),
     };
-    // 守护进程答不上来就当每家都有对话在跑：npm 一类原地覆盖的这次不升。
-    let hosted = host::client::hosted_vendors(data_dir)
-        .unwrap_or_else(|_| Vendor::ALL.into_iter().collect::<HashSet<_>>());
     let runner = Runner {
         login: &login,
         home: &home,
         data_dir,
         timeout: clis::UPGRADE_TIMEOUT,
+        hosted: &|| host::client::hosted_vendors(data_dir),
+        processes: &clis::processes,
     };
     for s in targets {
         let latest = s.newer().unwrap_or_default();
         eprintln!("升级 {} {} → {latest} …", s.install.vendor, version(s));
-        let r = clis::upgrade(
-            &s.install,
-            latest,
-            hosted.contains(&s.install.vendor),
-            false,
-            &runner,
-        );
+        let r = clis::upgrade(&s.install, latest, false, &runner);
         say(line(s.install.vendor, r));
     }
 }

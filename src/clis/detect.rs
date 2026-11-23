@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::core::Vendor;
+use crate::core::{Vendor, release};
 
 /// 每家的命令名和各渠道里的包名。
 pub(super) struct Cli {
@@ -61,6 +61,9 @@ pub fn program(vendor: Vendor) -> &'static str {
     cli(vendor).program
 }
 
+/// Volta 放各个包的目录（家目录下）。
+const VOLTA_PACKAGES: &str = ".volta/tools/image/packages";
+
 /// Node 包管理器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Manager {
@@ -82,15 +85,16 @@ impl Manager {
         }
     }
 
-    /// 全局装某个包的最新版。npm 官方说升 Claude Code 用 `install -g …@latest`，不要 `update -g`。
-    pub fn install_cmd(self, package: &str) -> String {
-        match self {
-            Manager::Npm => format!("npm install -g {package}@latest"),
-            Manager::Pnpm => format!("pnpm add -g {package}@latest"),
-            Manager::Yarn => format!("yarn global add {package}@latest"),
-            Manager::Bun => format!("bun add -g {package}@latest"),
-            Manager::Volta => format!("volta install {package}@latest"),
-        }
+    /// 全局装某个包的 `version` 这一版（`latest` 是最新版）。npm 官方说升 Claude Code 用 `install -g`，不要 `update -g`。
+    pub fn install_cmd(self, package: &str, version: &str) -> String {
+        let install = match self {
+            Manager::Npm => "npm install -g",
+            Manager::Pnpm => "pnpm add -g",
+            Manager::Yarn => "yarn global add",
+            Manager::Bun => "bun add -g",
+            Manager::Volta => "volta install",
+        };
+        format!("{install} {package}@{version}")
     }
 }
 
@@ -154,6 +158,53 @@ pub struct Install {
     /// 当前版本（`v` 去掉）；路径里读不出时由 `locate` 问 `--version` 补上，问不出是 `None`。
     pub version: Option<String>,
     pub problem: Option<Problem>,
+}
+
+impl Install {
+    /// `version` 比本机装着的新。哪边的版本号认不出（没问出、预发布后缀之类）都不算。
+    pub fn older_than(&self, version: &str) -> bool {
+        self.version
+            .as_deref()
+            .is_some_and(|cur| release::is_newer(version, cur))
+    }
+
+    /// 升级会换掉的那一块：npm 包的目录、Homebrew 里这个名字的目录、官方安装器放各版本的目录；别的是程序本身。
+    /// 从这里面起的进程就是在用这一份。
+    pub(super) fn replaced(&self, home: &Path) -> PathBuf {
+        let marker: Vec<&str> = match &self.method {
+            // 真身是转发程序，看不出包（见 `volta`）。
+            Method::Package {
+                manager: Manager::Volta,
+                package,
+            } => {
+                return fs::canonicalize(home)
+                    .unwrap_or_else(|_| home.to_owned())
+                    .join(VOLTA_PACKAGES)
+                    .join(package);
+            }
+            Method::Package { package, .. } => std::iter::once("node_modules")
+                .chain(package.split('/'))
+                .collect(),
+            Method::Formula(name) => vec!["Cellar", name],
+            Method::Cask(name) => vec!["Caskroom", name],
+            Method::Native => match self.vendor {
+                Vendor::Claude => vec![".local", "share", "claude", "versions"],
+                Vendor::Codex => vec!["packages", "standalone", "releases"],
+                Vendor::Pi => vec![".pi", "agent", "install"],
+                Vendor::Hermes => vec![".hermes", "hermes-agent"],
+                _ => return self.real.clone(),
+            },
+            Method::Unknown => return self.real.clone(),
+        };
+        let parts = normal_parts(&self.real);
+        parts
+            .windows(marker.len())
+            .rposition(|w| w == marker)
+            .map_or_else(
+                || self.real.clone(),
+                |i| Path::new("/").join(parts[..i + marker.len()].iter().collect::<PathBuf>()),
+            )
+    }
 }
 
 /// 认的时候要用的本机情况。
@@ -257,9 +308,9 @@ fn volta(path: &Path, home: &Path, packages: &[&'static str]) -> Option<Found> {
     let package = packages
         .iter()
         .copied()
-        .find(|p| home.join(".volta/tools/image/packages").join(p).exists())
+        .find(|p| home.join(VOLTA_PACKAGES).join(p).exists())
         .or_else(|| packages.first().copied())?;
-    let image = home.join(".volta/tools/image/packages").join(package);
+    let image = home.join(VOLTA_PACKAGES).join(package);
     let version = package_version(&image.join("lib/node_modules").join(package));
     Some((
         Method::Package {
@@ -267,7 +318,7 @@ fn volta(path: &Path, home: &Path, packages: &[&'static str]) -> Option<Found> {
             package,
         },
         version,
-        Some(home.join(".volta/tools/image/packages")),
+        Some(home.join(VOLTA_PACKAGES)),
     ))
 }
 

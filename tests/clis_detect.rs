@@ -131,7 +131,7 @@ fn claude_native_cask_and_npm() {
     let p = plan(&i, Some("2.1.330"));
     assert_eq!(
         p.command.as_deref(),
-        Some("npm install -g @anthropic-ai/claude-code@latest")
+        Some("npm install -g @anthropic-ai/claude-code@2.1.330")
     );
     assert_eq!(p.how, How::SelfUpdates);
 }
@@ -423,7 +423,7 @@ fn npm_prefix_mismatch_only_shows_the_command() {
     let p = plan(&i, Some("0.171.0"));
     assert_eq!(
         p.command.as_deref(),
-        Some("npm install -g @openai/codex@latest")
+        Some("npm install -g @openai/codex@0.171.0")
     );
     assert!(
         matches!(&p.how, How::Manual(why) if why.contains("npm prefix -g")),

@@ -192,8 +192,7 @@ impl Source for ClaudeSource {
             .ok_or_else(unsupported)?;
         let saved = b.save(&session.path, &to)?;
         if saved == Saved::Fresh && check && backup::verify(&to).is_err() {
-            std::fs::remove_file(&to)?;
-            return b.save(&session.path, &to);
+            return b.rewrite(&session.path, &to);
         }
         Ok(saved)
     }

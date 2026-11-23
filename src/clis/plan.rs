@@ -1,6 +1,6 @@
-//! 会怎么升级：按装法给出官方升级命令，和它能不能交给会话台去跑（这一版只说，不跑）。
+//! 会怎么升级：按装法给出官方升级命令，和它能不能交给会话台去跑（跑在 `upgrade`）。
 
-use crate::core::Vendor;
+use crate::core::{Vendor, release};
 
 use super::detect::{Install, Method, Problem};
 
@@ -22,9 +22,9 @@ pub enum How {
     Manual(String),
 }
 
-/// 这家这么装的，升级用什么命令；`latest` 是查到的最新版（看跨不跨大版本）。
+/// 这家这么装的，升级用什么命令；`latest` 是查到的最新版（看跨不跨大版本；能指定版本的命令就装这一版）。
 pub fn plan(install: &Install, latest: Option<&str>) -> Plan {
-    let (command, self_updates) = command(install);
+    let (command, self_updates) = command(install, latest);
     let manual = |why: String| Plan {
         command: command.clone(),
         how: How::Manual(why),
@@ -73,8 +73,13 @@ pub fn plan(install: &Install, latest: Option<&str>) -> Plan {
     }
 }
 
+/// 升级命令里能写死装哪一版：包管理器装的能；pi 走 `pi update`，Homebrew 和各家安装器只装它们那边此刻的最新版。
+pub(super) fn takes_version(install: &Install) -> bool {
+    matches!(install.method, Method::Package { .. }) && install.vendor != Vendor::Pi
+}
+
 /// 官方升级命令，和这种装法它自己会不会自动装新版。
-fn command(install: &Install) -> (Option<String>, bool) {
+fn command(install: &Install, latest: Option<&str>) -> (Option<String>, bool) {
     let v = install.vendor;
     let cmd = |s: &str| Some(s.to_owned());
     match &install.method {
@@ -84,7 +89,7 @@ fn command(install: &Install) -> (Option<String>, bool) {
         // pi 按它自己认的装法升级；curl 装的只能交给它，我们不碰 `~/.pi/agent/*`。
         _ if v == Vendor::Pi => (cmd("pi update"), false),
         Method::Package { manager, package } => (
-            Some(manager.install_cmd(package)),
+            Some(manager.install_cmd(package, wanted(install, latest))),
             matches!(v, Vendor::Claude | Vendor::Kimi | Vendor::Gemini),
         ),
         Method::Native => match v {
@@ -106,6 +111,14 @@ fn command(install: &Install) -> (Option<String>, bool) {
             _ => (None, false),
         },
     }
+}
+
+/// 包管理器装哪一版：查到的 `latest` 比本机新就装它（比过的一定全是数字，能放进命令）；不然没有要升的，
+/// 只是给人看的命令，写 `latest`。
+fn wanted<'a>(install: &Install, latest: Option<&'a str>) -> &'a str {
+    latest
+        .filter(|l| install.older_than(l))
+        .map_or("latest", release::display_version)
 }
 
 /// 大版本号。

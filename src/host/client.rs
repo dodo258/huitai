@@ -509,15 +509,13 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 #[derive(Debug)]
 struct DetachKey {
     key: BackKey,
-    pasting: bool,
+    /// 在括号粘贴里，值是粘贴结尾已经对上的字节数：结尾拆在两次读里也认得出。
+    paste: Option<usize>,
 }
 
 impl DetachKey {
     fn new(key: BackKey) -> Self {
-        Self {
-            key,
-            pasting: false,
-        }
+        Self { key, paste: None }
     }
 
     /// 返回脱离键在 `input` 里的位置：前面的字节照常转给 CLI，它和它后面的都不转（就要脱开了）。没有返回 `None`。
@@ -529,17 +527,18 @@ impl DetachKey {
         let mut i = 0;
         while i < input.len() {
             let rest = &input[i..];
-            if self.pasting {
-                if rest.starts_with(PASTE_END) {
-                    self.pasting = false;
-                    i += PASTE_END.len();
+            if let Some(matched) = self.paste {
+                let matched = if rest[0] == PASTE_END[matched] {
+                    matched + 1
                 } else {
-                    i += 1;
-                }
+                    usize::from(rest[0] == PASTE_END[0])
+                };
+                self.paste = (matched < PASTE_END.len()).then_some(matched);
+                i += 1;
                 continue;
             }
             if rest.starts_with(PASTE_START) {
-                self.pasting = true;
+                self.paste = Some(0);
                 i += PASTE_START.len();
                 continue;
             }
@@ -1137,6 +1136,22 @@ mod tests {
             [None, None, Some(8)]
         );
         assert_eq!(detach_at(&[b"\x1b[200~\x1c\x1b[201~"]), [None]);
+        // 粘贴结尾不管从哪拆成两次读，粘完再按都算。
+        let end = b"\x1b[201~";
+        for at in 0..=end.len() {
+            let first = [b"\x1b[200~\x1c", &end[..at]].concat();
+            let second = [&end[at..], b"\x1c"].concat();
+            assert_eq!(
+                detach_at(&[&first, &second]),
+                [None, Some(end.len() - at)],
+                "拆在 {at}"
+            );
+        }
+        // 粘贴内容里像结尾的前半截不算结尾。
+        assert_eq!(
+            detach_at(&[b"\x1b[200~\x1b[20\x1c\x1b[201\x1b\x1b[201~"]),
+            [None]
+        );
     }
 
     #[test]

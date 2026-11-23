@@ -319,7 +319,8 @@ pub(super) enum CliRequest {
 }
 
 /// 各家 CLI：起来时查一次，之后每小时再看一次（真去联网由 `clis` 的 20 小时缓存管），每轮把有新版的、
-/// 能一键升的报上去；设置里开着自动升级时顺手把能自动升的升了（那家有托管对话在跑就等，10 分钟后再看）。
+/// 能一键升的报上去；设置里开着自动升级时顺手把能自动升的升了（那家有在跑的就跳过、10 分钟后再看，
+/// 同一版只在状态栏说一次为什么）。
 /// 收到 [`CliRequest::UpgradeAll`] 就一家家升、报进度。升级都在这一个线程里，同一个会话台不会同时跑两个升级。
 /// 会话台开着时主人升了级，下一轮找到的就是新版本，标记跟着消失；主人在设置里关了「检查新版本」，
 /// 下一轮起就不找、不联网（每轮先看一眼设置文件）。
@@ -333,6 +334,9 @@ pub(super) fn cli_versions_worker(
     let (req, rx) = mpsc::channel::<CliRequest>();
     thread::spawn(move || {
         let config = data_dir.join("config.json");
+        // 说过为什么没自动升的：哪家、哪一版。
+        let mut told = HashSet::new();
+        let mut upgraded = false;
         loop {
             let snap = config_flag(&config, "check_updates", true)
                 .then(|| clis::snapshot(&home, &data_dir))
@@ -349,11 +353,20 @@ pub(super) fn cli_versions_worker(
                 .as_ref()
                 .filter(|_| config_flag(&config, "auto_upgrade_clis", true))
             {
-                let (results, pending) = auto_upgrade(snap, &home, &data_dir, now);
-                if pending {
+                let (results, skipped) = auto_upgrade(snap, &home, &data_dir, now);
+                if !skipped.is_empty() {
                     wait = RETRY;
                 }
-                if !results.is_empty() {
+                // 这一轮或紧挨着的上一轮刚说过「已自动升级」，不盖掉它，10 分钟后那一轮再说。
+                if results.is_empty()
+                    && !upgraded
+                    && let Some(text) = skip_note(skipped, &mut told)
+                    && tx.send(Msg::Status(text)).is_err()
+                {
+                    return;
+                }
+                upgraded = !results.is_empty();
+                if upgraded {
                     if tx.send(Msg::CliAuto(results)).is_err() {
                         return;
                     }
@@ -393,14 +406,14 @@ fn cli_report(snap: Option<&clis::Snapshot>, now: u64) -> CliReport {
     }
 }
 
-/// 自动升级这一轮：能自动升的（[`clis::auto_due`]）、此刻没有托管对话在跑的那几家，一家家升。
-/// 返回升了的结果，和还有没有因为对话在跑、锁被占着、问不到守护进程而等着的（等着的 10 分钟后再看）。
+/// 自动升级这一轮：能自动升的（[`clis::auto_due`]）一家家升，轮到时有在跑的就跳过。返回升了的结果，
+/// 和这次没跑的（有在跑的、它自己在更新、别的会话台在升）：哪家、要升到哪一版、为什么；这些 10 分钟后再看。
 fn auto_upgrade(
     snap: &clis::Snapshot,
     home: &Path,
     data_dir: &Path,
     now: u64,
-) -> (Vec<CliResult>, bool) {
+) -> (Vec<CliResult>, Vec<(Vendor, String, String)>) {
     let last = clis::last_results(data_dir);
     let due: Vec<&clis::Status> = snap
         .statuses
@@ -408,38 +421,45 @@ fn auto_upgrade(
         .filter(|s| clis::auto_due(s, now, last.get(&s.install.vendor)))
         .collect();
     if due.is_empty() {
-        return (Vec::new(), false);
+        return (Vec::new(), Vec::new());
     }
-    let Ok(hosted) = host::client::hosted_vendors(data_dir) else {
-        return (Vec::new(), true);
-    };
     let runner = clis::Runner {
         login: &snap.login,
         home,
         data_dir,
         timeout: clis::UPGRADE_TIMEOUT,
+        hosted: &|| host::client::hosted_vendors(data_dir),
+        processes: &clis::processes,
     };
-    let mut pending = false;
+    let mut skipped = Vec::new();
     let mut out = Vec::new();
     for s in due {
         let vendor = s.install.vendor;
-        if hosted.contains(&vendor) {
-            pending = true;
-            continue;
-        }
         let Some(target) = s.newer() else {
             continue;
         };
-        let r = clis::upgrade(&s.install, target, false, true, &runner);
-        if r.is_err() {
-            // 被挡住（它自己在更新、别的会话台在升）：没跑，过会儿再看。
-            pending = true;
+        let r = clis::upgrade(&s.install, target, true, &runner);
+        if let Err(b) = r {
+            skipped.push((vendor, target.to_owned(), b.reason));
             continue;
         }
         let (ok, text) = clis::summary(&r);
         out.push(CliResult { vendor, ok, text });
     }
-    (out, pending)
+    (out, skipped)
+}
+
+/// 还没说过的那几家为什么没自动升，合成状态栏的一句；都说过了是 `None`。
+fn skip_note(
+    skipped: Vec<(Vendor, String, String)>,
+    told: &mut HashSet<(Vendor, String)>,
+) -> Option<String> {
+    let parts: Vec<String> = skipped
+        .into_iter()
+        .filter(|(vendor, target, _)| told.insert((*vendor, target.clone())))
+        .map(|(vendor, target, why)| format!("{} {target}（{why}）", vendor.name()))
+        .collect();
+    (!parts.is_empty()).then(|| format!("暂不自动升级：{}", parts.join("、")))
 }
 
 /// 一键升级：重新找一遍（最新版用缓存），把能一键升的一家家升，每升完一家报一次进度。
@@ -453,14 +473,13 @@ fn upgrade_all(home: &Path, data_dir: &Path, tx: &Sender<Msg>) -> Vec<CliResult>
         .iter()
         .filter(|s| s.upgrade_now(now).is_some())
         .collect();
-    // 守护进程答不上来就当每家都有对话在跑：npm 一类原地覆盖的这次不升。
-    let hosted = host::client::hosted_vendors(data_dir)
-        .unwrap_or_else(|_| Vendor::ALL.into_iter().collect());
     let runner = clis::Runner {
         login: &snap.login,
         home,
         data_dir,
         timeout: clis::UPGRADE_TIMEOUT,
+        hosted: &|| host::client::hosted_vendors(data_dir),
+        processes: &clis::processes,
     };
     let total = targets.len();
     let _ = tx.send(Msg::CliProgress(0, total));
@@ -468,7 +487,7 @@ fn upgrade_all(home: &Path, data_dir: &Path, tx: &Sender<Msg>) -> Vec<CliResult>
     for (i, s) in targets.into_iter().enumerate() {
         let vendor = s.install.vendor;
         let target = s.newer().unwrap_or_default();
-        let r = clis::upgrade(&s.install, target, hosted.contains(&vendor), false, &runner);
+        let r = clis::upgrade(&s.install, target, false, &runner);
         let (ok, text) = clis::summary(&r);
         out.push(CliResult { vendor, ok, text });
         let _ = tx.send(Msg::CliProgress(i + 1, total));
@@ -672,5 +691,27 @@ mod tests {
         );
         assert!(cli_checks_on(&config));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一家同一版只说一次为什么没自动升（每 10 分钟看一轮，不反复说）；出了下一版再说。
+    #[test]
+    fn says_why_a_version_was_skipped_once() {
+        let skip = |v, target: &str, why: &str| (v, target.to_owned(), why.to_owned());
+        let mut told = HashSet::new();
+        assert_eq!(skip_note(Vec::new(), &mut told), None);
+        assert_eq!(
+            skip_note(
+                vec![
+                    skip(Vendor::Codex, "0.172.0", "有对话在用"),
+                    skip(Vendor::Pi, "1.5.3", "别处有 1 个它的进程在跑"),
+                ],
+                &mut told
+            )
+            .as_deref(),
+            Some("暂不自动升级：Codex 0.172.0（有对话在用）、pi 1.5.3（别处有 1 个它的进程在跑）")
+        );
+        let again = |target| vec![skip(Vendor::Codex, target, "别处有 2 个它的进程在跑")];
+        assert_eq!(skip_note(again("0.172.0"), &mut told), None);
+        assert!(skip_note(again("0.173.0"), &mut told).is_some());
     }
 }

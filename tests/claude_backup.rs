@@ -224,6 +224,48 @@ fn near_deletion_check_rewrites_a_broken_backup() {
     backup::verify(&bk).unwrap();
 }
 
+/// 校验没过、重写又失败：旧备份留着（校验没过可能只是一时读不了），能重写了再换上。
+#[test]
+fn near_deletion_check_keeps_the_old_backup_when_rewriting_fails() {
+    let k = Kit::new("backup-check-fails");
+    k.write("s1", "问题", "回答");
+    let src = k.source();
+    let index = k.open();
+    let s = index.list(Vendor::Claude).unwrap().remove(0).session;
+    src.back_up(&s, false).unwrap();
+    let original = k.env.session_path("s1");
+    let text = fs::read(&original).unwrap();
+    let bk = k.backup_path("s1");
+    let chmod = |p: &Path, mode| fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+
+    // 备份一时读不了（内容是好的），原文件也读不了。
+    chmod(&bk, 0o000);
+    chmod(&original, 0o000);
+    let failed = src.back_up(&s, true);
+    chmod(&original, 0o600);
+    assert!(failed.is_err(), "{failed:?}");
+    assert!(bk.exists(), "重写失败不能连旧备份也没了");
+    chmod(&bk, 0o600);
+    assert_eq!(unzstd(&bk), text);
+    let dir = bk.parent().unwrap();
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 1, "临时文件没清");
+
+    // 备份真坏了、原文件又读不了：坏的也先留着，原文件读得了了再换成好的。
+    let mtime = fs::metadata(&bk).unwrap().modified().unwrap();
+    let f = fs::File::options().write(true).open(&bk).unwrap();
+    f.set_len(5).unwrap();
+    f.set_modified(mtime).unwrap();
+    drop(f);
+    chmod(&original, 0o000);
+    let failed = src.back_up(&s, true);
+    chmod(&original, 0o600);
+    assert!(failed.is_err(), "{failed:?}");
+    assert_eq!(fs::metadata(&bk).unwrap().len(), 5);
+    assert_eq!(src.back_up(&s, true).unwrap(), Saved::Written);
+    assert_eq!(unzstd(&bk), text);
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 1);
+}
+
 #[test]
 fn trash_takes_the_backup_along_and_restore_brings_it_back() {
     let k = Kit::new("backup-trash");

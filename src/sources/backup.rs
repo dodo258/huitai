@@ -3,6 +3,7 @@
 //!
 //! - 备份目录：`<会话台数据目录>/backups/claude/`，别的账号在它下面再分一层 `<账号短名>/`；目录都是 0700，文件 0600。
 //! - 只读厂商文件：备份是复制出来压缩，原文件不改不删。备份的修改时间设成原文件的，两边不一样就是原文件变了，重写。
+//! - 换备份先写同目录的临时文件，落盘、完整解过一遍没坏才原子改名换上（`replace`）：哪一步出错，旧备份都原样留着。
 //! - 原文件没了只剩备份：读的时候解到备份目录下的 `.open/` 临时文件里读，读完就删（[`Plain`]），不往厂商目录写。
 //! - 唯一会写进厂商目录的是主人明确要的「放回」（[`put_back`]），原处已有同名文件不覆盖。
 
@@ -76,26 +77,25 @@ impl Backups {
         Some(projects.join(rel).with_extension(""))
     }
 
-    /// 备份或更新 `original`：备份的修改时间和原文件一样就不动；否则压缩写进临时文件、改名换上，
-    /// 修改时间设成读之前原文件的（读的时候原文件又变了，下一轮再更新）。原文件只读。
+    /// 备份或更新 `original`：备份的修改时间和原文件一样就不动，否则 [`Self::rewrite`]。
     pub fn save(&self, original: &Path, backup: &Path) -> io::Result<Saved> {
         let mtime = fs::metadata(original)?.modified()?;
         if fs::metadata(backup).and_then(|m| m.modified()).ok() == Some(mtime) {
             return Ok(Saved::Fresh);
         }
+        self.rewrite(original, backup)
+    }
+
+    /// 不管备份新不新都从 `original` 重写一份换上（出错时旧备份原样留着，见 `replace`），
+    /// 修改时间设成读之前原文件的（读的时候原文件又变了，下一轮再更新）。原文件只读。
+    pub fn rewrite(&self, original: &Path, backup: &Path) -> io::Result<Saved> {
+        let mtime = fs::metadata(original)?.modified()?;
         let dir = backup
             .parent()
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "备份路径没有上级目录"))?;
         make_dir(&self.root)?;
         make_dir(dir)?;
-        let tmp = temp_name(dir, ".saving");
-        let written = compress(original, &tmp)
-            .and_then(|f| f.set_modified(mtime))
-            .and_then(|()| fs::rename(&tmp, backup));
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        written.map(|()| Saved::Written)
+        replace(dir, backup, mtime, |tmp| compress(original, tmp)).map(|()| Saved::Written)
     }
 
     /// 原文件没了的备份：`<备份目录>/<项目目录>/<id>.jsonl.zst`，而 `<projects>/<项目目录>/<id>.jsonl` 不在。
@@ -273,6 +273,25 @@ fn compress(from: &Path, to: &Path) -> io::Result<File> {
     Ok(out)
 }
 
+/// 用 `write` 写出来的新件换掉 `backup`（在 `dir` 里）：先写同目录的临时文件，完整解一遍没坏、设好修改时间才改名换上。
+/// 写不成、校验不过、换不上都报错，清掉临时文件，旧的 `backup` 不动。
+fn replace(
+    dir: &Path,
+    backup: &Path,
+    mtime: SystemTime,
+    write: impl FnOnce(&Path) -> io::Result<File>,
+) -> io::Result<()> {
+    let tmp = temp_name(dir, ".saving");
+    let done = write(&tmp)
+        .and_then(|f| verify(&tmp).map(|()| f))
+        .and_then(|f| f.set_modified(mtime))
+        .and_then(|()| fs::rename(&tmp, backup));
+    if done.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    done
+}
+
 /// 解压 `from` 写进新文件 `to`。
 fn decompress(from: &Path, to: &Path) -> io::Result<File> {
     let mut d = zstd::stream::read::Decoder::new(File::open(from)?)?;
@@ -367,5 +386,47 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"{\"a\":1}\n");
         drop(plain);
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn failed_replace_keeps_the_old_backup() {
+        let d = temp("replace");
+        let orig = d.join("p/-x/s.jsonl");
+        fs::create_dir_all(orig.parent().unwrap()).unwrap();
+        fs::write(&orig, b"{\"a\":1}\n").unwrap();
+        let b = Backups::new(d.join("bk"));
+        let bk = b.path_for(&d.join("p"), &orig).unwrap();
+        b.save(&orig, &bk).unwrap();
+        let old = fs::read(&bk).unwrap();
+        let mtime = fs::metadata(&bk).unwrap().modified().unwrap();
+        let dir = bk.parent().unwrap();
+        let later = mtime + Duration::from_secs(60);
+        let untouched = |what: &str| {
+            assert_eq!(fs::read(&bk).unwrap(), old, "{what}");
+            assert_eq!(fs::metadata(&bk).unwrap().modified().unwrap(), mtime);
+            assert_eq!(
+                fs::read_dir(dir).unwrap().count(),
+                1,
+                "{what}：临时文件没清"
+            );
+        };
+
+        // 写到一半磁盘满了。
+        let full = replace(dir, &bk, later, |tmp| {
+            let mut f = create_private(tmp)?;
+            f.write_all(&old[..5])?;
+            Err(ErrorKind::StorageFull.into())
+        });
+        assert_eq!(full.unwrap_err().kind(), ErrorKind::StorageFull);
+        untouched("磁盘满");
+
+        // 写完了，但新件是截断的。
+        let broken = replace(dir, &bk, later, |tmp| {
+            let mut f = create_private(tmp)?;
+            f.write_all(&old[..5])?;
+            Ok(f)
+        });
+        assert!(broken.is_err());
+        untouched("新件校验不过");
     }
 }
