@@ -1,4 +1,5 @@
-//! `$` 额度面板：按账号一组，每组先写这个账号的额度（Claude、Codex、pi），再一行一个 provider 写余额或订阅额度；
+//! `$` 额度面板：按账号一组，每组先写这个账号的额度（Claude、Codex、pi），再一行一个 provider 写余额或订阅额度
+//! （额度窗口带重置倒计时）；
 //! 环境变量里的密钥单独一组。比例用 LineGauge 画（80% 黄、95% 红），没有公开文档的接口在行尾标出来。
 //! 另有顶栏用的 [`top_spans`]：pi / Hermes 显示它默认 provider 的读数。
 
@@ -13,13 +14,14 @@ use ratatui::widgets::{LineGauge, Widget};
 use super::app::App;
 use super::text::{ago, truncate, width};
 use super::theme::Theme;
-use super::view::{QUOTA_ALERT, QUOTA_WARN, bold, centered, fg, fill, row, sp, tokens};
+use super::view::{QUOTA_ALERT, QUOTA_WARN, bold, centered, fg, fill, reset_note, row, sp, tokens};
 use crate::core::{Account, QuotaValue, QuotaWindow, SessionState, Vendor};
 use crate::quota::{self, Balance, BalanceRow, BalanceValue, Money, OriginAccount};
 
-/// 一行里的一段：文字，或一条 LineGauge（前面带窗口名）。
+/// 一行里的一段：文字，重置倒计时（放不下时最先让出来），或一条 LineGauge（前面带窗口名）。
 enum Cell {
     Text(Span<'static>),
+    Reset(Span<'static>),
     Gauge {
         label: String,
         ratio: f64,
@@ -33,7 +35,7 @@ const BAR: u16 = 10;
 impl Cell {
     fn width(&self) -> u16 {
         match self {
-            Cell::Text(s) => width(&s.content) as u16,
+            Cell::Text(s) | Cell::Reset(s) => width(&s.content) as u16,
             Cell::Gauge { label, .. } => width(label) as u16 + 1 + BAR,
         }
     }
@@ -61,7 +63,13 @@ fn level(t: &Theme, used: f64, normal: Color) -> Color {
     }
 }
 
-fn window_cells(ws: &[QuotaWindow], t: &Theme, accent: Color) -> Vec<Cell> {
+/// 每个窗口：进度条、百分比；`now` 给了就在后面写重置倒计时（[`reset_note`]）。
+fn window_cells(
+    ws: &[QuotaWindow],
+    t: &Theme,
+    accent: Color,
+    now: Option<SystemTime>,
+) -> Vec<Cell> {
     let mut out = Vec::new();
     for (i, w) in ws.iter().enumerate() {
         if i > 0 {
@@ -77,6 +85,9 @@ fn window_cells(ws: &[QuotaWindow], t: &Theme, accent: Color) -> Vec<Cell> {
             format!(" {used:.0}%"),
             fg(level(t, used, t.text)),
         )));
+        if let Some(note) = now.and_then(|now| reset_note(w, now)) {
+            out.push(Cell::Reset(sp(format!(" · {note}"), fg(t.faint))));
+        }
     }
     out
 }
@@ -94,8 +105,8 @@ fn money(m: &Money) -> String {
     format!("{sign}{}{:.2}", currency(&m.currency), m.amount.abs())
 }
 
-/// 余额、额度的文字（顶栏和面板共用）；欠费、余额不够调用的标红。
-fn value_cells(v: &BalanceValue, t: &Theme, accent: Color) -> Vec<Cell> {
+/// 余额、额度的文字（顶栏和面板共用）；欠费、余额不够调用的标红。`now` 见 [`window_cells`]。
+fn value_cells(v: &BalanceValue, t: &Theme, accent: Color, now: Option<SystemTime>) -> Vec<Cell> {
     match v {
         BalanceValue::Money { amounts, available } => {
             let color = if *available { t.title } else { t.alert() };
@@ -135,15 +146,15 @@ fn value_cells(v: &BalanceValue, t: &Theme, accent: Color) -> Vec<Cell> {
                 ],
             }
         }
-        BalanceValue::Windows(ws) => window_cells(ws, t, accent),
+        BalanceValue::Windows(ws) => window_cells(ws, t, accent, now),
     }
 }
 
 /// 一个 provider 一行：名字、读数（或取不到的原因）、右边标非公开接口或密钥在哪。
-fn provider_line(r: &BalanceRow, t: &Theme, accent: Color) -> PanelLine {
+fn provider_line(r: &BalanceRow, now: SystemTime, t: &Theme, accent: Color) -> PanelLine {
     let mut cells = vec![Cell::Text(sp(name_col(r.provider.name()), fg(t.muted)))];
     match &r.result {
-        Ok(b) => cells.extend(value_cells(&b.value, t, accent)),
+        Ok(b) => cells.extend(value_cells(&b.value, t, accent, Some(now))),
         Err(e) => cells.push(Cell::Text(sp(format!("取不到：{e}"), fg(t.faint)))),
     }
     let right = if r.provider.unofficial() {
@@ -205,11 +216,14 @@ fn panel_lines(app: &App, t: &Theme) -> Vec<PanelLine> {
                     Cell::Text(sp(tokens(*n), fg(t.text))),
                     Cell::Text(sp(" token", fg(t.muted))),
                 ],
-                Some(QuotaValue::Windows(ws)) => window_cells(ws, t, accent),
+                Some(QuotaValue::Windows(ws)) => window_cells(ws, t, accent, Some(app.now)),
             });
             out.push(PanelLine { cells, right });
         }
-        out.extend(mine.into_iter().map(|r| provider_line(r, t, accent)));
+        out.extend(
+            mine.into_iter()
+                .map(|r| provider_line(r, app.now, t, accent)),
+        );
     }
     let env: Vec<&&BalanceRow> = rows
         .iter()
@@ -220,7 +234,10 @@ fn panel_lines(app: &App, t: &Theme) -> Vec<PanelLine> {
             out.push(text(sp("", Style::default())));
         }
         out.push(text(sp("环境变量", bold(t.muted))));
-        out.extend(env.into_iter().map(|r| provider_line(r, t, t.title)));
+        out.extend(
+            env.into_iter()
+                .map(|r| provider_line(r, app.now, t, t.title)),
+        );
     }
     match report {
         None => {
@@ -264,9 +281,19 @@ fn name_col(name: &str) -> String {
 /// 名字列宽：最长的「Moonshot 国际」13 格，再空两格。
 const NAME_W: usize = 15;
 
-fn draw_line(buf: &mut Buffer, area: Rect, line: PanelLine, t: &Theme) {
-    let left_w: u16 = line.cells.iter().map(Cell::width).sum();
-    // 右边的暗字放不下就不放，先保住读数。
+fn draw_line(buf: &mut Buffer, area: Rect, mut line: PanelLine, t: &Theme) {
+    let cells_w = |cells: &[Cell]| cells.iter().map(Cell::width).sum::<u16>();
+    // 放不下时先从后往前去掉重置倒计时，保住右边的暗字（「非公开接口，可能失效」、来源）；
+    // 倒计时都去掉了还放不下，右边的暗字才不放，先保住读数。
+    if let Some(right_w) = line.right.as_ref().map(|s| width(&s.content) as u16) {
+        while cells_w(&line.cells) + 2 + right_w > area.width {
+            let Some(i) = line.cells.iter().rposition(|c| matches!(c, Cell::Reset(_))) else {
+                break;
+            };
+            line.cells.remove(i);
+        }
+    }
+    let left_w = cells_w(&line.cells);
     let right = line
         .right
         .filter(|s| left_w + 2 + width(&s.content) as u16 <= area.width);
@@ -282,7 +309,7 @@ fn draw_line(buf: &mut Buffer, area: Rect, line: PanelLine, t: &Theme) {
         }
         let room = limit - x;
         match cell {
-            Cell::Text(s) => {
+            Cell::Text(s) | Cell::Reset(s) => {
                 let clipped = truncate(&s.content, usize::from(room));
                 buf.set_string(x, area.y, &clipped, s.style);
             }
@@ -317,7 +344,9 @@ fn draw_line(buf: &mut Buffer, area: Rect, line: PanelLine, t: &Theme) {
 pub fn draw(buf: &mut Buffer, area: Rect, app: &App, scroll: usize, t: &Theme) {
     let lines = panel_lines(app, t);
     let want = lines.len() as u16 + 4;
-    let boxr = centered(area, 100, want + 2);
+    // 最宽 124：两个额度窗口各带重置倒计时（最长「6 天 23 小时后重置」），右边的「非公开接口，可能失效」
+    // 也放得下（要 117 列）；终端窄了跟着收，放不下时倒计时先让（见 draw_line）。
+    let boxr = centered(area, 124, want + 2);
     fill(buf, boxr, t.bar);
     let inner = Rect {
         x: boxr.x + 3,
@@ -398,7 +427,8 @@ pub fn plain(v: &BalanceValue) -> String {
     }
 }
 
-/// 顶栏（pi / Hermes）：默认 provider 的读数。`with_source` 时后面跟「provider · 几分钟前」。
+/// 顶栏（pi / Hermes）：默认 provider 的读数。`with_source` 时后面跟「provider · 几分钟前」，
+/// `with_reset` 时额度窗口后面写重置倒计时。
 pub fn top_spans(
     row: &BalanceRow,
     b: &Balance,
@@ -406,11 +436,13 @@ pub fn top_spans(
     vendor: Vendor,
     t: &Theme,
     with_source: bool,
+    with_reset: bool,
 ) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
-    for c in value_cells(&b.value, t, t.accent(vendor)) {
+    let reset_now = with_reset.then_some(now);
+    for c in value_cells(&b.value, t, t.accent(vendor), reset_now) {
         match c {
-            Cell::Text(s) => out.push(s),
+            Cell::Text(s) | Cell::Reset(s) => out.push(s),
             // 顶栏只有一行窄地方，进度条用字符画（和额度一样 8 格）。
             Cell::Gauge {
                 label,

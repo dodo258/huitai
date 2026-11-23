@@ -2,6 +2,7 @@
 
 use super::preview::light;
 use super::*;
+use crate::ui::app::BACKUP_ONLY;
 
 pub(super) fn list(buf: &mut Buffer, head: Rect, area: Rect, app: &App, t: &Theme, accent: Color) {
     fill(buf, area, t.base);
@@ -525,6 +526,9 @@ pub(super) enum Tag {
     VendorAndProject,
 }
 
+/// 自动继续过的对话行标题后的那句。
+const AUTO_CONTINUED: &str = "已自动继续";
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn item(
     buf: &mut Buffer,
@@ -549,8 +553,18 @@ pub(super) fn item(
     // 同一家有几个账号时，标题后面用暗色小字写这条是哪个账号的（只有一个账号不写）。
     let account = app.account_label(&e.session).map(|a| truncate(a, 10));
     let account_w = account.as_ref().map_or(0, |a| width(a) + 2);
+    // 撞额度到点自动继续过：标题后写一句，主人回来一眼看到是会话台替他发的「继续」。
+    let continued = e.note.continued.is_some().then_some(AUTO_CONTINUED);
+    // Claude 删掉了原文件、只剩会话台的备份：标题后写一句，回车接不上之前先看到。
+    let backup_only = App::backup_only(e).then_some(BACKUP_ONLY);
+    let backup_w = backup_only.map_or(0, |c| width(c) + 2);
+    let continued_w = continued.map_or(0, |c| width(c) + 2);
+    // 会话台启动的 Claude 报过上下文占用：标题后写「上下文 72%」，快满了变色。
+    let context = app.context_of(e).map(|c| context_span(c, t, t.muted));
+    let context_w = context.as_ref().map_or(0, |c| c.width() + 2);
     let mark_w = if tag == Tag::VendorAndProject { 2 } else { 0 };
-    let title_room = room.saturating_sub(mark_w + project_w + account_w);
+    let title_room =
+        room.saturating_sub(mark_w + project_w + account_w + continued_w + backup_w + context_w);
     let mut left = Vec::new();
     if tag == Tag::VendorAndProject {
         let v = e.session.vendor;
@@ -559,6 +573,16 @@ pub(super) fn item(
     left.push(sp(truncate(e.title(), title_room), title_style));
     if let Some(a) = account {
         left.push(sp(format!("  {a}"), fg(t.faint)));
+    }
+    if let Some(c) = continued {
+        left.push(sp(format!("  {c}"), fg(t.muted)));
+    }
+    if let Some(b) = backup_only {
+        left.push(sp(format!("  {b}"), fg(t.state(SessionState::Waiting))));
+    }
+    if let Some(c) = context {
+        left.push(sp("  ", fg(t.muted)));
+        left.push(c);
     }
     if let Some(p) = project {
         left.push(sp(format!("  {p}"), fg(t.faint)));

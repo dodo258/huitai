@@ -310,6 +310,106 @@ fn claude_settings_keeps_original_statusline_and_its_options() {
     assert!(data.join("claude-statusline.json").exists());
 }
 
+/// 带上下文占用的状态栏数据（官方字段 `context_window.used_percentage`）：单行 JSON，和 Claude 实际给的一样。
+fn statusline_with_context(session_id: &str, used: serde_json::Value) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(fixtures().join("claude/statusline.json")).unwrap(),
+    )
+    .unwrap();
+    v["session_id"] = session_id.into();
+    v["context_window"] = serde_json::json!({
+        "context_window_size": 200000,
+        "used_percentage": used,
+        "remaining_percentage": null,
+    });
+    v.to_string()
+}
+
+#[test]
+fn statusline_saves_one_copy_per_session_for_context_use() {
+    let sb = Sandbox::new("cl-context");
+    let reader = sb.reader();
+    let command = settings_status(&reader.claude_settings(&sb.root.join("proj")))["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let a = "11111111-2222-3333-4444-555555555555";
+    let b = "66666666-7777-8888-9999-000000000000";
+    run_statusline(&command, &statusline_with_context(a, 72.4.into()));
+    run_statusline(&command, &statusline_with_context(b, 85.into()));
+    // 多行 JSON（测试样例那样排版）也认得出 session_id。
+    let pretty = serde_json::to_string_pretty(
+        &serde_json::from_str::<serde_json::Value>(&statusline_with_context(a, 30.into())).unwrap(),
+    )
+    .unwrap();
+    run_statusline(&command, &pretty);
+    let ctx = sb.data().join("claude-context");
+    assert!(ctx.join(format!("{a}.json")).exists());
+    assert!(
+        sb.data().join("claude-statusline.json").exists(),
+        "额度缓存照常写"
+    );
+    let mut seen = Default::default();
+    let got = reader.contexts(&mut seen);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[a].percent, 30.0, "同一条对话后来的那份盖掉前面的");
+    assert_eq!(got[b].percent, 85.0);
+
+    // 刚开、刚 /compact 完 used_percentage 是 null：这条没读数。
+    run_statusline(
+        &command,
+        &statusline_with_context(b, serde_json::Value::Null),
+    );
+    let got = reader.contexts(&mut seen);
+    assert!(!got.contains_key(b), "{got:?}");
+    assert!(got.contains_key(a), "没变的那份照用上次读到的");
+
+    // session_id 里有路径字符的不存（拼不出目录外的路径），也没有临时文件留下。
+    run_statusline(&command, &statusline_with_context("../evil", 50.into()));
+    run_statusline(&command, &statusline_with_context("a/b", 50.into()));
+    let names: Vec<String> = fs::read_dir(&ctx)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(!sb.root.join("evil.json").exists() && !sb.data().join("evil.json").exists());
+}
+
+#[test]
+fn context_use_skips_bad_files_and_drops_month_old_ones() {
+    let sb = Sandbox::new("cl-context-old");
+    let ctx = sb.data().join("claude-context");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(
+        ctx.join("fresh.json"),
+        statusline_with_context("fresh", 12.into()),
+    )
+    .unwrap();
+    fs::write(
+        ctx.join("old.json"),
+        statusline_with_context("old", 50.into()),
+    )
+    .unwrap();
+    fs::write(ctx.join("broken.json"), "{不是 JSON").unwrap();
+    fs::write(ctx.join("renamed.json"), r#"{"context":{"pct":3}}"#).unwrap();
+    fs::write(
+        ctx.join(".fresh.123"),
+        statusline_with_context("tmp", 9.into()),
+    )
+    .unwrap();
+    set_mtime(&ctx.join("fresh.json"), at(NOW - 60));
+    set_mtime(&ctx.join("old.json"), at(NOW - 31 * 24 * 3600));
+    let got = sb.reader().contexts(&mut Default::default());
+    assert_eq!(got.keys().collect::<Vec<_>>(), vec!["fresh"]);
+    assert_eq!(
+        got["fresh"].at,
+        at(NOW - 60),
+        "读数时间取那份数据的修改时间"
+    );
+    assert!(!ctx.join("old.json").exists(), "一个月没更新的删掉");
+    assert!(ctx.join("broken.json").exists(), "认不出的不删");
+}
+
 // ---------- Codex ----------
 
 #[test]

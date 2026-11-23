@@ -6,6 +6,9 @@
 //! - 配了自己的服务地址（pi `models.json` 的 `baseUrl`，`*_BASE_URL` 环境变量、Hermes `.env`）的密钥按地址认是哪家；
 //!   地址的域名不在 [`Provider::hosts`] 里（自建网关、代理）就不查，记成「跳过」：这把密钥是网关的，发给原厂就是泄露。
 //!   同一把密钥在别处没配地址也不查。
+//! - 地址和密钥可以分在两处（pi 只在 `models.json` 给内置 provider 配 `baseUrl`、密钥放环境变量是官方写法；
+//!   Hermes `.env` 只写 `KIMI_BASE_URL`、密钥在进程环境里）：读环境变量前先把各账号配置里的地址汇成一张表
+//!   （[`file_bases`]），表里这个变量有一处地址不是原厂的，环境变量里的这把就当网关的，不查。
 
 use std::fmt;
 use std::fs;
@@ -172,6 +175,7 @@ impl Found {
 /// 按顺序读：各 pi 账号的 `auth.json`、`models.json`，各 Hermes 账号（含 profile）的 `.env`，最后环境变量。
 pub fn find(accounts: &[Account], env: &dyn Fn(&str) -> Option<String>) -> Found {
     let mut found = Found::default();
+    let table = file_bases(accounts);
     for a in accounts {
         match a.vendor {
             Vendor::Pi => {
@@ -188,7 +192,12 @@ pub fn find(accounts: &[Account], env: &dyn Fn(&str) -> Option<String>) -> Found
                 account: None,
                 place: format!("环境变量 {name}"),
             };
-            let base = base_url_vars(name).into_iter().find_map(|b| env(&b));
+            // 先查表：配置文件里给这个变量配了别家地址（网关），就按那个地址走（记成跳过）。
+            let gateway = table
+                .iter()
+                .find(|(var, base)| var == name && provider_of_url(base).is_none())
+                .map(|(_, base)| base.clone());
+            let base = gateway.or_else(|| base_url_vars(name).into_iter().find_map(|b| env(&b)));
             found.add_routed(env_providers(name, &v), base.as_deref(), origin, v);
         }
     }
@@ -197,28 +206,27 @@ pub fn find(accounts: &[Account], env: &dyn Fn(&str) -> Option<String>) -> Found
 }
 
 /// 这个 pi / Hermes 账号默认用哪家（pi `settings.json` 的 `defaultProvider`，Hermes `config.yaml` 的
-/// `model.provider`）。不是我们能查余额的那几家就是 `None`。
-pub fn default_provider(account: &Account) -> Option<Provider> {
-    match account.vendor {
-        Vendor::Pi => {
-            let settings = read_json(&account.dir.join("settings.json"))?;
-            let name = settings.get("defaultProvider")?.as_str()?;
-            // 配了 baseUrl（自定义的 provider，或内置名字改了地址）按地址认，没配按名字认。
-            match pi_base_url(account, name) {
-                Some(base) => first(provider_of_url(&base)),
-                None => first(provider_named(name)),
-            }
-        }
-        Vendor::Hermes => {
-            let text = fs::read_to_string(account.dir.join("config.yaml")).ok()?;
-            first(provider_named(&yaml_model_provider(&text)?))
-        }
+/// `model.provider`）：一个名字可能对应同一公司的几家（Hermes 的 `kimi-coding`），读数是其中哪家都算。
+/// 不是我们能查余额的那几家就是空的。
+pub fn default_providers(account: &Account) -> Vec<Provider> {
+    let named = match account.vendor {
+        Vendor::Pi => pi_default(account),
+        Vendor::Hermes => fs::read_to_string(account.dir.join("config.yaml"))
+            .ok()
+            .and_then(|text| hermes_provider_named(&yaml_model_provider(&text)?)),
         _ => None,
-    }
+    };
+    named.unwrap_or_default()
 }
 
-fn first(p: Option<Vec<Provider>>) -> Option<Provider> {
-    p.and_then(|v| v.first().copied())
+fn pi_default(account: &Account) -> Option<Vec<Provider>> {
+    let settings = read_json(&account.dir.join("settings.json"))?;
+    let name = settings.get("defaultProvider")?.as_str()?;
+    // 配了 baseUrl（自定义的 provider，或内置名字改了地址）按地址认，没配按名字认。
+    match pi_base_url(account, name) {
+        Some(base) => provider_of_url(&base),
+        None => provider_named(name),
+    }
 }
 
 fn origin(a: &Account, place: String) -> KeyOrigin {
@@ -244,6 +252,65 @@ fn pi_base_url(a: &Account, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|b| !b.is_empty())
         .map(str::to_owned)
+}
+
+/// 各账号配置文件里配的服务地址 → （密钥变量名，地址）：pi `models.json` 的 `providers.<名>.baseUrl`
+/// （有没有 `apiKey` 都收：按 pi 内置 provider 默认读的环境变量，加上 `apiKey` 里 `$变量` 引用的变量对上），
+/// Hermes `.env` 的 `*_BASE_URL`（按 [`base_url_vars`] 对上密钥变量）。空地址不收。
+fn file_bases(accounts: &[Account]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for a in accounts {
+        match a.vendor {
+            Vendor::Pi => {
+                let doc = read_json(&a.dir.join("models.json"));
+                let Some(Value::Object(providers)) = doc.as_ref().and_then(|d| d.get("providers"))
+                else {
+                    continue;
+                };
+                for (name, p) in providers {
+                    let Some(base) = p.get("baseUrl").and_then(Value::as_str).map(str::trim) else {
+                        continue;
+                    };
+                    if base.is_empty() {
+                        continue;
+                    }
+                    let mut vars: Vec<String> =
+                        pi_env_key(name).map(str::to_owned).into_iter().collect();
+                    if let Some(raw) = p.get("apiKey").and_then(Value::as_str) {
+                        vars.extend(template_vars(raw));
+                    }
+                    out.extend(vars.into_iter().map(|v| (v, base.to_owned())));
+                }
+            }
+            Vendor::Hermes => {
+                let Ok(text) = fs::read_to_string(a.dir.join(".env")) else {
+                    continue;
+                };
+                for (k, v) in parse_dotenv(&text) {
+                    let v = v.trim();
+                    if !k.ends_with("_BASE_URL") || v.is_empty() {
+                        continue;
+                    }
+                    for name in ENV_KEYS.iter().filter(|n| base_url_vars(n).contains(&k)) {
+                        out.push(((*name).to_owned(), v.to_owned()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// pi 内置 provider 没写 `apiKey` 时读的环境变量（pi-ai `env-api-keys.js`），只列我们认的几家。
+fn pi_env_key(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "moonshotai" | "moonshotai-cn" => "MOONSHOT_API_KEY",
+        "kimi-coding" => "KIMI_API_KEY",
+        _ => return None,
+    })
 }
 
 /// pi `auth.json`：`{"<provider>": {"type": "api_key", "key": …} | {"type": "oauth", "access": …}}`。
@@ -355,6 +422,19 @@ fn resolve_template(raw: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<S
     }
     out.push_str(rest);
     Some(out)
+}
+
+/// pi 配置值里 `$变量`、`${变量}` 引用的变量名（`!命令` 不算）。
+fn template_vars(raw: &str) -> Vec<String> {
+    if raw.starts_with('!') {
+        return Vec::new();
+    }
+    let names = std::cell::RefCell::new(Vec::new());
+    resolve_template(raw, &|n| {
+        names.borrow_mut().push(n.to_owned());
+        Some("x".to_owned())
+    });
+    names.into_inner()
 }
 
 fn var_prefix_len(s: &str) -> usize {
@@ -493,6 +573,20 @@ fn provider_named(name: &str) -> Option<Vec<Provider>> {
     })
 }
 
+/// Hermes 的 provider 名（含别名，`hermes_cli/auth.py` 的 provider 表和别名表）→ 依次试哪几家。
+/// `kimi-coding` 的端点随密钥变（`sk-kimi-` 走 Kimi Code，别的走 Moonshot 开放平台），和
+/// [`env_providers`] 里 `KIMI_API_KEY` 的几家一致；`kimi-coding-cn` 是 Moonshot 国内。
+fn hermes_provider_named(name: &str) -> Option<Vec<Provider>> {
+    use Provider::*;
+    Some(match name {
+        "kimi-coding" | "kimi" | "kimi-for-coding" | "moonshot" => {
+            vec![KimiCode, MoonshotIntl, MoonshotCn]
+        }
+        "kimi-coding-cn" | "kimi-cn" | "moonshot-cn" => vec![MoonshotCn],
+        _ => return provider_named(name),
+    })
+}
+
 /// 按 API 地址的域名认是哪家。
 fn provider_of_url(url: &str) -> Option<Vec<Provider>> {
     let host = url.split("://").nth(1)?.split(['/', ':']).next()?;
@@ -531,6 +625,8 @@ mod tests {
             None,
             "变量没设就没有密钥"
         );
+        assert_eq!(template_vars("a$A-${B_2}$$C"), ["A", "B_2"]);
+        assert!(template_vars("!echo $A").is_empty());
     }
 
     #[test]

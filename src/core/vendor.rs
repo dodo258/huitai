@@ -54,6 +54,9 @@ pub struct VendorInfo {
     /// 还支持不支持：不支持的（Qwen Code）不进 [`Vendor::ALL`]，不列出、不扫描、没有来源，
     /// 只为解码旧数据留着这一行（名字给旧版托管的标签页标题用，目录给 0.1.3 旧标注的目录名算法用）。
     pub listed: bool,
+    /// 会话记录里认得出撞用量上限、读得出重置时间（`sources::limit`，有官方字样才算）。
+    /// 认得出的家对话菜单里才有「撞额度后自动继续」。
+    pub limit_notice: bool,
 }
 
 /// 每家一行，顺序就是界面标签的顺序，必须和 [`Vendor`] 的声明顺序一致（[`Vendor::info`] 按下标取）。
@@ -75,6 +78,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         parse_version: 4,
         presets_new_id: true,
         listed: true,
+        limit_notice: true,
     },
     VendorInfo {
         vendor: Vendor::Codex,
@@ -92,6 +96,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         parse_version: 4,
         presets_new_id: false,
         listed: true,
+        limit_notice: true,
     },
     VendorInfo {
         vendor: Vendor::Pi,
@@ -107,6 +112,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         parse_version: 1,
         presets_new_id: true,
         listed: true,
+        limit_notice: false,
     },
     VendorInfo {
         vendor: Vendor::Hermes,
@@ -123,6 +129,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         parse_version: 3,
         presets_new_id: false,
         listed: true,
+        limit_notice: false,
     },
     VendorInfo {
         vendor: Vendor::Kimi,
@@ -140,6 +147,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         parse_version: 3,
         presets_new_id: false,
         listed: true,
+        limit_notice: false,
     },
     VendorInfo {
         vendor: Vendor::Gemini,
@@ -158,6 +166,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         parse_version: 2,
         presets_new_id: true,
         listed: true,
+        limit_notice: false,
     },
     VendorInfo {
         vendor: Vendor::OpenCode,
@@ -180,6 +189,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         // 2.x 的 `-s <id>` 遇到不存在的 id 会用它新建，1.x 直接报错退出：两版都能用的只有临时 id 托管再认回。
         presets_new_id: false,
         listed: true,
+        limit_notice: false,
     },
     VendorInfo {
         vendor: Vendor::Qwen,
@@ -196,6 +206,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         parse_version: 2,
         presets_new_id: true,
         listed: false,
+        limit_notice: false,
     },
     VendorInfo {
         vendor: Vendor::Antigravity,
@@ -216,6 +227,7 @@ pub const VENDORS: [VendorInfo; 9] = [
         // `agy` 没有让我们先定 id 的选项。
         presets_new_id: false,
         listed: true,
+        limit_notice: false,
     },
 ];
 

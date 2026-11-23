@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use super::jsonl::{self, str_field};
+use super::limit::LimitHit;
 use super::{Part, Role, window};
 
 /// 只读会话文件最后这么多字节：在跑的工具、最后一句、计划都在最近几轮里。
@@ -36,6 +37,8 @@ pub struct Moment {
     pub plan: Vec<PlanStep>,
     /// 这一轮失败或被打断了：原因（厂商写的，可能是空串）。
     pub failed: Option<String>,
+    /// 最后一条是厂商记下的撞用量上限（之后没有新的消息）。
+    pub limit: Option<LimitHit>,
 }
 
 impl Moment {
@@ -110,6 +113,8 @@ pub(crate) enum Event {
         failed: Option<String>,
     },
     Plan(Vec<PlanStep>),
+    /// 厂商记下撞了用量上限（Claude 的错误消息、Codex 回合结束带的错误）。
+    Limit(LimitHit),
 }
 
 /// 把事件按先后推一遍，得出「此刻」。
@@ -127,6 +132,10 @@ pub(crate) struct Folder {
 impl Folder {
     pub(crate) fn push(&mut self, e: Event) {
         let started = std::mem::take(&mut self.started);
+        // 上限记录之后又有了消息（新一轮、新回复）：最后一条就不是它了。
+        if matches!(e, Event::Part(Part::Message(_)) | Event::TurnStarted(_)) {
+            self.m.limit = None;
+        }
         match e {
             // 厂商记了开始时间的，用户消息只是这一轮的头一句（它自己可能没带时间）。
             Event::Part(Part::Message(m)) if m.role == Role::User => {
@@ -163,6 +172,7 @@ impl Folder {
                 self.m.failed = failed;
             }
             Event::Plan(steps) => self.m.plan = steps,
+            Event::Limit(hit) => self.m.limit = Some(hit),
         }
     }
 

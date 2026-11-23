@@ -364,7 +364,7 @@ type Mover = dyn Fn(&Path, &Path) -> io::Result<()>;
 
 /// 原子改名，`to` 已存在（文件、目录、断掉的链接）时报 `AlreadyExists`，绝不覆盖。
 /// macOS 的 `renamex_np(RENAME_EXCL)`：检查和改名是一步，不会在两者之间被别的进程抢先写进同名文件。
-fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = |p: &Path| {

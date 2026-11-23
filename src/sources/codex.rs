@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use super::jsonl::{self, str_field};
+use super::limit;
 use super::moment::{Event, Folder, MOMENT_TAIL_BYTES};
 use super::sqlite::{self, Row};
 use super::time::{from_millis, parse_rfc3339};
@@ -761,6 +762,7 @@ fn moment_events(v: &Value) -> Vec<Event> {
         }
         _ => {}
     }
+    out.extend(limit::codex(v).map(Event::Limit));
     out
 }
 

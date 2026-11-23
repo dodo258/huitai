@@ -49,7 +49,9 @@ impl App {
             }
             4 => self.config.blink_waiting = !self.config.blink_waiting,
             5 => self.config.auto_ascii_input = !self.config.auto_ascii_input,
-            6 => self.config.check_updates = !self.config.check_updates,
+            6 => self.config.backup_all_claude = !self.config.backup_all_claude,
+            7 => self.config.check_updates = !self.config.check_updates,
+            8 => self.config.auto_upgrade_clis = !self.config.auto_upgrade_clis,
             3 => {
                 let now = self.config.idle_reclaim_minutes;
                 // 手改 config.json 写了列表外的数：从不小于它的那一档接着走。

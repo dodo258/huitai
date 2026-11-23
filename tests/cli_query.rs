@@ -346,6 +346,52 @@ fn old_index_and_broken_notes_are_read_not_repaired() {
     assert_eq!(snapshot(&dir), before, "没补列、没把标注文件改名");
 }
 
+/// 审计 v0.1.4 复核第 9 条（标注）：0.1.3 之后加的厂商（Antigravity）的改名、归档存在 `annotations-more.json`，
+/// `ai list`、`ai search` 也读它。以前只读 `annotations.json`，列出来还是原名、没归档，按新名字搜不到。
+#[test]
+fn queries_see_notes_of_vendors_added_after_v013() {
+    const AGY: &str = "a9e10000-1111-4aaa-8bbb-000000000001";
+    let home = home("cli-query-agy-notes");
+    let root = home.join(".gemini/antigravity-cli");
+    copy_tree(
+        &fixture("antigravity/annotations"),
+        &root.join("annotations"),
+    );
+    copy_tree(&fixture("antigravity/brain"), &root.join("brain"));
+    let sql = fs::read_to_string(fixture("antigravity/conversation_summaries.sql")).unwrap();
+    sources_common::build_db(&root.join("conversation_summaries.db"), &sql);
+    build_index(&home);
+    let accounts = sources::accounts(&home, &home, |_| None, &[]);
+    let srcs = sources::sources_for(&accounts, Trash::new(home.join(".Trash")));
+    let index = Index::open(&data_dir(&home), srcs).unwrap();
+    let id = SessionId::from(AGY);
+    index
+        .annotate(
+            Vendor::Antigravity,
+            &id,
+            Edit::Rename(Some("收银台改版".into())),
+        )
+        .unwrap();
+    index
+        .annotate(Vendor::Antigravity, &id, Edit::Archive(true))
+        .unwrap();
+    drop(index);
+    assert!(data_dir(&home).join("annotations-more.json").is_file());
+
+    let rows = json(&ai(&home, &["list", "--vendor", "antigravity", "--json"]));
+    let row = rows
+        .iter()
+        .find(|r| r["id"] == AGY)
+        .unwrap_or_else(|| panic!("没列出 {AGY}：{rows:?}"));
+    assert_eq!(
+        (&row["title"], &row["archived"]),
+        (&Value::from("收银台改版"), &Value::from(true)),
+        "{row}"
+    );
+    let hits = json(&ai(&home, &["search", "收银台改版", "--json"]));
+    assert!(hits.iter().any(|h| h["id"] == AGY), "{hits:?}");
+}
+
 #[test]
 fn help_lists_both_commands() {
     let out = ai(Path::new("/"), &["--help"]);

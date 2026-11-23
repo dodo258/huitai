@@ -17,12 +17,12 @@ use crate::quota;
 use crate::sources::Role;
 
 use super::activity;
-use super::app::{App, Overlay, Prompt, TERMINAL_CHOICES, VIEW_ONLY};
-use super::keys::{self, HELP, Selected};
+use super::app::{App, CliUpgrade, Overlay, Prompt, TERMINAL_CHOICES, VIEW_ONLY};
+use super::keys::{self, HELP, MenuItem};
 use super::newdir::{self, DirPicker};
 use super::rows::{Group, GroupKey, Row};
 use super::text::{ago, tilde, truncate, truncate_middle, width, wrap};
-use super::theme::{Theme, mix};
+use super::theme::{Theme, UpdateButton, mix};
 
 mod board;
 mod bottom_bar;
@@ -34,10 +34,10 @@ mod top_bar;
 use board::board;
 use bottom_bar::bottom_bar;
 use list::list;
-use overlays::{dir_candidates, help, menu, settings};
+use overlays::{cli_failures, dir_candidates, help, menu, settings};
 use preview::{preview, preview_head};
 use top_bar::top_bar;
-pub use top_bar::{QUOTA_ALERT, QUOTA_WARN, tokens};
+pub use top_bar::{QUOTA_ALERT, QUOTA_WARN, reset_note, tokens};
 
 /// 窄于这个宽度只显示列表，不显示预览。
 const MIN_SPLIT_WIDTH: u16 = 80;
@@ -143,8 +143,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
         Overlay::Help => help(buf, area, theme, accent),
         Overlay::Settings { cursor } => settings(buf, area, app, cursor, theme, accent),
         Overlay::Balance { scroll } => super::balance::draw(buf, area, app, scroll, theme),
+        Overlay::CliFailures { scroll } => cli_failures(buf, area, app, scroll, theme),
         Overlay::Menu { sel, x, y, cursor } => {
-            app.areas.menu = menu(buf, area, sel, (x, y), cursor, theme, accent);
+            let items = app.menu_items(sel);
+            app.areas.menu = menu(buf, area, &items, (x, y), cursor, theme, accent);
         }
         Overlay::None => {}
     }
@@ -291,6 +293,16 @@ impl RenderInto for Line<'_> {
     fn render_into(self, buf: &mut Buffer, area: Rect) {
         ratatui::widgets::Widget::render(self, area, buf);
     }
+}
+
+/// 「上下文 72%」：用到 80% 起是提醒的黄、95% 起红（和额度一个门槛），没到用 `normal`。
+pub(super) fn context_span(c: quota::ContextUse, t: &Theme, normal: Color) -> Span<'static> {
+    let color = match c.percent {
+        u if u >= QUOTA_ALERT => t.alert(),
+        u if u >= QUOTA_WARN => t.state(SessionState::Waiting),
+        _ => normal,
+    };
+    sp(format!("上下文 {:.0}%", c.percent), fg(color))
 }
 
 pub(super) fn fg(c: Color) -> Style {

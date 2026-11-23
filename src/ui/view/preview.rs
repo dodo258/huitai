@@ -5,7 +5,7 @@ use super::*;
 
 /// 预览区的标题行：这一栏此刻在显示什么。
 /// 选中的是托管着或别处在跑的对话时，标题跟着状态走：「在跑 · 4 分 12 秒」「做完 · 用时 6 分钟」
-/// 「等你回复 · 3 分钟」「失败」，用状态的颜色。
+/// 「等你回复 · 3 分钟」「失败」，用状态的颜色。选中的对话报过上下文占用时后面接「 · 上下文 72%」。
 pub(super) fn preview_head(buf: &mut Buffer, area: Rect, app: &App, t: &Theme) {
     fill(buf, area, t.bar);
     let r = Rect {
@@ -21,6 +21,8 @@ pub(super) fn preview_head(buf: &mut Buffer, area: Rect, app: &App, t: &Theme) {
         if app.live_screen().is_some() {
             spans.push(sp(" · 此刻的画面", fg(t.muted)));
         }
+        spans.extend(context_note(app, e, t));
+        spans.extend(deletion_note(app, e, t));
         Line::from(clip(spans, usize::from(r.width))).render_into(buf, r);
         return;
     }
@@ -37,7 +39,26 @@ pub(super) fn preview_head(buf: &mut Buffer, area: Rect, app: &App, t: &Theme) {
             None => return,
         },
     };
-    Line::from(sp(label, fg(t.muted))).render_into(buf, r);
+    let mut spans = vec![sp(label, fg(t.muted))];
+    if let Some(e) = app.selected_entry() {
+        spans.extend(context_note(app, e, t));
+        spans.extend(deletion_note(app, e, t));
+    }
+    Line::from(clip(spans, usize::from(r.width))).render_into(buf, r);
+}
+
+/// 预览区标题行后面的「 · 约 2 天后被 Claude 删除」：离 Claude 删它不到 3 天的才有，用提醒的红。
+fn deletion_note(app: &App, e: &Entry, t: &Theme) -> Vec<Span<'static>> {
+    app.deletion_note(e)
+        .map(|n| vec![sp(" · ", fg(t.faint)), sp(n, fg(t.alert()))])
+        .unwrap_or_default()
+}
+
+/// 预览区标题行后面的「 · 上下文 72%」；没有读数就没有。
+fn context_note(app: &App, e: &Entry, t: &Theme) -> Vec<Span<'static>> {
+    app.context_of(e)
+        .map(|c| vec![sp(" · ", fg(t.faint)), context_span(c, t, t.muted)])
+        .unwrap_or_default()
 }
 
 pub(super) fn preview(buf: &mut Buffer, area: Rect, app: &App, t: &Theme, accent: Color) {

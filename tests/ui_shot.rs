@@ -836,6 +836,18 @@ fn fake_home(home: &Path) {
     )
     .unwrap();
 
+    // 注入的状态栏命令按对话另存的那份：头两条 Claude 对话报了上下文占用（72%、86%，后一条到了提醒色）。
+    let context = data.join("claude-context");
+    fs::create_dir_all(&context).unwrap();
+    for (n, used) in [(0x100, 72), (0x101, 86)] {
+        let id = uuid(n);
+        fs::write(
+            context.join(format!("{id}.json")),
+            format!(r#"{{"session_id":"{id}","context_window":{{"used_percentage":{used}}}}}"#),
+        )
+        .unwrap();
+    }
+
     // 余额：pi 的 auth.json 里一把编的 DeepSeek 密钥、models.json 里一把 Kimi Code 的和一条写成命令的（跳过）。
     // 余额缓存预先写好并处在退避期：会话台直接用缓存，绝不拿这两把编的密钥去请求真接口。
     fs::write(
@@ -1593,6 +1605,7 @@ fn real_terminal_screenshots() {
         + 1;
     run.send(format!("\x1b[<2;12;{y}M\x1b[<2;12;{y}m").as_bytes());
     run.wait_for("在当前窗口打开");
+    run.wait_for("撞额度后到点自动继续");
     run.save(&out, "15-menu");
     run.press(b"\x1b");
     // $：各账号额度和余额（缓存里预先写好的，见 fake_home）。

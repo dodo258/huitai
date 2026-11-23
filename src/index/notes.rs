@@ -46,6 +46,12 @@ pub struct Note {
     pub pinned: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
+    /// 撞了用量上限，到重置时间自动接着做（对话菜单里开，默认关）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_continue: bool,
+    /// 已经为哪一次上限自动接着做过：那次的可继续时刻（Unix 秒）。同一次只送一次。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued: Option<i64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -96,6 +102,10 @@ pub enum Edit {
     Rename(Option<String>),
     Pin(bool),
     Archive(bool),
+    /// 开、关撞额度后自动继续；关掉时连「已自动继续」一起清掉。
+    AutoContinue(bool),
+    /// 为这一次上限（可继续时刻，Unix 秒）自动接着做过了。
+    Continued(i64),
 }
 
 impl Note {
@@ -104,6 +114,13 @@ impl Note {
             Edit::Rename(t) => self.title = clean(t),
             Edit::Pin(p) => self.pinned = p,
             Edit::Archive(a) => self.archived = a,
+            Edit::AutoContinue(on) => {
+                self.auto_continue = on;
+                if !on {
+                    self.continued = None;
+                }
+            }
+            Edit::Continued(at) => self.continued = Some(at),
         }
     }
 
@@ -182,18 +199,31 @@ impl Notes {
         Ok((notes, problem))
     }
 
-    /// 只读：同 [`Notes::load`]，但格式坏了不改名留底，当没有标注，并在第二个返回值里说明。
+    /// 只读：同 [`Notes::load`]（两份都读、合起来），但格式坏了不改名留底，那一份当没有标注，
+    /// 并在第二个返回值里说明。
     pub(crate) fn load_read_only(dir: &Path) -> io::Result<(Self, Option<String>)> {
         let path = dir.join(FILE_NAME);
-        let (state, problem) = match read(&path) {
-            Ok(st) => (st, None),
-            Err(e) if e.kind() == ErrorKind::InvalidData => (
+        let read_or_skip = |p: &Path| match read(p) {
+            Ok(st) => Ok((st, None)),
+            Err(e) if e.kind() == ErrorKind::InvalidData => Ok((
                 State::default(),
-                Some(format!("{e}；这次不显示改名、置顶、归档")),
-            ),
-            Err(e) => return Err(e),
+                Some(format!("{e}；这次不显示这份里的改名、置顶、归档")),
+            )),
+            Err(e) => Err(e),
         };
-        Ok((Self { path, state }, problem))
+        let (main, main_problem) = read_or_skip(&path)?;
+        let (more, more_problem) = read_or_skip(&path.with_file_name(MORE_FILE_NAME))?;
+        let problem = [main_problem, more_problem]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}；{b}"));
+        Ok((
+            Self {
+                path,
+                state: merge(main, more),
+            },
+            problem,
+        ))
     }
 
     pub(crate) fn get(&self, vendor: Vendor, id: &str) -> Option<&Note> {

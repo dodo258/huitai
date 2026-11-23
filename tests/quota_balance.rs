@@ -625,3 +625,117 @@ fn cache_is_per_key_not_per_place() {
         );
     }
 }
+
+/// 地址配在文件里、密钥放在环境变量里（pi 官方写法：`models.json` 只给内置 provider 配 `baseUrl`；Hermes `.env`
+/// 只写 `KIMI_BASE_URL`；自定义 provider 的 `apiKey` 引用环境变量）：环境变量里的这把是网关的，不发给原厂、记成跳过。地址是原厂的照查。
+#[test]
+fn gateway_address_in_file_key_in_env_is_not_sent() {
+    const GW_DEEPSEEK: &str = "sk-gw-deepseek-0021";
+    const GW_KIMI: &str = "sk-kimi-gw-0022";
+    const GW_OPENROUTER: &str = "sk-gw-openrouter-0023";
+    const GW_CORP: &str = "sk-gw-corp-0024";
+    let sb = Sandbox::new("gateway-env");
+    let fake = Fake::start();
+    serve_typical(&fake);
+    sb.write(
+        ".pi/agent/models.json",
+        r#"{"providers": {
+            "deepseek": {"baseUrl": "https://gw.example.com/v1"},
+            "openrouter": {"apiKey": "sk-literal-not-env", "baseUrl": "http://127.0.0.1:3425/v1"},
+            "moonshotai-cn": {"baseUrl": "https://api.moonshot.cn/v1"},
+            "corp": {"baseUrl": "https://corp-gw.example.com/v1", "apiKey": "${KIMI_CN_API_KEY}"}
+        }}"#,
+    );
+    sb.write(
+        ".hermes/.env",
+        "KIMI_BASE_URL=https://kimi-gw.example.com/coding\n",
+    );
+    let env = |n: &str| match n {
+        "DEEPSEEK_API_KEY" => Some(GW_DEEPSEEK.to_owned()),
+        "KIMI_API_KEY" => Some(GW_KIMI.to_owned()),
+        "OPENROUTER_API_KEY" => Some(GW_OPENROUTER.to_owned()),
+        "KIMI_CN_API_KEY" => Some(GW_CORP.to_owned()),
+        "MOONSHOT_API_KEY" => Some(MOONSHOT.to_owned()),
+        _ => None,
+    };
+    let found = find(&sb.accounts(), &env);
+    let rows = sb.reader(&fake, NOW).read_all(&found.keys);
+
+    for (path, auth) in fake.seen.lock().unwrap().iter() {
+        for k in [GW_DEEPSEEK, GW_KIMI, GW_OPENROUTER, GW_CORP] {
+            assert!(!auth.contains(k), "网关密钥 {k} 发给了 {path}");
+        }
+    }
+    let places: Vec<&str> = found
+        .skipped
+        .iter()
+        .map(|s| s.origin.place.as_str())
+        .collect();
+    for want in [
+        "环境变量 DEEPSEEK_API_KEY",
+        "环境变量 KIMI_API_KEY",
+        "环境变量 OPENROUTER_API_KEY",
+        "环境变量 KIMI_CN_API_KEY",
+    ] {
+        assert!(places.contains(&want), "{want} 应记成跳过：{places:?}");
+    }
+    assert!(
+        found
+            .skipped
+            .iter()
+            .all(|s| !s.reason.contains("example.com"))
+    );
+    // 原厂地址（Moonshot 国内）照查。
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].origins[0].place, "环境变量 MOONSHOT_API_KEY");
+    assert!(fake.hits(P_MOONSHOT_CN) >= 1);
+}
+
+/// Hermes 的 `kimi-coding` 随密钥走 Kimi Code 或 Moonshot 开放平台：旧的开放平台密钥查到 Moonshot 余额时顶栏照样认；
+/// `kimi-coding-cn` 是 Moonshot 国内。
+#[test]
+fn hermes_kimi_providers_show_moonshot_balance() {
+    const OLD_MOONSHOT: &str = "sk-fake-old-moonshot-0031";
+    const CN_MOONSHOT: &str = "sk-fake-cn-moonshot-0032";
+    let sb = Sandbox::new("hermes-kimi");
+    let fake = Fake::start();
+    serve_typical(&fake);
+    // Kimi Code 不认这把旧密钥，Moonshot 国际站认。
+    fake.route(P_KIMI, 401, "{}");
+    let h = sb.home();
+    sb.write(".hermes/.env", &format!("KIMI_API_KEY={OLD_MOONSHOT}\n"));
+    sb.write(".hermes/config.yaml", "model:\n  provider: kimi-coding\n");
+    sb.write(
+        "hermes-cn/.env",
+        &format!("KIMI_CN_API_KEY={CN_MOONSHOT}\n"),
+    );
+    sb.write(
+        "hermes-cn/config.yaml",
+        "model:\n  provider: kimi-coding-cn\n",
+    );
+    let cn = Account::new(Vendor::Hermes, "国内", h.join("hermes-cn"), &h);
+    let accounts = vec![
+        Account::new(Vendor::Hermes, "默认", h.join(".hermes"), &h),
+        cn.clone(),
+    ];
+    fake.route(
+        P_MOONSHOT_CN,
+        200,
+        r#"{"code": 0, "data": {"available_balance": 8.0, "voucher_balance": 0, "cash_balance": 8.0}, "scode": "0x0", "status": true}"#,
+    );
+    let found = find(&accounts, &|_| None);
+    let report = BalanceReport {
+        rows: sb.reader(&fake, NOW).read_all(&found.keys),
+        skipped: found.skipped,
+        defaults: defaults(&accounts),
+    };
+    let (row, _) = report
+        .for_account(Vendor::Hermes, "")
+        .expect("kimi-coding 的旧密钥查到 Moonshot 国际，顶栏要认");
+    assert_eq!(row.provider, Provider::MoonshotIntl);
+    assert_eq!(fake.hits(P_KIMI), 1, "先试 Kimi Code");
+    let (row, _) = report
+        .for_account(Vendor::Hermes, &cn.key)
+        .expect("kimi-coding-cn 是 Moonshot 国内");
+    assert_eq!(row.provider, Provider::MoonshotCn);
+}

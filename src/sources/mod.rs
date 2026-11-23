@@ -1,6 +1,7 @@
 //! 各家适配器：扫描、元数据、预览、恢复/新建命令、回收站。对外接口：`trait Source`。
 //!
-//! 全部只读厂商数据；唯一会移动厂商文件的是 [`Source::trash`]（移进会话台回收站，可恢复）。
+//! 全部只读厂商数据；唯一会移动厂商文件的是 [`Source::trash`]（移进会话台回收站，可恢复），
+//! 唯一会写进厂商目录的是主人明确要的 [`Source::put_back`]（把只剩备份的 Claude 对话放回原处，不覆盖）。
 //! 扫描只读每个会话文件的头尾（见 `window`），不整文件解析。
 //!
 //! 「消息数」统一指用户发言条数。扫描时文件头尾装得下整个文件、或厂商自己记了计数（Codex 状态库）
@@ -9,12 +10,14 @@
 
 mod account;
 pub mod antigravity;
+pub mod backup;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
 pub mod hermes;
 mod jsonl;
 pub mod kimi;
+pub mod limit;
 pub mod live;
 pub mod moment;
 pub mod opencode;
@@ -35,11 +38,13 @@ use crate::core::{Account, Config, EnvAssign, Session, Vendor, VendorDirs};
 
 pub use account::{AccountSource, DEFAULT_NAME, accounts, data_root, setting_dir};
 pub use antigravity::AntigravitySource;
+pub use backup::{Backups, Saved};
 pub use claude::ClaudeSource;
 pub use codex::CodexSource;
 pub use gemini::GeminiSource;
 pub use hermes::HermesSource;
 pub use kimi::KimiSource;
+pub use limit::LimitHit;
 pub use moment::{Moment, PlanStep, StepStatus};
 pub use opencode::OpenCodeSource;
 pub use pi::PiSource;
@@ -160,6 +165,25 @@ pub trait Source: Send + Sync {
             .iter()
             .map(|_| Err(io::ErrorKind::Unsupported.into()))
             .collect()
+    }
+
+    /// 增量扫描用：会话文件 `gone` 没了时还能读的替身（Claude：会话台给它留的备份），交给 [`Source::read_files`] 读。
+    /// 默认没有。
+    fn stand_in(&self, _gone: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// 给这条对话做备份或更新备份（只 Claude 有，见 [`backup`]）；`check` 为真时备份没变也完整解一遍确认没坏。
+    fn back_up(&self, _session: &Session, _check: bool) -> io::Result<Saved> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "这家不做备份"))
+    }
+
+    /// 把只剩备份的对话放回厂商目录原处（主人明确要的才调），返回放回的路径；原处已有文件不覆盖。
+    fn put_back(&self, _session: &Session) -> io::Result<PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "这家没有备份可放回",
+        ))
     }
 }
 
@@ -398,7 +422,8 @@ pub fn sources_for(accounts: &[Account], trash: Trash) -> Vec<Box<dyn Source>> {
         .iter()
         .filter_map(|a| -> Option<Box<dyn Source>> {
             let dir = a.dir.as_path();
-            let inner = adapter(a.vendor, dir, trash.clone().for_account(dir))?;
+            let backups = backups_beside(&trash, a);
+            let inner = adapter(a.vendor, dir, trash.clone().for_account(dir), backups)?;
             Some(if a.is_default() {
                 inner
             } else {
@@ -408,11 +433,31 @@ pub fn sources_for(accounts: &[Account], trash: Trash) -> Vec<Box<dyn Source>> {
         .collect()
 }
 
+/// 账号 `a` 的备份目录：在回收站旁边（都在会话台数据目录下，见 [`Backups::for_account`]）。只 Claude 有。
+fn backups_beside(trash: &Trash, a: &Account) -> Option<Backups> {
+    let data = trash
+        .root()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())?;
+    (a.vendor == Vendor::Claude).then(|| Backups::for_account(data, &a.key))
+}
+
 /// 数据目录是 `dir` 的这家适配器（不包账号）；不再支持的家没有。
-fn adapter(vendor: Vendor, dir: &Path, trash: Trash) -> Option<Box<dyn Source>> {
+fn adapter(
+    vendor: Vendor,
+    dir: &Path,
+    trash: Trash,
+    backups: Option<Backups>,
+) -> Option<Box<dyn Source>> {
     let root = data_root(vendor, dir);
     Some(match vendor {
-        Vendor::Claude => Box::new(ClaudeSource::new(root, trash)),
+        Vendor::Claude => {
+            let src = ClaudeSource::new(root, trash);
+            Box::new(match backups {
+                Some(b) => src.with_backups(b),
+                None => src,
+            })
+        }
         Vendor::Codex => Box::new(CodexSource::new(dir, trash)),
         Vendor::Pi => Box::new(PiSource::new(root, trash)),
         Vendor::Hermes => Box::new(HermesSource::new(dir, trash)),
@@ -431,7 +476,7 @@ pub fn created_at(s: &Session) -> Option<SystemTime> {
     BARE.get_or_init(|| {
         Vendor::ALL
             .into_iter()
-            .filter_map(|v| adapter(v, Path::new(""), Trash::new("")))
+            .filter_map(|v| adapter(v, Path::new(""), Trash::new(""), None))
             .collect()
     })
     .iter()

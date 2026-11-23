@@ -1,6 +1,6 @@
 [package]
 name = "huitai"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "会话台：按厂商、按项目列出本机 AI 对话，在新标签页接着聊"
 publish = false
@@ -20,6 +20,8 @@ serde_json = "1"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
 zstd = { version = "0.14.4", default-features = false }
+jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+regex = "1"
 
 [profile.release]
 lto = true

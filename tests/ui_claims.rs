@@ -106,6 +106,74 @@ fn one_output_is_not_two_witnesses() {
     assert_eq!(settle(&mut c, 1201, &pairs), vec![id(TEMP)]);
 }
 
+/// 审计 v0.1.4 第 6 条复审：同一批输出守护进程既报有输出、又报标题（或响铃、通知），两条事件前后脚到。
+/// 以前各记一次输出，B 在这批前后各变一次就有两份证据、被认领到 A 下。现在一秒内的算同一次输出，B 只对上一次。
+#[test]
+fn output_and_title_of_one_batch_are_one_witness() {
+    let mut c = watching();
+    let b = id("kimi-b");
+    let pairs = [(b.clone(), id(TEMP))];
+    c.output(&id(TEMP), at(1100));
+    c.output(&id(TEMP), at(1100) + Duration::from_millis(300));
+    c.entry_seen(&b, 2, at(1096));
+    c.entry_seen(&b, 4, at(1104));
+    assert!(settle(&mut c, 1104, &pairs).is_empty());
+    assert!(c.bound().is_empty(), "一批输出不能认领：{:?}", c.bound());
+    assert!(c.open(&b, &id(TEMP)), "没对不上，仍是认不准");
+    // 隔了一秒以上的是另一批，各算各的。
+    c.output(&id(TEMP), at(1200));
+    c.output(&id(TEMP), at(1202));
+    c.entry_seen(&b, 6, at(1199));
+    c.entry_seen(&b, 8, at(1203));
+    assert_eq!(settle(&mut c, 1203, &pairs), vec![id(TEMP)]);
+}
+
+/// 审计 v0.1.4 第 13 条复审：接过来的认领，别的会话台后来撤了（记录里没了），这边跟着撤；
+/// 自己有证据认领的不因记录里没有而撤（可能是自己没写成）。
+#[test]
+fn adopted_claim_follows_the_saved_record_when_revoked() {
+    let real = id("kimi-a");
+    let saved = HashMap::from([(
+        id(TEMP),
+        Bound {
+            real: real.clone(),
+            pid: PID,
+        },
+    )]);
+    let mut c = watching();
+    c.adopt(saved.clone());
+    assert!(c.binding_of(&real).is_some());
+    c.adopt(saved);
+    assert!(c.binding_of(&real).is_some(), "记录没变，留着");
+    c.adopt(HashMap::new());
+    assert!(
+        c.bound().is_empty(),
+        "别的会话台撤了，这边也撤：{:?}",
+        c.bound()
+    );
+    // 重开时读回的也算接过来的。
+    let mut c = Claims::restore(HashMap::from([(
+        id(TEMP),
+        Bound {
+            real: real.clone(),
+            pid: PID,
+        },
+    )]));
+    c.adopt(HashMap::new());
+    assert!(c.bound().is_empty());
+    // 自己认领的：记录里没有也留着。
+    let mut c = watching();
+    let pairs = [(real.clone(), id(TEMP))];
+    for t in [1050, 1080] {
+        c.output(&id(TEMP), at(t));
+        c.entry_seen(&real, (t / 10) as usize, at(t + 1));
+        settle(&mut c, t + 1, &pairs);
+    }
+    assert!(c.binding_of(&real).is_some());
+    c.adopt(HashMap::new());
+    assert!(c.binding_of(&real).is_some(), "自己认领的不跟着记录撤");
+}
+
 /// 审计 v0.1.4 第 13 条：别的会话台落盘的认领接过来；自己认领着的、进程号对不上的、记录里一条认在两处的不接。
 #[test]
 fn adopts_claims_saved_by_another_board() {
@@ -123,7 +191,16 @@ fn adopts_claims_saved_by_another_board() {
     let mut c = watching();
     c.adopt(HashMap::from([bound(&id(TEMP), PID)]));
     assert_eq!(c.binding_of(&real).map(|(t, _)| t.clone()), Some(id(TEMP)));
-    // 这边已经认给 TEMP 了：同一条在别的临时 id 下的不接。
+    // 这边自己有证据认给 TEMP 了：同一条在别的临时 id 下的不接。
+    // （adopt 收到的是整份记录：接过来的 TEMP 在记录里没了会跟着撤，所以这里用自己认领的。）
+    let mut c = watching();
+    let pairs = [(real.clone(), id(TEMP))];
+    for t in [1050, 1080] {
+        c.output(&id(TEMP), at(t));
+        c.entry_seen(&real, (t / 10) as usize, at(t + 1));
+        settle(&mut c, t + 1, &pairs);
+    }
+    assert_eq!(c.binding_of(&real).map(|(t, _)| t.clone()), Some(id(TEMP)));
     c.adopt(HashMap::from([bound(&other, 7)]));
     assert!(!c.bound().contains_key(&other));
     // 进程号和这边看着的对不上（那次认领是上一个进程的）：不接。

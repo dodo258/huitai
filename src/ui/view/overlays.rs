@@ -70,13 +70,12 @@ pub(super) fn dir_candidates(
 pub(super) fn menu(
     buf: &mut Buffer,
     area: Rect,
-    sel: Selected,
+    items: &[MenuItem],
     (x, y): (u16, u16),
     cursor: usize,
     t: &Theme,
     accent: Color,
 ) -> Rect {
-    let items = keys::menu(sel);
     let label_w = items.iter().map(|i| width(i.label)).max().unwrap_or(0);
     let keys_w = items.iter().map(|i| width(i.keys)).max().unwrap_or(0);
     // 左右各留两格，标签和按键之间至少四格；上下各留一行。
@@ -130,10 +129,11 @@ pub(super) fn menu(
 
 pub(super) fn help(buf: &mut Buffer, area: Rect, t: &Theme, accent: Color) {
     let (left_secs, right_secs) = HELP.split_at(2);
+    // 每组：组名、各键、空一行；最后一组后面的空行不占高度。「更多技巧」放在标题行，30 行的终端也放得下全部按键。
     let col_h = |secs: &[(&str, &[super::keys::KeyHelp])]| {
-        secs.iter().map(|(_, ks)| ks.len() + 2).sum::<usize>()
+        secs.iter().map(|(_, ks)| ks.len() + 2).sum::<usize>() - 1
     };
-    let h = col_h(left_secs).max(col_h(right_secs)) as u16 + 3;
+    let h = col_h(left_secs).max(col_h(right_secs)) as u16 + 2;
     let boxr = centered(area, 78, h + 2);
     fill(buf, boxr, t.bar);
     let inner = Rect {
@@ -146,7 +146,7 @@ pub(super) fn help(buf: &mut Buffer, area: Rect, t: &Theme, accent: Color) {
         buf,
         Rect { height: 1, ..inner },
         vec![sp("全部按键", bold(t.title))],
-        vec![sp("任意键关闭", fg(t.faint))],
+        vec![sp("更多技巧见 README · 任意键关闭", fg(t.faint))],
     );
     let col_w = inner.width / 2;
     for (ci, secs) in [left_secs, right_secs].into_iter().enumerate() {
@@ -154,7 +154,7 @@ pub(super) fn help(buf: &mut Buffer, area: Rect, t: &Theme, accent: Color) {
             x: inner.x + col_w * ci as u16,
             y: inner.y + 2,
             width: col_w,
-            height: inner.height.saturating_sub(3),
+            height: inner.height.saturating_sub(2),
         };
         let mut lines = Vec::new();
         for (name, keys) in secs {
@@ -170,16 +170,6 @@ pub(super) fn help(buf: &mut Buffer, area: Rect, t: &Theme, accent: Color) {
         }
         put_lines(buf, col, lines);
     }
-    let foot = Rect {
-        y: inner.y + inner.height.saturating_sub(1),
-        height: 1,
-        ..inner
-    };
-    put_lines(
-        buf,
-        foot,
-        vec![Line::from(sp("更多技巧见 README", fg(t.faint)))],
-    );
 }
 
 /// 闲置收回的时长：没有标签页连着、等你回复、这么久没输出就结束进程（对话记录保留）。
@@ -214,7 +204,7 @@ pub(super) fn settings(
         })
         .collect();
     let account_lines = multi.len().max(1) as u16;
-    let boxr = centered(area, 64, 15 + account_lines);
+    let boxr = centered(area, 64, 17 + account_lines);
     fill(buf, boxr, t.bar);
     let inner = Rect {
         x: boxr.x + 3,
@@ -265,11 +255,29 @@ pub(super) fn settings(
             .to_owned(),
         ),
         (
+            "备份对话",
+            if cfg.backup_all_claude {
+                "全部 Claude 对话"
+            } else {
+                "只备置顶、改名、归档的 Claude 对话"
+            }
+            .to_owned(),
+        ),
+        (
             "检查新版本",
             if cfg.check_updates {
-                "开 · 每天最多查一次 GitHub"
+                "开 · 会话台和各家 CLI，每天最多查一次"
             } else {
                 "关"
+            }
+            .to_owned(),
+        ),
+        (
+            "自动升级",
+            match (cfg.auto_upgrade_clis, cfg.check_updates) {
+                (true, true) => "开 · 各家 CLI 没有对话在跑时升，不跨大版本",
+                (true, false) => "开 · 要先开「检查新版本」",
+                (false, _) => "关 · 顶栏「更新」手动升",
             }
             .to_owned(),
         ),
@@ -298,7 +306,7 @@ pub(super) fn settings(
     }
     row(
         buf,
-        line(9),
+        line(11),
         vec![
             sp(format!("{:<8}", "呼出键"), fg(t.muted)),
             sp(cfg.hotkey.clone(), fg(t.text)),
@@ -309,7 +317,7 @@ pub(super) fn settings(
     if multi.is_empty() {
         row(
             buf,
-            line(10),
+            line(12),
             vec![
                 sp(format!("{:<8}", "账号"), fg(t.muted)),
                 sp("每家一个", fg(t.text)),
@@ -323,7 +331,7 @@ pub(super) fn settings(
         let label = if i == 0 { "账号" } else { "" };
         row(
             buf,
-            line(10 + i as u16),
+            line(12 + i as u16),
             vec![
                 sp(format!("{label:<8}"), fg(t.muted)),
                 sp(format!("{} ", v.mark()), fg(t.accent(*v))),
@@ -334,17 +342,88 @@ pub(super) fn settings(
     }
     row(
         buf,
-        line(11 + account_lines),
+        line(13 + account_lines),
         vec![sp("↑↓ 选择 · ←→ 修改 · Esc 保存并关闭", fg(t.faint))],
         vec![],
     );
     row(
         buf,
-        line(12 + account_lines),
+        line(14 + account_lines),
         vec![sp(
             "其余在 ~/Library/Application Support/huitai/config.json",
             fg(t.faint),
         )],
+        vec![],
+    );
+}
+
+/// 一键升级没升上的那几家：每家一段（厂商名、命令和输出原文），内容比框高时 ↑↓ 翻。
+pub(super) fn cli_failures(buf: &mut Buffer, area: Rect, app: &App, scroll: usize, t: &Theme) {
+    let failed = match &app.cli_upgrade {
+        CliUpgrade::Failed(f) => f.as_slice(),
+        _ => &[],
+    };
+    // 宽 100（终端窄了跟着收），高按内容来：标题、空行、原文、空行、提示，屏幕放不下就翻。
+    let width_of = |w: u16| usize::from(w.min(100).saturating_sub(6));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for r in failed {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(sp(r.vendor.name(), bold(t.accent(r.vendor)))));
+        for l in wrap(&r.text, width_of(area.width.saturating_sub(2))) {
+            lines.push(Line::from(sp(l, fg(t.text))));
+        }
+    }
+    let want = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(6);
+    let boxr = centered(area, 100, want);
+    fill(buf, boxr, t.bar);
+    let inner = Rect {
+        x: boxr.x + 3,
+        y: boxr.y + 1,
+        width: boxr.width.saturating_sub(6),
+        height: boxr.height.saturating_sub(2),
+    };
+    if inner.height < 4 {
+        return;
+    }
+    row(
+        buf,
+        Rect { height: 1, ..inner },
+        vec![sp("没升上的", bold(t.title))],
+        vec![sp("原文照录，可以复制命令自己跑", fg(t.faint))],
+    );
+    let body = inner.height - 3;
+    let max_scroll = lines.len().saturating_sub(usize::from(body));
+    let body_area = Rect {
+        y: inner.y + 2,
+        height: body,
+        ..inner
+    };
+    put_lines(
+        buf,
+        body_area,
+        lines
+            .into_iter()
+            .skip(scroll.min(max_scroll))
+            .take(usize::from(body))
+            .collect(),
+    );
+    let hint = if max_scroll > 0 {
+        "↑↓ 翻 · U 再试一次 · Esc 关闭"
+    } else {
+        "U 再试一次 · Esc 关闭"
+    };
+    row(
+        buf,
+        Rect {
+            y: inner.bottom() - 1,
+            height: 1,
+            ..inner
+        },
+        vec![sp(hint, fg(t.faint))],
         vec![],
     );
 }

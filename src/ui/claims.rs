@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -34,6 +35,9 @@ pub const CLAIM_WINDOW: Duration = Duration::from_secs(10);
 pub const CLAIM_WITNESSES: u32 = 2;
 /// 临时 id 那个进程的输出时刻留多久（对话的变化在这之内都对完了）。
 const CLAIM_KEEP: Duration = Duration::from_secs(600);
+/// 守护进程同一批输出会同时报有输出和标题/响铃/通知（有输出最多一秒报一次）：相隔不到这么久的算同一次输出
+/// （审计 v0.1.4 第 6 条：一批输出不能算两份证据）。
+const SAME_BATCH: Duration = Duration::from_secs(1);
 
 /// 一条认领：临时 id 下的进程 `pid` 写的就是列表里的 `real`。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,12 +83,15 @@ pub struct Claims {
     refuted: HashSet<(SessionId, SessionId)>,
     /// 临时 id → 认领到的那条。
     bound: HashMap<SessionId, Bound>,
+    /// `bound` 里从落盘记录接过来的（重开时读回的、别的会话台认领的）：记录里撤了就跟着撤。
+    adopted: HashSet<SessionId>,
 }
 
 impl Claims {
     /// 从落盘的认领接着来（会话台重开、守护进程中断后认回用）。
     pub fn restore(bound: HashMap<SessionId, Bound>) -> Self {
         Self {
+            adopted: bound.keys().cloned().collect(),
             bound,
             ..Self::default()
         }
@@ -92,7 +99,18 @@ impl Claims {
 
     /// 接上别的会话台落盘的认领（审计 v0.1.4 第 13 条：别的窗口新建、认领的，这边也要认得）。
     /// 自己已有认领的临时 id、自己有证据否掉的、进程号和这边看着的对不上的、那条已认领在别的临时 id 下的，不接。
+    /// 之前接过来的、记录里已经撤掉或换了的（别的会话台有证据否掉了），这边也撤。
     pub fn adopt(&mut self, saved: HashMap<SessionId, Bound>) {
+        let gone: Vec<SessionId> = self
+            .adopted
+            .iter()
+            .filter(|t| saved.get(*t) != self.bound.get(*t))
+            .cloned()
+            .collect();
+        for temp in gone {
+            self.bound.remove(&temp);
+            self.adopted.remove(&temp);
+        }
         // 记录里同一条认在几个临时 id 下（记坏了）：哪个都不接。
         let twice = |real: &SessionId| saved.values().filter(|b| b.real == *real).count() > 1;
         let mut take = Vec::new();
@@ -111,6 +129,7 @@ impl Claims {
                 take.push((temp.clone(), b.clone()));
             }
         }
+        self.adopted.extend(take.iter().map(|(t, _)| t.clone()));
         self.bound.extend(take);
     }
 
@@ -137,6 +156,7 @@ impl Claims {
             Some(b) if b.pid != pid => {
                 let real = b.real.clone();
                 self.bound.remove(temp);
+                self.adopted.remove(temp);
                 self.refuted.insert((real, temp.clone()));
                 true
             }
@@ -159,11 +179,14 @@ impl Claims {
         self.watches.iter().map(|(id, w)| (id, w.pid))
     }
 
-    /// 临时 id 那个进程在 `at` 有输出。
+    /// 临时 id 那个进程在 `at` 有输出。和上一次相隔不到 [`SAME_BATCH`] 的是同一批，不另记。
     pub fn output(&mut self, temp: &SessionId, at: SystemTime) {
         let Some(w) = self.watches.get_mut(temp) else {
             return;
         };
+        if w.outputs.back().is_some_and(|o| gap(o.at, at) < SAME_BATCH) {
+            return;
+        }
         w.outputs.push_back(Output { at, used: false });
         while w
             .outputs
@@ -233,6 +256,7 @@ impl Claims {
                 self.refuted.insert(key);
                 if self.bound.get(temp).is_some_and(|b| b.real == real) {
                     self.bound.remove(temp);
+                    self.adopted.remove(temp);
                     changed.push(temp.clone());
                 }
             }
@@ -252,6 +276,7 @@ impl Claims {
                 .iter()
                 .any(|(r, t)| (r == real) != (t == temp) && self.open(r, t));
             if enough && !rival {
+                self.adopted.remove(temp);
                 self.bound.insert(
                     temp.clone(),
                     Bound {
@@ -283,6 +308,9 @@ pub(super) struct NewSession {
     pub(super) cwd: PathBuf,
     /// 新建那一刻这个项目里已有的这家对话（这些肯定不是新建的那条）；守护进程报来的旧对话不知道，是空的。
     pub(super) existing: HashSet<SessionId>,
+    /// 各账号的对话都可能是它：旧版守护进程托管、不带账号前缀的临时 id（v0.1.3 新建工作账号的对话也不带前缀，
+    /// 审计 v0.1.4 第 7 条）。按时间对得上的各账号对话都参与对证，认不准就是歧义。
+    pub(super) any_account: bool,
 }
 
 /// 打开一条对话时它实际托管在哪个 id 下。
@@ -303,37 +331,40 @@ pub(super) fn native_hosted(id: &SessionId) -> bool {
 }
 
 /// 以原生 id `id` 托管在项目 `cwd` 的这家对话，对到列表里的哪几条（审计 v0.1.4 第 7 条）。
-/// 列表里有 id 原样相同的那条（默认账号的）就是它：新版托管默认账号的对话也记原生 id，记录里分不出是
-/// v0.1.3 托管的还是新版托管的（没有账号字段），照新版当它（工作账号里同项目的同 id 副本照旧各开各的）。
-/// 没有时（v0.1.3 在自定义目录下托管、升级后那条带了账号前缀）按厂商、原生 id、项目找各账号里的同名对话：
-/// 同项目的正好一条才是它；几条是认不准，一条也不接；没有就是空的。
+/// 按厂商、原生 id 找各账号里的同名对话，只看同项目的：其中有 id 原样相同的那条（默认账号的）就是它
+/// （新版托管默认账号的对话也记原生 id，记录里分不出是 v0.1.3 托管的还是新版托管的，照新版当它）；
+/// 没有时（v0.1.3 在自定义目录下托管、升级后那条带了账号前缀）同项目的正好一条才是它，几条是认不准。
+/// 同项目的一条都没有时，id 原样相同的那条还算它（对话记的项目和托管时的不一样，别的账号也没有能是它的）。
 pub(super) fn native_owners<'a>(
     id: &SessionId,
     vendor: Vendor,
     cwd: &Path,
     listed: impl IntoIterator<Item = &'a Session>,
 ) -> Vec<&'a Session> {
-    let same: Vec<&Session> = listed
+    let (here, elsewhere): (Vec<&Session>, Vec<&Session>) = listed
         .into_iter()
         .filter(|s| s.vendor == vendor && s.id.native() == id.as_str())
-        .collect();
-    if let Some(exact) = same.iter().find(|s| s.id == *id) {
-        return vec![exact];
+        .partition(|s| s.cwd == cwd);
+    let exact = |v: &[&'a Session]| v.iter().copied().find(|s| s.id == *id);
+    match exact(&here) {
+        Some(s) => vec![s],
+        None if here.is_empty() => exact(&elsewhere).into_iter().collect(),
+        None => here,
     }
-    same.into_iter().filter(|s| s.cwd == cwd).collect()
 }
 
-/// `s` 会不会是临时 id `temp` 那条、`since` 那一刻在项目 `cwd` 里新建的对话：同一个账号、同一项目、
-/// id 是那之后才生成的（新建之前就有的对话，不管后来在别处聊没聊，都不可能是它），
-/// 且不在新建那一刻已有的对话 `existing` 里。id 看不出生成时间的一律不认。
+/// `s` 会不会是临时 id `temp` 那条、`since` 那一刻在项目 `cwd` 里新建的对话：同一个账号（`any_account`
+/// 时哪个账号都行，见 [`NewSession::any_account`]）、同一项目、id 是那之后才生成的（新建之前就有的对话，
+/// 不管后来在别处聊没聊，都不可能是它），且不在新建那一刻已有的对话 `existing` 里。id 看不出生成时间的一律不认。
 pub(super) fn is_new_since(
     s: &Session,
     temp: &SessionId,
     cwd: &Path,
     since: SystemTime,
     existing: Option<&HashSet<SessionId>>,
+    any_account: bool,
 ) -> bool {
-    s.account == temp.split_account().0
+    (any_account || s.account == temp.split_account().0)
         && s.cwd == cwd
         && sources::created_at(s).is_some_and(|c| c >= since)
         && !existing.is_some_and(|e| e.contains(&s.id))
@@ -346,7 +377,9 @@ fn may_be(h: &HostedInfo, x: &Session, known: &HashMap<SessionId, NewSession>) -
         && h.pid.is_some()
         && !x.automatic
         && temp_started(&h.id).is_some_and(|t| {
-            is_new_since(x, &h.id, &h.cwd, t, known.get(&h.id).map(|n| &n.existing))
+            let n = known.get(&h.id);
+            let any = n.is_some_and(|n| n.any_account);
+            is_new_since(x, &h.id, &h.cwd, t, n.map(|n| &n.existing), any)
         })
 }
 
@@ -355,7 +388,8 @@ fn may_be(h: &HostedInfo, x: &Session, known: &HashMap<SessionId, NewSession>) -
 /// 进程还在跑，才认作那个临时 id、接到那个进程上（不再起第二个 `resume`）。按时间可能是它、又没认领、
 /// 也没被证据否掉的，是 [`Hosted::Ambiguous`]：绝不接错。
 /// 以原生 id 托管着的（v0.1.3 托管的）按 [`native_owners`] 对到 `listed`（这家列表里的全部对话）：
-/// 对上唯一一条就接到那个进程上，对上几条都是认不准，不再起第二个 CLI。
+/// 对上唯一一条就接到那个进程上，对上几条都是认不准，不再起第二个 CLI；
+/// 自己的 id 托管着、对到的却是别的那条：也是认不准。
 pub(super) fn hosted_alias(
     s: &Session,
     hosted: &[HostedInfo],
@@ -374,6 +408,10 @@ pub(super) fn hosted_alias(
             .filter(|x| x.id == h.id || !hosted.iter().any(|y| y.id == x.id));
         let owners = native_owners(&h.id, h.vendor, &h.cwd, others);
         if !owners.iter().any(|o| o.id == s.id) {
+            // 自己的 id 托管着、对到的却是别的账号那条（项目对不上）：认不准，不拿这个 id 再起一个。
+            if h.id == s.id && !owners.is_empty() {
+                return Hosted::Ambiguous;
+            }
             continue;
         }
         return match owners.as_slice() {
@@ -457,6 +495,33 @@ pub(super) fn save_claims(
     std::fs::write(&tmp, json)
         .and_then(|()| std::fs::rename(&tmp, &path))
         .map_err(|e| io::Error::new(e.kind(), format!("{}：{e}", path.display())))
+}
+
+/// 认领记录文件上次看到的样子（修改时间、大小、inode；改写是换文件，inode 必变）：变了才重读，
+/// 交给 [`Claims::adopt`]（审计 v0.1.4 第 13 条：别的会话台后来认领或撤销的，这边不等下次补取托管列表）。
+#[derive(Debug, Default)]
+pub(super) struct ClaimsStamp(Option<(SystemTime, u64, u64)>);
+
+impl ClaimsStamp {
+    /// `dir` 里的认领记录和上次看到的不一样了（写过、删了）：返回读到的记录（删了是空的）；没变返回 `None`。
+    /// 读不出来也算看过这一版，下次变了再读，不每轮报错。
+    pub(super) fn reload(
+        &mut self,
+        dir: &Path,
+        now: SystemTime,
+    ) -> io::Result<Option<HashMap<SessionId, Bound>>> {
+        let path = dir.join(CLAIMS_FILE);
+        let stamp = match std::fs::metadata(&path) {
+            Ok(m) => Some((m.modified()?, m.len(), m.ino())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{}：{e}", path.display()))),
+        };
+        if stamp == self.0 {
+            return Ok(None);
+        }
+        self.0 = stamp;
+        load_claims(dir, now).map(Some)
+    }
 }
 
 /// 拿认领记录的独占锁（flock）；返回的文件关掉时锁随之释放。别的会话台占着就等，最多 [`CLAIMS_LOCK_WAIT`]。

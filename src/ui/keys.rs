@@ -38,8 +38,12 @@ pub enum Action {
     Rename,
     Pin,
     Archive,
+    /// 开 / 关撞额度后到重置时间自动继续（只在认得出撞额度的那几家的对话上有）。
+    AutoContinue,
     Trash,
     Untrash,
+    /// 把只剩备份的 Claude 对话放回 Claude 目录再接着聊。
+    PutBack,
     Kill,
     Editor,
     Finder,
@@ -47,6 +51,8 @@ pub enum Action {
     Settings,
     /// `$` 额度面板。
     Balance,
+    /// 顶栏「更新」：升级各家 CLI（有没升上的就看原文）。
+    UpgradeClis,
     Help,
     Quit,
 }
@@ -117,14 +123,17 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('e') => Action::Rename,
         KeyCode::Char('p') => Action::Pin,
         KeyCode::Char('a') => Action::Archive,
+        KeyCode::Char('A') => Action::AutoContinue,
         KeyCode::Char('d') => Action::Trash,
         KeyCode::Char('u') => Action::Untrash,
+        KeyCode::Char('P') => Action::PutBack,
         KeyCode::Char('x') => Action::Kill,
         KeyCode::Char('o') => Action::Editor,
         KeyCode::Char('f') => Action::Finder,
         KeyCode::Char('g') => Action::GitStatus,
         KeyCode::Char(',') => Action::Settings,
         KeyCode::Char('$') => Action::Balance,
+        KeyCode::Char('U') => Action::UpgradeClis,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
@@ -252,6 +261,21 @@ pub fn menu(sel: Selected) -> Vec<MenuItem> {
     }
 }
 
+/// 只剩备份的 Claude 对话菜单最前面那项（见 `App::menu_items`）。
+pub fn put_back_item() -> MenuItem {
+    m(Action::PutBack, "P", "放回 Claude 目录再接着聊")
+}
+
+/// 对话菜单里「撞额度后自动继续」开关（只在认得出撞额度的那几家的对话上加，见 `App::menu_items`）。
+pub fn auto_continue_item(on: bool) -> MenuItem {
+    let label = if on {
+        "撞额度后自动继续：开（再按关）"
+    } else {
+        "撞额度后到点自动继续"
+    };
+    m(Action::AutoContinue, "A", label)
+}
+
 /// 帮助页：分组列出全部按键（方案「界面」节）。
 pub const HELP: &[(&str, &[KeyHelp])] = &[
     (
@@ -282,6 +306,7 @@ pub const HELP: &[(&str, &[KeyHelp])] = &[
             k("R", "被中断的全部接着做"),
             k("", "否则恢复上次所有标签"),
             k("c", "复制恢复命令"),
+            k("P", "只剩备份的放回再接着聊"),
         ],
     ),
     (
@@ -290,6 +315,7 @@ pub const HELP: &[(&str, &[KeyHelp])] = &[
             k("e", "改名（项目组上改项目显示名）"),
             k("p", "置顶 / 取消"),
             k("a", "归档 / 取消（项目组上整组）"),
+            k("A", "撞额度后到点自动继续 / 取消"),
             k("d", "进回收站"),
             k("u", "从回收站恢复"),
             k("x", "结束后台任务 / 移出被中断"),
@@ -308,6 +334,7 @@ pub const HELP: &[(&str, &[KeyHelp])] = &[
         &[
             k(",", "设置"),
             k("$", "各账号额度和余额"),
+            k("U", "升级各家 CLI"),
             k("q", "退出（后台对话不停）"),
             k("单击", "选中；组标题收起 / 展开"),
             k("", "顶栏 ◆ 跳到等你回复的"),

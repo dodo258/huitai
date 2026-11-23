@@ -14,7 +14,7 @@ impl App {
         let Overlay::Menu { x, y, .. } = self.overlay else {
             return None;
         };
-        let n = keys::menu(sel).len();
+        let n = self.menu_items(sel).len();
         let at = |cursor| Overlay::Menu { sel, x, y, cursor };
         match key.code {
             KeyCode::Esc => self.overlay = Overlay::None,
@@ -34,7 +34,7 @@ impl App {
     /// 执行右键菜单第 `i` 项：关菜单，对选中项做这一项的动作。
     pub(super) fn run_menu_item(&mut self, sel: Selected, i: usize) -> Vec<Effect> {
         self.overlay = Overlay::None;
-        match keys::menu(sel).get(i) {
+        match self.menu_items(sel).get(i) {
             Some(item) => self.act(item.action),
             None => Vec::new(),
         }

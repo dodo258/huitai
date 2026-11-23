@@ -55,7 +55,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 2. **Type `ai`**: the tools you have installed sit along the top as tabs (missing ones are hidden); click one or press `Tab` to switch. Conversations are grouped by project on the left; the last few messages are previewed on the right, and `v` shows the whole conversation.
 3. **Press Enter to continue**: select a conversation and press Enter. A new tab opens in the project directory and resumes it.
 
-Not sure everything is set up? Run `ai doctor`. It checks the three CLIs and their versions, the session directories, quota, whether the current terminal can open new tabs, and whether the background daemon is running.
+Not sure everything is set up? Run `ai doctor`. It checks how each CLI was installed (npm, Homebrew, official installer…), its current and latest version and which command upgrades it, the session directories, quota, whether the current terminal can open new tabs, and whether the background daemon is running.
 
 ## Everyday tasks
 
@@ -69,9 +69,13 @@ Not sure everything is set up? Run `ai doctor`. It checks the three CLIs and the
 
 **Pick up after a power cut**: after a power cut, reboot or daemon crash, open `ai` and an "Interrupted" group appears at the top with the conversations that were running. `R` reopens all of them in new tabs and tells each one to check where it left off before carrying on; to open just one, select it and press Enter. Settings has an option to open huitai at login.
 
-**Check your quota**: the right side of the top bar shows the current tool's quota. Claude and Codex show how much of each limit window (such as 5 hours and 7 days) is used, pi shows tokens used today, followed by where the number came from and when. When it can't be read, `ai doctor` shows where each source failed.
+**Check your quota**: the right side of the top bar shows the current tool's quota. Claude and Codex show how much of each limit window (such as 5 hours and 7 days) is used and when it resets, pi shows tokens used today, followed by where the number came from and when. When it can't be read, `ai doctor` shows where each source failed.
+
+**See how full the context is**: Claude conversations started from huitai show "上下文 72%" (context used) after the title in the list and in the preview header, turning yellow at 80% and red at 95%, a hint to `/compact` or start fresh. The number comes from the official data Claude passes to its status line, so it appears after the first reply; other tools don't show it yet.
 
 **Get deleted conversations back**: `d` moves a conversation to huitai's trash; nothing is really deleted (Codex conversations are only hidden). `u` restores the most recently deleted one for this tool; press it again to go further back.
+
+**A warning and a backup before Claude deletes old conversations**: Claude Code deletes conversations untouched for longer than `cleanupPeriodDays` (30 days by default). When one is less than 3 days away, the preview header says "约 2 天后被 Claude 删除" (deleted by Claude in about 2 days), and `ai doctor` tells you the number of days on this Mac. huitai keeps a compressed backup of every Claude conversation you have pinned, renamed or archived (or all of them, in Settings) under `~/Library/Application Support/huitai/backups/claude/`. After Claude deletes the original, the conversation stays in the list marked "只剩备份" (backup only); you can preview, read, search and export it, and `P` (or "放回 Claude 目录再接着聊" in the right-click menu) puts it back where Claude keeps it so you can carry on. An existing file at that path is never overwritten.
 
 A header row tops the list: projects and conversation titles on the left, then columns for status (each conversation's status light, preceded by plan progress such as `2/5` when there is one; a collapsed project shows how many are running and whether any is waiting), background conversations running, number of conversations, and when you last talked. Every column is right-aligned under its header; in a narrow terminal the conversation count goes first, then background and last talked, the header drops them too, and the status column always stays. Keys 1–9 jump to a project. Expanded project headers sit on a tinted band, and when you scroll into a long group its header stays pinned at the top, so you can always click it or press `←` to fold it. Projects you have not touched for a month fold into "long idle" at the bottom; press Enter to open it. The path at the bottom right opens in Finder when clicked.
 
@@ -98,11 +102,13 @@ Right after the seal, the top bar totals every tool: conversations huitai hosts 
 
 ## Privacy
 
-- Reads the three tools' session files on this Mac and never changes their configuration (`~/.claude/settings.json`, `~/.codex/config.toml`, `~/.pi/agent/`). The only thing that moves their files is delete, which goes to huitai's trash and can be undone.
+- Reads the three tools' session files on this Mac and never changes their configuration (`~/.claude/settings.json`, `~/.codex/config.toml`, `~/.pi/agent/`). The only thing that moves their files is delete, which goes to huitai's trash and can be undone; the only thing that writes into their folders is `P`, which puts a backup-only Claude conversation back where it was.
 - No uploads, no analytics, no telemetry. Renames, pins, archives and settings live in `~/Library/Application Support/huitai/`.
 - When huitai starts Claude it passes `--settings` with a status line command to read quota. It applies to that launch only, and your own status line still shows.
-- There are only two kinds of network access. The first is Claude's fallback quota source: when the status line data is missing, it asks Anthropic's official usage endpoint once using your local Claude Code login, and caches the answer for 5 minutes. The credential is used in memory only, never written to disk. `ai doctor` tries every source, so it makes this request too.
+- There are only a few kinds of network access. The first is Claude's fallback quota source: when the status line data is missing, it asks Anthropic's official usage endpoint once using your local Claude Code login, and caches the answer for 5 minutes. The credential is used in memory only, never written to disk. `ai doctor` tries every source, so it makes this request too.
 - The second is the new-version check: at most once a day it sends one request to GitHub Releases with no personal information, gives up silently after 3 seconds, and when a newer version exists the top bar shows "有新版 x.y.z · ai update" (new version available). It never updates by itself. To turn it off, switch off 「检查新版本」 (check for new versions) in settings (`,`), or set the environment variable `HUITAI_NO_UPDATE_CHECK=1`.
+- The third is the new-version check for each CLI: it asks the public endpoint that matches how the CLI was installed (npm registry for npm installs, formulae.brew.sh for Homebrew, the vendor's own release URL for official installers, GitHub for Codex standalone and Hermes), at most once every 20 hours per CLI, gives up silently after 10 seconds, and sends no personal information. When a newer version exists, a small "↑" follows that tool's tab in the top bar and `ai doctor` shows the new version and the upgrade command. The same switch turns it off.
+- Upgrading the CLIs: when some can be upgraded for you, a filled 「更新」 (update) button appears on the right of the top bar. Press `U` or click it to run each one's official upgrade command for how it is installed (`npm install -g …@latest`, `brew upgrade …`, the official install script, `claude update` and so on, never sudo). It shows progress while running, disappears when everything succeeded, and turns into 「1 家没升上」 (1 failed) when something failed; open it to see the command and its raw output. On the command line: `ai update <tool>` or `ai update --all`. 「自动升级」 (auto-upgrade) in settings is on by default: a CLI is upgraded automatically while it has no conversation hosted by huitai running, never across a major version; tools with their own auto-updater (Claude Code, Kimi Code…) get 24 hours to update themselves first. Installs that need sudo, a mismatched npm prefix, or a major-version jump only get the command, never run for you. Results show in the status line; `ai doctor` shows the last upgrade.
 
 ## Keys
 
@@ -131,16 +137,18 @@ Every action is a single key. The bottom bar shows the most common ones; `?` sho
 | | `a` | Archive / unarchive (on a project: whole group) |
 | | `d` | Move to trash |
 | | `u` | Restore from trash |
+| | `P` | Put a backup-only Claude conversation back |
 | | `x` | End a background conversation / dismiss from Interrupted |
 | Project | `o` | Open in editor |
 | | `f` | Show in Finder |
 | | `g` | Show changed files |
 | Other | `,` | Settings |
+| | `U` | Upgrade the CLIs (when the top bar shows 「更新」; shows the raw output of failures) |
 | | `?` | All keys |
 | | `q` | Quit (background conversations keep running) |
 | Global | `⌥Space` | Bring up huitai |
 
-There are eight commands: `ai` (the list), `ai doctor` (self-check), `ai list` and `ai search <words>` (list or search conversations without opening the UI, see "Command-line queries" below), `ai export <conversation id> [-o file]` (export one conversation as Markdown, printed to standard output without `-o`; the id is in the resume command `c` copies, and if several accounts have the same id it lists account-qualified ids to pick from), `ai update` (upgrade: runs `brew upgrade` for Homebrew installs, prints the command for cargo installs, and for downloaded builds verifies the new one before swapping it in; running conversations are not interrupted), `ai attach <id>` (used by new tabs, no need to remember it) and `ai daemon` (the background daemon, started automatically).
+There are eight commands: `ai` (the list), `ai doctor` (self-check), `ai list` and `ai search <words>` (list or search conversations without opening the UI, see "Command-line queries" below), `ai export <conversation id> [-o file]` (export one conversation as Markdown, printed to standard output without `-o`; the id is in the resume command `c` copies, and if several accounts have the same id it lists account-qualified ids to pick from), `ai update` (upgrade huitai itself: runs `brew upgrade` for Homebrew installs, prints the command for cargo installs, and for downloaded builds verifies the new one before swapping it in; running conversations are not interrupted; `ai update <tool>` upgrades that CLI and `ai update --all` every one that can be), `ai attach <id>` (used by new tabs, no need to remember it) and `ai daemon` (the background daemon, started automatically).
 
 ## Command-line queries
 

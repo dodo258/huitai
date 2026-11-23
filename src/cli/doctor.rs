@@ -1,5 +1,5 @@
-//! `ai doctor`：自检。各家 CLI 装好没有、会话目录读不读得了、额度每个渠道能不能用、余额和订阅额度各渠道通不通、
-//! 当前终端能不能开新标签页、守护进程是哪一版。只读，不开窗口、不弹授权框。
+//! `ai doctor`：自检。各家 CLI 装好没有、怎么装的、有没有新版、会怎么升级，会话目录读不读得了、额度每个渠道能不能用、余额和订阅额度各渠道通不通、
+//! Claude 会删多少天没动的对话、会话台给它们的备份占多大，当前终端能不能开新标签页、守护进程是哪一版。只读，不开窗口、不弹授权框。
 
 use std::fmt::Write as _;
 use std::io::{self, ErrorKind};
@@ -7,19 +7,17 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::core::{Config, QuotaReading, QuotaValue, Vendor, exec};
+use crate::clis;
+use crate::core::{Account, Config, QuotaReading, QuotaValue, Vendor, exec, release};
 use crate::host::{self, Build, DaemonInfo, version};
 use crate::opener::{CmuxOpener, KakuOpener, Terminal};
 use crate::quota::{self, BalanceReport, ChannelReport, OriginAccount, QuotaReader};
-use crate::sources::{self, Source, Trash};
+use crate::sources::claude::{self, RetentionFrom};
+use crate::sources::{self, Source, Trash, backup};
 use crate::ui::{balance, text, view};
 
-/// 找 CLI 用的登录 shell 最多等多久（nvm、oh-my-zsh 这类配置启动慢）。
-const CLI_TIMEOUT: Duration = Duration::from_secs(15);
 /// `kaku cli list` 最多等多久。
 const KAKU_TIMEOUT: Duration = Duration::from_secs(5);
-/// 登录 shell 输出里标出 CLI 路径的那一行（shell 配置自己打印的东西在它前面，跳过）。
-const PATH_MARK: &str = "HUITAI_PATH=";
 
 /// 一项检查的结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +77,12 @@ pub fn report(dir: &Path) -> String {
     let srcs = sources::default_sources(&home, Trash::new(dir.join("trash")));
     let config = Config::load(&dir.join("config.json"));
 
+    // 关了「检查新版本」的，各家 CLI 也不联网查最新版。
+    let check = config.as_ref().map_or(true, |c| c.check_updates)
+        && !release::disabled_by_env(env(release::NO_CHECK_ENV).as_deref());
     // 找 CLI 要起登录 shell，和扫描、读额度互不相干，并行做。
     let (clis, scans, quotas, balances) = thread::scope(|s| {
-        let clis = s.spawn(|| cli_section(&shell, &home, &srcs));
+        let clis = s.spawn(|| cli_section(&shell, &home, dir, check));
         let scans = s.spawn(|| sessions_section(&srcs, &home));
         let balances = s.spawn(|| balance_section(&home));
         let quotas = quota_section();
@@ -100,6 +101,12 @@ pub fn report(dir: &Path) -> String {
         scans,
         quotas,
         balances,
+        claude_backup_section(
+            &sources::local_accounts(&home),
+            dir,
+            &home,
+            config.as_ref().is_ok_and(|c| c.backup_all_claude),
+        ),
         terminal_section(&Terminal::current(), &env, config.as_ref().ok(), cli_probe),
         Section {
             title: "守护进程".to_owned(),
@@ -140,89 +147,195 @@ pub fn render(sections: &[Section]) -> String {
     out
 }
 
-// ---- 各家 CLI ----
+// ---- Claude 对话保留和备份 ----
 
-/// 和开对话时一样用登录 shell（`$SHELL -lc`）在家目录找，找得到再问版本。
-fn cli_section(shell: &str, home: &Path, srcs: &[Box<dyn Source>]) -> Section {
-    let items = thread::scope(|s| {
-        let jobs: Vec<_> = srcs
-            .iter()
-            .map(|src| {
-                let program = src.new_cmd(home).program;
-                s.spawn(move || {
-                    let found = exec::run(
-                        Path::new(shell),
-                        &["-lc", &find_script(&program)],
-                        None,
-                        CLI_TIMEOUT,
-                    )
-                    .map(|out| parse_find(&out));
-                    cli_item(src.vendor(), &program, found)
-                })
-            })
-            .collect();
-        jobs.into_iter()
-            .map(|j| {
-                j.join()
-                    .unwrap_or_else(|_| item(Mark::Fail, "?", "检查本身出错了"))
-            })
-            .collect()
-    });
+/// 每个 Claude 账号多少天没动的对话会被 Claude 删（只读它 `settings.json` 的 `cleanupPeriodDays`），
+/// 会话台的备份有几份、占多大（`<数据目录>/backups/claude/`，各账号一起算）。
+pub fn claude_backup_section(accounts: &[Account], dir: &Path, home: &Path, all: bool) -> Section {
+    let claude: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| a.vendor == Vendor::Claude)
+        .collect();
+    let mut items: Vec<Item> = claude
+        .iter()
+        .map(|a| {
+            let r = claude::retention(&a.dir);
+            let name = if claude.len() > 1 {
+                format!("保留期（{}）", a.name)
+            } else {
+                "保留期".to_owned()
+            };
+            let said = format!("{} 天没动的 Claude 对话会被删", r.days);
+            let settings = text::tilde(&a.dir.join("settings.json"), home);
+            match r.from {
+                RetentionFrom::Default => item(
+                    Mark::Ok,
+                    name,
+                    format!("{said}（{settings} 没设 cleanupPeriodDays，官方默认 30）"),
+                ),
+                RetentionFrom::Set => item(
+                    Mark::Ok,
+                    name,
+                    format!("{said}（{settings} 的 cleanupPeriodDays）"),
+                ),
+                RetentionFrom::Invalid(v) => item(
+                    Mark::Warn,
+                    name,
+                    format!(
+                        "{settings} 的 cleanupPeriodDays 不合法（{v}，要不小于 1 的整数），按默认 30 天算：{said}"
+                    ),
+                ),
+            }
+        })
+        .collect();
+    let root = dir.join(backup::BACKUP_DIR);
+    let (n, bytes) = backup::usage(&root);
+    let what = if all {
+        "备全部 Claude 对话"
+    } else {
+        "只备置顶、改名、归档的（设置里可改成全部）"
+    };
+    items.push(item(
+        Mark::Ok,
+        "备份",
+        format!(
+            "{n} 份，占 {}，{what}；在 {}",
+            size_label(bytes),
+            text::tilde(&root, home)
+        ),
+    ));
     Section {
-        title: "各家 CLI（用登录 shell 找，和开对话时一样）".to_owned(),
+        title: "Claude 对话保留和备份".to_owned(),
         items,
     }
 }
 
-/// 登录 shell 里跑的那一行：打印路径，找得到就打印版本（stderr 也收，有的 CLI 把版本写在那里）。
-pub fn find_script(program: &str) -> String {
-    format!(
-        "p=$(command -v {program}); printf '\\n{PATH_MARK}%s\\n' \"$p\"; \
-         if [ -n \"$p\" ]; then {program} --version 2>&1; fi; exit 0"
-    )
-}
-
-/// 找到的 CLI：路径和版本那一行（问不出版本时为空）。
-#[derive(Debug, PartialEq, Eq)]
-pub enum Found {
-    Missing,
-    At { path: String, version: String },
-}
-
-/// 解析 [`find_script`] 的输出。标记行之前是 shell 配置自己打印的东西，不看。
-pub fn parse_find(out: &str) -> Found {
-    let mut lines = out.lines();
-    let Some(path) = lines.by_ref().find_map(|l| l.strip_prefix(PATH_MARK)) else {
-        return Found::Missing;
-    };
-    let path = path.trim();
-    if path.is_empty() {
-        return Found::Missing;
-    }
-    let version = lines
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or_default();
-    Found::At {
-        path: path.to_owned(),
-        version: version.to_owned(),
+/// 「312 KB」「4.2 MB」「1.3 GB」。
+fn size_label(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < K * K {
+        format!("{:.0} KB", (b / K).ceil())
+    } else if b < K * K * K {
+        format!("{:.1} MB", b / K / K)
+    } else {
+        format!("{:.1} GB", b / K / K / K)
     }
 }
 
-pub fn cli_item(vendor: Vendor, program: &str, found: io::Result<Found>) -> Item {
-    let name = format!("{} {}", vendor.mark(), vendor.name());
-    match found {
-        Ok(Found::At { path, version }) if version.is_empty() => {
-            item(Mark::Warn, name, format!("{path}（问不出版本）"))
+// ---- 各家 CLI ----
+
+/// 和开对话时一样用登录 shell 的 PATH 找，认出装法和版本；开着「检查新版本」时再查最新版（20 小时缓存，10 秒超时）。
+fn cli_section(shell: &str, home: &Path, dir: &Path, check: bool) -> Section {
+    let title = "各家 CLI（用登录 shell 的 PATH 找，和开对话时一样）".to_owned();
+    let login = match clis::login_env(Path::new(shell)) {
+        Ok(l) => l,
+        Err(e) => {
+            return Section {
+                title,
+                items: vec![item(Mark::Fail, "登录 shell", format!("没跑完：{e}"))],
+            };
         }
-        Ok(Found::At { path, version }) => item(Mark::Ok, name, format!("{version}  {path}")),
-        Ok(Found::Missing) => item(
-            Mark::Fail,
-            name,
-            format!("没找到 {program} 命令：没装，或登录 shell 的 PATH 里没有它"),
-        ),
-        Err(e) => item(Mark::Fail, name, format!("登录 shell 没跑完：{e}")),
+    };
+    let installs = clis::probe(&login, home);
+    let statuses = if check {
+        clis::check(
+            dir,
+            installs,
+            now_secs(),
+            &clis::Bases::official(),
+            clis::TIMEOUT,
+        )
+    } else {
+        installs
+            .into_iter()
+            .map(|install| clis::Status {
+                install,
+                latest: None,
+                seen_at: None,
+            })
+            .collect()
+    };
+    let last = clis::last_results(dir);
+    let items = Vendor::ALL
+        .iter()
+        .map(|&v| match statuses.iter().find(|s| s.install.vendor == v) {
+            Some(s) => cli_item(s, check, last.get(&v)),
+            None => item(
+                Mark::Fail,
+                format!("{} {}", v.mark(), v.name()),
+                format!(
+                    "没找到 {} 命令：没装，或登录 shell 的 PATH 里没有它",
+                    clis::program(v)
+                ),
+            ),
+        })
+        .collect();
+    Section { title, items }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// 一家：装法 · 当前版本 · 最新版 · 会怎么升级，最后是路径；升级过的下一行接着写上次升级（自动还是手动、
+/// 几点、成没成，没成带原文）。有新版、问不出版本、认不出装法是「!」。
+pub fn cli_item(status: &clis::Status, checked: bool, last: Option<&clis::Outcome>) -> Item {
+    let i = &status.install;
+    let name = format!("{} {}", i.vendor.mark(), i.vendor.name());
+    let current = i.version.as_deref().unwrap_or("问不出版本");
+    let newer = status.newer();
+    let latest = match (checked, newer, status.latest.as_deref()) {
+        (false, _, _) => "没查最新版（关了检查新版本）".to_owned(),
+        (true, Some(v), _) => format!("有新版 {v}"),
+        (true, None, Some(_)) => "已是最新".to_owned(),
+        (true, None, None) => "最新版没查到".to_owned(),
+    };
+    let plan = clis::plan(i, status.latest.as_deref());
+    let mark = if newer.is_some() || i.version.is_none() || i.method == clis::Method::Unknown {
+        Mark::Warn
+    } else {
+        Mark::Ok
+    };
+    let mut detail = format!(
+        "{} · {current} · {latest} · 升级：{}  {}",
+        i.method.label(i.vendor),
+        plan.describe(),
+        i.path.display()
+    );
+    if let Some(o) = last {
+        let when = jiff::Timestamp::from_second(i64::try_from(o.at).unwrap_or(0))
+            .map(|t| {
+                let d = jiff::tz::TimeZone::system().to_datetime(t);
+                format!(
+                    "{:02}-{:02} {:02}:{:02}",
+                    d.month(),
+                    d.day(),
+                    d.hour(),
+                    d.minute()
+                )
+            })
+            .unwrap_or_default();
+        let how = if o.auto {
+            "自动升级"
+        } else {
+            "手动升级"
+        };
+        let result = if o.ok {
+            o.message.clone()
+        } else {
+            format!("没升上：{}", o.message)
+        };
+        // 原文可能有多行：缩进接在下面，和别的项对齐看得清。
+        let result = result.replace('\n', "\n      ");
+        detail.push_str(&format!(
+            "\n      上次{how}（{when}，→ {}）：{result}",
+            o.target
+        ));
     }
+    item(mark, name, detail)
 }
 
 // ---- 会话目录 ----
@@ -660,59 +773,73 @@ mod tests {
     }
 
     #[test]
-    fn find_script_runs_in_a_real_shell() {
-        let out = exec::run(
-            Path::new("/bin/sh"),
-            &["-c", &find_script("sh")],
-            None,
-            CLI_TIMEOUT,
-        )
-        .unwrap();
-        assert!(
-            matches!(parse_find(&out), Found::At { ref path, .. } if path.ends_with("/sh")),
-            "{out}"
-        );
-        let out = exec::run(
-            Path::new("/bin/sh"),
-            &["-c", &find_script("huitai-no-such-cli")],
-            None,
-            CLI_TIMEOUT,
-        )
-        .unwrap();
-        assert_eq!(parse_find(&out), Found::Missing, "{out}");
-    }
-
-    #[test]
-    fn parse_find_skips_shell_noise() {
-        let out = "欢迎回来\nHUITAI_PATH=/opt/bin/claude\n\n2.1.330 (Claude Code)\n";
-        assert_eq!(
-            parse_find(out),
-            Found::At {
-                path: "/opt/bin/claude".to_owned(),
-                version: "2.1.330 (Claude Code)".to_owned()
-            }
-        );
-        assert_eq!(parse_find("HUITAI_PATH=\n"), Found::Missing);
-        assert_eq!(parse_find("没有标记"), Found::Missing);
-    }
-
-    #[test]
     fn cli_items() {
-        let ok = cli_item(
-            Vendor::Codex,
-            "codex",
-            Ok(Found::At {
-                path: "/b/codex".to_owned(),
-                version: "codex-cli 0.171.0".to_owned(),
-            }),
-        );
+        let status = |version: Option<&str>, latest: Option<&str>| clis::Status {
+            install: clis::Install {
+                vendor: Vendor::Codex,
+                path: PathBuf::from("/b/codex"),
+                real: PathBuf::from("/b/lib/node_modules/@openai/codex/bin/codex.js"),
+                method: clis::Method::Package {
+                    manager: clis::Manager::Npm,
+                    package: "@openai/codex",
+                },
+                version: version.map(str::to_owned),
+                problem: None,
+            },
+            latest: latest.map(str::to_owned),
+            seen_at: None,
+        };
+        let ok = cli_item(&status(Some("0.171.0"), Some("0.171.0")), true, None);
         assert_eq!(ok.mark, Mark::Ok);
-        assert!(ok.detail.contains("codex-cli 0.171.0"), "{ok:?}");
-        let missing = cli_item(Vendor::Pi, "pi", Ok(Found::Missing));
-        assert_eq!(missing.mark, Mark::Fail);
-        assert!(missing.detail.contains("没找到 pi"), "{missing:?}");
-        let timeout = cli_item(Vendor::Pi, "pi", Err(io::Error::from(ErrorKind::TimedOut)));
-        assert_eq!(timeout.mark, Mark::Fail);
+        assert_eq!(
+            ok.detail,
+            "npm 全局 · 0.171.0 · 已是最新 · 升级：npm install -g @openai/codex@latest  /b/codex"
+        );
+        let new = cli_item(&status(Some("0.171.0"), Some("0.172.0")), true, None);
+        assert_eq!(new.mark, Mark::Warn);
+        assert!(new.detail.contains("有新版 0.172.0"), "{new:?}");
+        let off = cli_item(&status(Some("0.171.0"), None), false, None);
+        assert!(off.detail.contains("没查最新版"), "{off:?}");
+        let unasked = cli_item(&status(None, Some("0.172.0")), true, None);
+        assert_eq!(unasked.mark, Mark::Warn);
+        assert!(unasked.detail.contains("问不出版本"), "{unasked:?}");
+
+        // 升级过的：下一行写上次升级，没成的带原文（多行缩进接着）。
+        let tried = clis::Outcome {
+            vendor: Vendor::Codex,
+            from: Some("0.171.0".into()),
+            target: "0.172.0".into(),
+            command: "npm install -g @openai/codex@latest".into(),
+            ok: false,
+            message: "npm install -g @openai/codex@latest 退出码 243：\nnpm error code EACCES"
+                .into(),
+            at: 1_800_000_000,
+            auto: true,
+        };
+        let failed = cli_item(
+            &status(Some("0.171.0"), Some("0.172.0")),
+            true,
+            Some(&tried),
+        );
+        assert!(
+            failed.detail.contains("\n      上次自动升级（"),
+            "{failed:?}"
+        );
+        assert!(
+            failed.detail.ends_with(
+                "，→ 0.172.0）：没升上：npm install -g @openai/codex@latest 退出码 243：\n      npm error code EACCES"
+            ),
+            "{failed:?}"
+        );
+        let done = clis::Outcome {
+            ok: true,
+            auto: false,
+            message: "已升到 0.172.0".into(),
+            ..tried
+        };
+        let ok = cli_item(&status(Some("0.172.0"), Some("0.172.0")), true, Some(&done));
+        assert!(ok.detail.contains("上次手动升级（"), "{ok:?}");
+        assert!(ok.detail.ends_with("：已升到 0.172.0"), "{ok:?}");
     }
 
     #[test]

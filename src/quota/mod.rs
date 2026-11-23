@@ -9,13 +9,14 @@
 mod balance;
 mod claude;
 mod codex;
+mod context;
 mod curl;
 mod keys;
 mod rules;
 mod time;
 mod tokens;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,8 @@ pub use balance::{
     Money, Provider, balances, defaults,
 };
 pub use claude::{UsageFetch, UsageRequest, usage_command};
-pub use keys::{Found, FoundKey, KeyOrigin, OriginAccount, Skipped, default_provider, find};
+pub use context::{ContextFiles, ContextUse};
+pub use keys::{Found, FoundKey, KeyOrigin, OriginAccount, Skipped, default_providers, find};
 
 /// 读当前机器上某个账号的额度。
 pub fn quota(account: &Account) -> QuotaReading {
@@ -51,6 +53,12 @@ pub fn supported(vendor: Vendor) -> bool {
 /// `cwd` 是 Claude 的项目目录（用来找项目级的原有状态栏设置）。
 pub fn claude_settings(account: &Account, cwd: &Path) -> Option<String> {
     QuotaReader::system_for(account).map(|r| r.claude_settings(cwd))
+}
+
+/// 会话台启动的这个 Claude 账号里各条对话的上下文占用：厂商自己的会话 id → 读数（见 [`QuotaReader::contexts`]）。
+/// `seen` 由调用方留着，下次只重读变了的。
+pub fn contexts(account: &Account, seen: &mut ContextFiles) -> HashMap<String, ContextUse> {
+    QuotaReader::system_for(account).map_or_else(HashMap::new, |r| r.contexts(seen))
 }
 
 /// 这个账号的额度缓存放哪：默认账号是会话台数据目录本身（老用户的缓存不动），别的账号在 `accounts/<短名>`。

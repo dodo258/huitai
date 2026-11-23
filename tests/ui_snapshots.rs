@@ -507,6 +507,31 @@ fn new_version_hint_in_top_bar() {
     );
 }
 
+/// 那家 CLI 有新版：顶栏那家标签后紧跟一个暗色「↑」，别的家不标；缩成标记时也跟着；关了检查新版本就不标。
+#[test]
+fn cli_update_mark_after_the_tab() {
+    let mut app = demo_app(Vendor::Claude);
+    let top = |app: &mut App, w| row_text(&render(app, w, H), 0);
+    assert!(!top(&mut app, W).contains('↑'));
+
+    app.cli_updates.insert(Vendor::Codex, "0.172.0".to_owned());
+    let compact = top(&mut app, W);
+    assert!(compact.contains("◎↑"), "缩成标记的标签也带着：{compact}");
+    assert!(!compact.contains("Claude↑"), "{compact}");
+    let buf = render(&mut app, W, H);
+    let x = (0..W).find(|&x| buf[(x, 0)].symbol() == "↑").unwrap();
+    assert_eq!(buf[(x, 0)].fg, Theme::DARK.faint);
+    app.vendor = Vendor::Codex;
+    let full = top(&mut app, W);
+    assert!(
+        full.contains("◎ Codex↑"),
+        "当前这家写全名，标记跟在后面：{full}"
+    );
+
+    app.config.check_updates = false;
+    assert!(!top(&mut app, W).contains('↑'), "关了检查就不标");
+}
+
 /// 后台是旧版：顶栏右侧额度前一句暗色提示，条数跟着托管的对话走；放不下额度时额度让位。
 #[test]
 fn old_daemon_hint_in_top_bar() {
@@ -592,4 +617,77 @@ fn two_accounts_label_rows_and_switch_quota() {
         text.contains("88%"),
         "选中工作号的对话，顶栏换成工作号的额度\n{text}"
     );
+}
+
+/// 上下文占用：有读数的行标题后写「上下文 N%」，80% 起黄、95% 起红；预览区标题行跟着写。
+/// 没读数的、读数之后又在会话台外面聊过（会话文件比读数新 10 分钟以上）的不写。
+#[test]
+fn context_use_on_rows_and_preview_head() {
+    use huitai::core::SessionState;
+    use huitai::quota::ContextUse;
+    use std::time::Duration;
+
+    let mut app = demo_app(Vendor::Claude);
+    let plain = dump(&render(&mut app, W, H));
+    assert!(!plain.contains("上下文"), "没读数不写：{plain}");
+
+    let ago = |m: u64| now() - Duration::from_secs(m * 60);
+    let put = |app: &mut App, id: &str, percent: f32, at| {
+        app.contexts
+            .insert(SessionId::from(id), ContextUse { percent, at });
+    };
+    put(&mut app, "c-shop-1", 72.4, ago(3));
+    put(&mut app, "c-shop-2", 85.0, ago(26));
+    // c-shop-3 最后在 30 小时前，读数比它早 11 分钟：过时，不写。
+    put(&mut app, "c-shop-3", 40.0, ago(60 * 30 + 11));
+    let buf = render(&mut app, W, H);
+    let text = dump(&buf);
+    let line_of = |s: &str| {
+        text.lines()
+            .position(|l| l.contains(s))
+            .unwrap_or_else(|| panic!("没有 {s}：{text}")) as u16
+    };
+    let row1 = row_text(&buf, line_of("购物车结算按钮点了没反应  "));
+    assert!(row1.contains("上下文 72%"), "{row1}");
+    assert!(row_text(&buf, line_of("把优惠券接口换成新版")).contains("上下文 85%"));
+    assert!(!row_text(&buf, line_of("结算页首屏加载慢")).contains("上下文"));
+    // 选中的是在跑的 c-shop-1：预览区标题行「在跑 … · 上下文 72%」。
+    // 预览区标题行就在预览区上面一行。
+    let head_text = row_text(&buf, app.areas.preview.y - 1);
+    assert!(head_text.contains("· 上下文 72%"), "{head_text}");
+    assert_snapshot("context", &text);
+
+    // 颜色：没到 80% 是暗色，80% 起黄。
+    let color_at = |buf: &ratatui::buffer::Buffer, y: u16, s: &str| {
+        let line = row_text(buf, y);
+        let col = line[..line.find(s).unwrap()]
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16);
+        buf[(col.sum(), y)].fg
+    };
+    assert_eq!(
+        color_at(&buf, line_of("购物车结算按钮点了没反应  "), "上下文"),
+        Theme::DARK.muted
+    );
+    assert_eq!(
+        color_at(&buf, line_of("把优惠券接口换成新版"), "上下文"),
+        Theme::DARK.state(SessionState::Waiting)
+    );
+
+    // 选中不在跑的那条：预览标题行是「对话预览 · 上下文 85%」。
+    select_id(&mut app, "c-shop-2");
+    load_preview(&mut app);
+    let buf = render(&mut app, W, H);
+    let head_text = row_text(&buf, app.areas.preview.y - 1);
+    assert!(head_text.contains("上下文 85%"), "{head_text}");
+
+    // 95% 起红：c-shop-3 换一份跟得上的读数。
+    put(&mut app, "c-shop-3", 97.0, ago(60 * 30));
+    let buf = render(&mut app, W, H);
+    let text = dump(&buf);
+    let y = text
+        .lines()
+        .position(|l| l.contains("结算页首屏加载慢") && l.contains("上下文 97%"))
+        .expect("c-shop-3 有读数") as u16;
+    assert_eq!(color_at(&buf, y, "上下文"), Theme::DARK.alert());
 }

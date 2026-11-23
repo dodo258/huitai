@@ -1,4 +1,4 @@
-//! 后台线程：预览、此刻、整段对话、命中片段、托管画面、额度、余额、进程、看过、守护进程事件。
+//! 后台线程：预览、此刻、整段对话、命中片段、托管画面、额度、余额、进程、各家 CLI 新版、Claude 对话备份、看过、守护进程事件。
 //! 每个线程收请求、把结果用 [`Msg`] 交回事件循环。
 
 use super::*;
@@ -262,6 +262,37 @@ pub(super) fn balance_worker(accounts: Arc<Vec<Account>>, tx: Sender<Msg>) -> Se
     req
 }
 
+/// 每 [`CONTEXT_EVERY`] 读一次各个 Claude 账号里每条对话的上下文占用，变了才报（全部重报）。
+pub(super) fn context_worker(accounts: Arc<Vec<Account>>, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let claude: Vec<&Account> = accounts
+            .iter()
+            .filter(|a| a.vendor == Vendor::Claude)
+            .collect();
+        if claude.is_empty() {
+            return;
+        }
+        let mut seen: Vec<quota::ContextFiles> =
+            claude.iter().map(|_| Default::default()).collect();
+        let mut last = HashMap::new();
+        loop {
+            let mut now = HashMap::new();
+            for (a, seen) in claude.iter().zip(&mut seen) {
+                for (id, c) in quota::contexts(a, seen) {
+                    now.insert(SessionId::in_account(&a.key, &id), c);
+                }
+            }
+            if now != last {
+                if tx.send(Msg::Context(now.clone())).is_err() {
+                    return;
+                }
+                last = now;
+            }
+            thread::sleep(CONTEXT_EVERY);
+        }
+    });
+}
+
 /// 每 [`PROCS_EVERY`] 看一次本机进程，把参数里带着会话 id 的报上来；`ps` 跑不了这一轮就跳过。
 pub(super) fn procs_worker(tx: Sender<Msg>) {
     thread::spawn(move || {
@@ -279,6 +310,222 @@ pub(super) fn procs_worker(tx: Sender<Msg>) {
             thread::sleep(PROCS_EVERY);
         }
     });
+}
+
+/// 交给各家 CLI 线程的请求。
+pub(super) enum CliRequest {
+    /// 顶栏「更新」：把能一键升的都升一遍。
+    UpgradeAll,
+}
+
+/// 各家 CLI：起来时查一次，之后每小时再看一次（真去联网由 `clis` 的 20 小时缓存管），每轮把有新版的、
+/// 能一键升的报上去；设置里开着自动升级时顺手把能自动升的升了（那家有托管对话在跑就等，10 分钟后再看）。
+/// 收到 [`CliRequest::UpgradeAll`] 就一家家升、报进度。升级都在这一个线程里，同一个会话台不会同时跑两个升级。
+/// 会话台开着时主人升了级，下一轮找到的就是新版本，标记跟着消失；主人在设置里关了「检查新版本」，
+/// 下一轮起就不找、不联网（每轮先看一眼设置文件）。
+pub(super) fn cli_versions_worker(
+    home: PathBuf,
+    data_dir: PathBuf,
+    tx: Sender<Msg>,
+) -> Sender<CliRequest> {
+    const EVERY: Duration = Duration::from_secs(60 * 60);
+    const RETRY: Duration = Duration::from_secs(10 * 60);
+    let (req, rx) = mpsc::channel::<CliRequest>();
+    thread::spawn(move || {
+        let config = data_dir.join("config.json");
+        loop {
+            let snap = config_flag(&config, "check_updates", true)
+                .then(|| clis::snapshot(&home, &data_dir))
+                .flatten();
+            let now = clis::now_secs();
+            if tx
+                .send(Msg::CliUpdates(cli_report(snap.as_ref(), now)))
+                .is_err()
+            {
+                return;
+            }
+            let mut wait = EVERY;
+            if let Some(snap) = snap
+                .as_ref()
+                .filter(|_| config_flag(&config, "auto_upgrade_clis", true))
+            {
+                let (results, pending) = auto_upgrade(snap, &home, &data_dir, now);
+                if pending {
+                    wait = RETRY;
+                }
+                if !results.is_empty() {
+                    if tx.send(Msg::CliAuto(results)).is_err() {
+                        return;
+                    }
+                    // 升完马上重查一遍，按钮和标记跟着变。
+                    wait = Duration::ZERO;
+                }
+            }
+            match rx.recv_timeout(wait) {
+                Ok(CliRequest::UpgradeAll) => {
+                    while rx.try_recv().is_ok() {}
+                    let results = upgrade_all(&home, &data_dir, &tx);
+                    if tx.send(Msg::CliDone(results)).is_err() {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+    req
+}
+
+/// 有新版的、能一键升的。
+fn cli_report(snap: Option<&clis::Snapshot>, now: u64) -> CliReport {
+    let statuses = snap.map_or(&[][..], |s| s.statuses.as_slice());
+    CliReport {
+        newer: statuses
+            .iter()
+            .filter_map(|s| Some((s.install.vendor, s.newer()?.to_owned())))
+            .collect(),
+        ready: statuses
+            .iter()
+            .filter(|s| s.upgrade_now(now).is_some())
+            .map(|s| s.install.vendor)
+            .collect(),
+    }
+}
+
+/// 自动升级这一轮：能自动升的（[`clis::auto_due`]）、此刻没有托管对话在跑的那几家，一家家升。
+/// 返回升了的结果，和还有没有因为对话在跑、锁被占着、问不到守护进程而等着的（等着的 10 分钟后再看）。
+fn auto_upgrade(
+    snap: &clis::Snapshot,
+    home: &Path,
+    data_dir: &Path,
+    now: u64,
+) -> (Vec<CliResult>, bool) {
+    let last = clis::last_results(data_dir);
+    let due: Vec<&clis::Status> = snap
+        .statuses
+        .iter()
+        .filter(|s| clis::auto_due(s, now, last.get(&s.install.vendor)))
+        .collect();
+    if due.is_empty() {
+        return (Vec::new(), false);
+    }
+    let Ok(hosted) = host::client::hosted_vendors(data_dir) else {
+        return (Vec::new(), true);
+    };
+    let runner = clis::Runner {
+        login: &snap.login,
+        home,
+        data_dir,
+        timeout: clis::UPGRADE_TIMEOUT,
+    };
+    let mut pending = false;
+    let mut out = Vec::new();
+    for s in due {
+        let vendor = s.install.vendor;
+        if hosted.contains(&vendor) {
+            pending = true;
+            continue;
+        }
+        let Some(target) = s.newer() else {
+            continue;
+        };
+        let r = clis::upgrade(&s.install, target, false, true, &runner);
+        if r.is_err() {
+            // 被挡住（它自己在更新、别的会话台在升）：没跑，过会儿再看。
+            pending = true;
+            continue;
+        }
+        let (ok, text) = clis::summary(&r);
+        out.push(CliResult { vendor, ok, text });
+    }
+    (out, pending)
+}
+
+/// 一键升级：重新找一遍（最新版用缓存），把能一键升的一家家升，每升完一家报一次进度。
+fn upgrade_all(home: &Path, data_dir: &Path, tx: &Sender<Msg>) -> Vec<CliResult> {
+    let Some(snap) = clis::snapshot(home, data_dir) else {
+        return Vec::new();
+    };
+    let now = clis::now_secs();
+    let targets: Vec<&clis::Status> = snap
+        .statuses
+        .iter()
+        .filter(|s| s.upgrade_now(now).is_some())
+        .collect();
+    // 守护进程答不上来就当每家都有对话在跑：npm 一类原地覆盖的这次不升。
+    let hosted = host::client::hosted_vendors(data_dir)
+        .unwrap_or_else(|_| Vendor::ALL.into_iter().collect());
+    let runner = clis::Runner {
+        login: &snap.login,
+        home,
+        data_dir,
+        timeout: clis::UPGRADE_TIMEOUT,
+    };
+    let total = targets.len();
+    let _ = tx.send(Msg::CliProgress(0, total));
+    let mut out = Vec::new();
+    for (i, s) in targets.into_iter().enumerate() {
+        let vendor = s.install.vendor;
+        let target = s.newer().unwrap_or_default();
+        let r = clis::upgrade(&s.install, target, hosted.contains(&vendor), false, &runner);
+        let (ok, text) = clis::summary(&r);
+        out.push(CliResult { vendor, ok, text });
+        let _ = tx.send(Msg::CliProgress(i + 1, total));
+    }
+    out
+}
+
+/// 设置文件里一个开关。只读这一项，不走 `Config::load`（它会顺手同步写 `accounts.json`，
+/// 后台线程定时读不该写文件）；文件不在、读不了、看不懂都按默认 `default`，和界面读不到设置时一样。
+fn config_flag(config: &Path, key: &str, default: bool) -> bool {
+    std::fs::read(config)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get(key)?.as_bool())
+        .unwrap_or(default)
+}
+
+/// 给 Claude 对话做备份：起来时备一轮，之后每 [`BACKUP_EVERY`] 一轮，收到请求（改了标注、存了设置）马上一轮。
+/// 每轮先看一眼设置里「备份全部 Claude 对话」和各账号的 `cleanupPeriodDays`。备不成的原因变了才报到状态栏。
+pub(super) fn backup_worker(
+    index: Index,
+    accounts: Arc<Vec<Account>>,
+    data_dir: PathBuf,
+    tx: Sender<Msg>,
+) -> Sender<()> {
+    let (req, rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let config = data_dir.join("config.json");
+        let mut checked = HashSet::new();
+        let mut last_problems = Vec::new();
+        loop {
+            let all = config_flag(&config, "backup_all_claude", false);
+            let retention = sources::claude::retention_by_account(&accounts);
+            let r = index.back_up_claude(all, &retention, SystemTime::now(), &mut checked);
+            if r.problems != last_problems {
+                if let Some(p) = r.problems.first() {
+                    let more = match r.problems.len() {
+                        1 => String::new(),
+                        n => format!("（共 {n} 条没备上）"),
+                    };
+                    if tx
+                        .send(Msg::Status(format!("备份没做成：{p}{more}")))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                last_problems = r.problems;
+            }
+            match rx.recv_timeout(BACKUP_EVERY) {
+                Ok(()) => while rx.try_recv().is_ok() {},
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+    req
 }
 
 /// 告诉守护进程用户看过了哪条对话。守护进程没在跑就算了（它没在跑也就没有要提醒的）。
@@ -383,4 +630,47 @@ pub(super) fn system_alert(msg: Message) {
             eprintln!("huitai: 系统通知没发出去: {e}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 主人在设置里关了「检查新版本」后，后台线程下一轮就不再找各家、不再联网（审查退回第 1 轮）。
+    #[test]
+    fn cli_checks_follow_the_saved_setting() {
+        let dir = std::env::temp_dir().join(format!("huitai-cli-checks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        let cli_checks_on = |c: &Path| config_flag(c, "check_updates", true);
+        assert!(cli_checks_on(&config), "没有设置文件按默认开");
+        assert!(
+            config_flag(&config, "auto_upgrade_clis", true),
+            "自动升级默认开"
+        );
+        Config {
+            check_updates: false,
+            ..Config::default()
+        }
+        .save(&config)
+        .unwrap();
+        assert!(!cli_checks_on(&config), "存了关就不查");
+        Config::default().save(&config).unwrap();
+        assert!(cli_checks_on(&config));
+        std::fs::write(&config, "坏了").unwrap();
+        assert!(cli_checks_on(&config), "看不懂按默认开");
+        Config {
+            auto_upgrade_clis: false,
+            ..Config::default()
+        }
+        .save(&config)
+        .unwrap();
+        assert!(
+            !config_flag(&config, "auto_upgrade_clis", true),
+            "关了自动升级就不自动升"
+        );
+        assert!(cli_checks_on(&config));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

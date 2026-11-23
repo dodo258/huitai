@@ -170,7 +170,8 @@ pub struct BalanceRow {
 pub struct BalanceReport {
     pub rows: Vec<BalanceRow>,
     pub skipped: Vec<Skipped>,
-    /// （厂商，账号短名）→ 这个账号默认用的那家。
+    /// （厂商，账号短名）→ 这个账号默认用的那家。一个账号可以有几条：默认的名字对应同一公司的几家
+    /// （Hermes 的 `kimi-coding` 是 Kimi Code、Moonshot 国际、国内），读数是其中哪家都算。
     pub defaults: Vec<((Vendor, String), Provider)>,
 }
 
@@ -178,10 +179,12 @@ impl BalanceReport {
     /// 这个账号默认 provider 的读数（顶栏给 pi / Hermes 显示）：密钥要是从这个账号的配置里读到的，
     /// 或者来自环境变量；没订套餐、取不到都算没有。
     pub fn for_account(&self, vendor: Vendor, key: &str) -> Option<(&BalanceRow, &Balance)> {
-        let (_, p) = self
+        let ps: Vec<Provider> = self
             .defaults
             .iter()
-            .find(|((v, k), _)| *v == vendor && k == key)?;
+            .filter(|((v, k), _)| *v == vendor && k == key)
+            .map(|(_, p)| *p)
+            .collect();
         let mine = |r: &&BalanceRow| {
             r.origins.iter().any(|o| match &o.account {
                 Some(a) => a.vendor == vendor && a.key == key,
@@ -189,7 +192,7 @@ impl BalanceReport {
             })
         };
         let env = |r: &&BalanceRow| r.origins.iter().any(|o| o.account.is_none());
-        let of_p = || self.rows.iter().filter(|r| r.provider == *p);
+        let of_p = || self.rows.iter().filter(|r| ps.contains(&r.provider));
         let row = of_p().find(mine).or_else(|| of_p().find(env))?;
         row.result.as_ref().ok().map(|b| (row, b))
     }
@@ -214,7 +217,11 @@ pub fn balances(accounts: &[Account]) -> BalanceReport {
 pub fn defaults(accounts: &[Account]) -> Vec<((Vendor, String), Provider)> {
     accounts
         .iter()
-        .filter_map(|a| Some(((a.vendor, a.key.clone()), keys::default_provider(a)?)))
+        .flat_map(|a| {
+            keys::default_providers(a)
+                .into_iter()
+                .map(|p| ((a.vendor, a.key.clone()), p))
+        })
         .collect()
 }
 

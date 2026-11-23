@@ -109,3 +109,24 @@ fn accounts_added_by_hand_in_config_json_are_merged() {
     save_as_v013(&path);
     assert_eq!(Config::load(&path).unwrap().accounts, [work(), extra]);
 }
+
+/// 审计 v0.1.4 复核第 9 条：0.1.3 存设置丢了 `accounts` 以后连读两次（一次 `ai list` 就读两次），
+/// 手动账号还在、`accounts.json` 里也还有。以前第一次读把设置快照推进到新值，第二次就当成用户删的清空了。
+#[test]
+fn accounts_survive_two_loads_after_an_old_version_dropped_them() {
+    let dir = temp_dir("v013-two-loads");
+    let path = dir.join("config.json");
+    fs::write(
+        &path,
+        r#"{"trash_days": 30, "accounts": [{"vendor": "codex", "name": "工作号", "dir": "~/.codex-work"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(Config::load(&path).unwrap().accounts, [work()]);
+    save_as_v013(&path);
+    for n in 1..=3 {
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!((n, cfg.trash_days, cfg.accounts), (n, 9, vec![work()]));
+    }
+    let text = fs::read_to_string(dir.join("accounts.json")).unwrap();
+    assert!(text.contains("codex-work"), "{text}");
+}

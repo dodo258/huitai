@@ -1,6 +1,7 @@
 //! 动作线程：开标签页、新建、恢复、删除这些会动外部的活（[`Job`]），由 [`Worker`] 一件件做。
 
 use super::*;
+use crate::index::Edit;
 
 /// 交给动作线程的活。
 pub(super) enum Job {
@@ -14,8 +15,11 @@ pub(super) enum Job {
     /// 补取托管列表（交回 [`Msg::Learned`]）。
     Learn,
     Kill(SessionId),
+    /// 撞额度的对话到点了：结束卡在上限上的进程（托管 id），带「继续」重开，记下这次上限（可继续时刻）。
+    AutoContinue(Box<Entry>, SessionId, i64),
     Trash(Box<Entry>),
     Untrash(Vendor),
+    PutBack(Box<Entry>),
     Finder(PathBuf),
     Git(PathBuf),
     Copy(Box<Entry>),
@@ -132,8 +136,10 @@ impl Worker {
             },
             Job::Learn => return Msg::Learned(hosted_list(&self.ctx)),
             Job::Kill(id) => self.kill(&id),
+            Job::AutoContinue(e, hosted, at) => self.auto_continue(&e, &hosted, at),
             Job::Trash(e) => self.trash(&e),
             Job::Untrash(v) => self.untrash(v),
+            Job::PutBack(e) => self.put_back(&e),
             Job::Finder(dir) => exec::run("open", &[&dir], None, CHILD_TIMEOUT)
                 .map(|_| "已在 Finder 打开".to_owned()),
             Job::Copy(e) => self.copy_resume(&e),
@@ -228,16 +234,58 @@ impl Worker {
         for e in entries {
             let s = &e.session;
             let tab = opener::tab_title(s.vendor, &self.ctx.label(&s.cwd), Some(e.title()));
-            let result = register_continue(&self.ctx, &sources, s).and_then(|(cmd, delivery)| {
-                self.open_tab(&s.id, &cmd, &tab, !hosted.contains(&s.id))
-                    .map(|_| delivery)
-            });
+            let result = register_continue(&self.ctx, &sources, s, CONTINUE_MESSAGE).and_then(
+                |(cmd, delivery)| {
+                    self.open_tab(&s.id, &cmd, &tab, !hosted.contains(&s.id))
+                        .map(|_| delivery)
+                },
+            );
             match result {
                 Ok(delivery) => opened.push((s.vendor, delivery)),
                 Err(err) => failed.push(format!("「{}」{err}", truncate(e.title(), 16))),
             }
         }
         Ok(resume_report(&opened, &failed))
+    }
+
+    /// 撞额度到点自动继续：和 R 同一套发送方式（[`register_continue`]，命令带 [`AUTO_CONTINUE_MESSAGE`]）。
+    /// CLI 还托管着（停在上限提示上）就先结束它、等守护进程把它拿掉：同一个 id 只能有一个进程，
+    /// 不往在跑的 CLI 里打字（托管层只原样转发）。做成了才记进标注，同一次上限只发一次。
+    pub(super) fn auto_continue(
+        &self,
+        e: &Entry,
+        hosted: &SessionId,
+        resume_at: i64,
+    ) -> io::Result<String> {
+        let s = &e.session;
+        if hosted_list(&self.ctx).iter().any(|h| h.id == *hosted) {
+            self.kill(hosted)?;
+            self.wait_gone(hosted)?;
+        }
+        self.tabs()?.forget(&s.id)?;
+        let sources = self.ctx.sources()?;
+        let tab = opener::tab_title(s.vendor, &self.ctx.label(&s.cwd), Some(e.title()));
+        let (cmd, _) = register_continue(&self.ctx, &sources, s, AUTO_CONTINUE_MESSAGE)?;
+        self.open_tab(&s.id, &cmd, &tab, true)?;
+        self.index
+            .annotate(s.vendor, &s.id, Edit::Continued(resume_at))?;
+        self.relist(s.vendor);
+        Ok(format!(
+            "「{}」到了额度重置时间，已自动继续",
+            truncate(e.title(), 16)
+        ))
+    }
+
+    /// 等守护进程把结束了的托管拿掉（它先发 SIGHUP，不退再 SIGKILL）。
+    fn wait_gone(&self, id: &SessionId) -> io::Result<()> {
+        let deadline = Instant::now() + GONE_WAIT;
+        while hosted_list(&self.ctx).iter().any(|h| h.id == *id) {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("卡在上限上的进程没退出，没自动继续"));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
     }
 
     /// 开标签页（已开着就切过去）。`fresh`：这次才登记的托管；标签页没开成时撤掉它，
@@ -317,6 +365,22 @@ impl Worker {
             format!("已隐藏「{title}」，u 恢复")
         } else {
             format!("「{title}」已进回收站，u 恢复")
+        })
+    }
+
+    /// 把只剩备份的 Claude 对话放回 Claude 目录（原处有同名文件不覆盖），终端开得了新标签页就接着聊。
+    fn put_back(&self, e: &Entry) -> io::Result<String> {
+        let sources = self.ctx.sources()?;
+        let original = source_of(&sources, &e.session)?.put_back(&e.session)?;
+        self.relist(e.session.vendor);
+        if !self.ctx.terminal.has_tabs() {
+            return Ok("已放回 Claude 目录，⏎ 接着聊".to_owned());
+        }
+        let mut back = e.clone();
+        back.session.path = original;
+        Ok(match self.open(&back) {
+            Ok(opened) => format!("已放回 Claude 目录，{opened}"),
+            Err(err) => format!("已放回 Claude 目录，没打开：{err}（⏎ 再试）"),
         })
     }
 

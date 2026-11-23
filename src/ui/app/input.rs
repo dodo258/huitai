@@ -22,6 +22,7 @@ impl App {
                 self.balance_key(key, scroll);
                 return Vec::new();
             }
+            Overlay::CliFailures { scroll } => return self.cli_failures_key(key, scroll),
             Overlay::Menu { sel, cursor, .. } => {
                 if let Some(effects) = self.menu_key(key, sel, cursor) {
                     return effects;
@@ -140,12 +141,14 @@ impl App {
             Action::Archive => {
                 return self.annotate(|e| Edit::Archive(!e.note.archived));
             }
+            Action::AutoContinue => return self.toggle_auto_continue(),
             Action::Trash => {
                 if let Some(e) = self.selected_entry() {
                     return vec![Effect::Trash(Box::new(e.clone()))];
                 }
             }
             Action::Untrash => return vec![Effect::Untrash(self.vendor)],
+            Action::PutBack => return self.put_back(),
             Action::Kill => return self.ask_kill(),
             Action::Editor => return self.with_dir(Effect::Editor),
             Action::Finder => return self.with_dir(Effect::Finder),
@@ -155,6 +158,7 @@ impl App {
                 self.overlay = Overlay::Balance { scroll: 0 };
                 return vec![Effect::RefreshBalances];
             }
+            Action::UpgradeClis => return self.press_update(),
             Action::Help => self.overlay = Overlay::Help,
             Action::Quit => self.quit = true,
         }
@@ -281,6 +285,10 @@ impl App {
 
     /// 打开这条对话；它正在别处运行就先问一句。没有本机项目目录的只能查看，给个提示不打开。
     fn open_entry(&mut self, e: Entry, here: bool) -> Vec<Effect> {
+        if Self::backup_only(&e) {
+            self.status = Some(backup::BACKUP_ONLY_OPEN.to_owned());
+            return Vec::new();
+        }
         if !e.session.resumable() {
             self.status = Some(VIEW_ONLY.to_owned());
             return Vec::new();

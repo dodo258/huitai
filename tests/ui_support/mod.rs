@@ -80,6 +80,7 @@ pub fn entry(vendor: Vendor, x: &Fake) -> Entry {
             title: None,
             pinned: x.pinned,
             archived: x.archived,
+            ..Note::default()
         },
     }
 }

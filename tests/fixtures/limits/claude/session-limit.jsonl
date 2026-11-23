@@ -1,0 +1,5 @@
+{"type":"user","timestamp":"2026-11-23T02:00:00Z","sessionId":"s1","message":{"role":"user","content":"把登录页的表单校验补上"}}
+{"type":"assistant","timestamp":"2026-11-23T02:01:00Z","sessionId":"s1","message":{"role":"assistant","model":"claude-demo","content":[{"type":"text","text":"好，我先看表单组件。"}]}}
+{"type":"assistant","timestamp":"2026-11-23T03:10:00Z","sessionId":"s1","isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit · resets 1pm (Asia/Shanghai)"}]}}
+{"type":"last-prompt","sessionId":"s1"}
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-11-23T03:20:00Z","sessionId":"s1"}

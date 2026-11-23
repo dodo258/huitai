@@ -79,7 +79,10 @@ impl App {
         if self.prompt.is_some()
             || matches!(
                 self.overlay,
-                Overlay::Help | Overlay::Settings { .. } | Overlay::Balance { .. }
+                Overlay::Help
+                    | Overlay::Settings { .. }
+                    | Overlay::Balance { .. }
+                    | Overlay::CliFailures { .. }
             )
         {
             return Vec::new();
@@ -92,7 +95,7 @@ impl App {
         self.last_click = None;
         self.select(i);
         let sel = self.selected_kind();
-        if !keys::menu(sel).is_empty() {
+        if !self.menu_items(sel).is_empty() {
             self.overlay = Overlay::Menu {
                 sel,
                 x: pos.x,
@@ -132,6 +135,7 @@ impl App {
             self.areas.status,
             self.areas.elsewhere,
             self.areas.path,
+            self.areas.update,
         ];
         if bars.iter().any(|r| r.contains(pos))
             || self.areas.tabs.iter().any(|(_, r)| r.contains(pos))
@@ -149,6 +153,9 @@ impl App {
         }
         if self.areas.path.contains(pos) {
             return self.with_dir(Effect::Finder);
+        }
+        if self.areas.update.contains(pos) {
+            return self.press_update();
         }
         if let Some((v, _)) = self.areas.tabs.iter().find(|(_, r)| r.contains(pos)) {
             let v = *v;

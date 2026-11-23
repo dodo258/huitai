@@ -6,7 +6,7 @@ mod ui_support;
 use std::path::Path;
 use std::time::Duration;
 
-use huitai::core::{Account, QuotaWindow, Vendor};
+use huitai::core::{Account, QuotaValue, QuotaWindow, Vendor};
 use huitai::quota::{
     Balance, BalanceReport, BalanceRow, BalanceValue, KeyOrigin, Money, OriginAccount, Provider,
     Skipped,
@@ -185,6 +185,57 @@ fn panel_lists_accounts_and_providers() {
     );
 }
 
+/// 额度窗口有重置时间时面板写倒计时（账号额度和订阅额度都写），过了的不写；没有重置时间的见上面 `balance` 快照。
+#[test]
+fn panel_shows_reset_countdown() {
+    let mut app = app_with_balance(Vendor::Claude);
+    let at = |secs: i64| {
+        Some(if secs >= 0 {
+            now() + Duration::from_secs(secs as u64)
+        } else {
+            now() - Duration::from_secs(secs.unsigned_abs())
+        })
+    };
+    let mut claude = quota_for(Vendor::Claude);
+    if let QuotaValue::Windows(ws) = &mut claude.value {
+        ws[0].resets_at = at(80 * 60);
+        ws[1].resets_at = at(-60);
+    }
+    app.quota.insert((Vendor::Claude, String::new()), claude);
+    let mut report = report();
+    if let Ok(Balance {
+        value: BalanceValue::Windows(ws),
+        ..
+    }) = &mut report.rows[1].result
+    {
+        ws[0].resets_at = at(45 * 60);
+        ws[1].resets_at = at(2 * 86_400 + 3 * 3600);
+    }
+    app.balance = Some(report);
+    app.key(key(KeyCode::Char('$')));
+    // 132 列（常见终端宽）：倒计时、右边的来源和「非公开接口，可能失效」都放得下。
+    let text = dump(&render(&mut app, 132, H));
+    for want in [
+        "23% · 1 小时 20 分后重置",
+        "83% · 45 分钟后重置",
+        "31% · 2 天 3 小时后重置",
+        "非公开接口，可能失效",
+        "状态栏 · 2 分钟前",
+    ] {
+        assert!(text.contains(want), "缺「{want}」\n{text}");
+    }
+    // Claude 7 天窗口的重置时间已过：读数过期，不写倒计时。
+    assert!(!text.contains("41% ·"), "{text}");
+    assert_snapshot("balance-reset", &text);
+
+    // 窄一点放不下：Kimi Code 那行先让出最后一个倒计时，「非公开接口，可能失效」留着。
+    let text = dump(&render(&mut app, W, H));
+    let kimi = text.lines().find(|l| l.contains("Kimi Code")).unwrap();
+    assert!(kimi.contains("非公开接口，可能失效"), "{kimi}");
+    assert!(kimi.contains("83% · 45 分钟后重置"), "{kimi}");
+    assert!(!kimi.contains("31% ·"), "{kimi}");
+}
+
 #[test]
 fn panel_without_keys_says_where_it_looked() {
     let mut app = demo_app(Vendor::Claude);
@@ -274,7 +325,8 @@ fn top_of(v: BalanceValue) -> (String, usize) {
         v,
     );
     let b = row.result.clone().unwrap();
-    let spans = huitai::ui::balance::top_spans(&row, &b, now(), Vendor::Pi, &Theme::DARK, false);
+    let spans =
+        huitai::ui::balance::top_spans(&row, &b, now(), Vendor::Pi, &Theme::DARK, false, false);
     let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
     let filled = spans
         .iter()

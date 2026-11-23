@@ -166,6 +166,20 @@ pub fn span(d: Duration) -> String {
     }
 }
 
+/// 额度离重置还有多久：「1 分钟内重置」「20 分钟后重置」「1 小时 20 分后重置」「3 天 5 小时后重置」。
+pub fn resets_in(d: Duration) -> String {
+    let s = d.as_secs();
+    let (d, h, m) = (s / 86_400, s % 86_400 / 3600, s % 3600 / 60);
+    match () {
+        _ if s < 60 => "1 分钟内重置".to_owned(),
+        _ if s < 3600 => format!("{m} 分钟后重置"),
+        _ if d == 0 && m == 0 => format!("{h} 小时后重置"),
+        _ if d == 0 => format!("{h} 小时 {m} 分后重置"),
+        _ if h == 0 => format!("{d} 天后重置"),
+        _ => format!("{d} 天 {h} 小时后重置"),
+    }
+}
+
 /// 家目录开头的换成 `~`。
 pub fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
@@ -221,6 +235,21 @@ mod tests {
         assert_eq!(span(d(360)), "6 分钟");
         assert_eq!(span(d(59)), "59 秒");
         assert_eq!(span(d(7200)), "2 小时 0 分");
+    }
+
+    #[test]
+    fn reset_countdown() {
+        let d = Duration::from_secs;
+        assert_eq!(resets_in(d(0)), "1 分钟内重置");
+        assert_eq!(resets_in(d(59)), "1 分钟内重置");
+        assert_eq!(resets_in(d(20 * 60 + 30)), "20 分钟后重置");
+        assert_eq!(resets_in(d(80 * 60)), "1 小时 20 分后重置");
+        assert_eq!(resets_in(d(2 * 3600)), "2 小时后重置");
+        assert_eq!(
+            resets_in(d(3 * 86_400 + 5 * 3600 + 59)),
+            "3 天 5 小时后重置"
+        );
+        assert_eq!(resets_in(d(6 * 86_400 + 40 * 60)), "6 天后重置");
     }
 
     #[test]

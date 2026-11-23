@@ -1,8 +1,9 @@
 //! 会话台（huitai）。模块划分与依赖方向见 AGENTS.md「模块」：
-//! `cli → ui → (index, quota, opener, host 客户端, export) → sources → core`；
+//! `cli → ui → (index, quota, opener, host 客户端, export, clis) → sources → core`（`clis` 只依赖 `core`）；
 //! `host`、`notify`、`hotkey`、`ime` 只依赖 `core`。
 
 pub mod cli;
+pub mod clis;
 pub mod core;
 pub mod export;
 pub mod host;

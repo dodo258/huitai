@@ -14,7 +14,7 @@ use ratatui::layout::{Position, Rect};
 use crate::core::{Account, Config, QuotaReading, Session, SessionId, SessionState, Vendor};
 use crate::host::ScreenSnapshot;
 use crate::index::{Edit, Entry, Hit, ProjectEdit, ProjectNote, Snippet};
-use crate::quota::{Balance, BalanceReport, BalanceRow};
+use crate::quota::{Balance, BalanceReport, BalanceRow, ContextUse};
 use crate::sources::{Moment, PreviewMessage, Transcript};
 
 // 认领在 `claims` 里；从这里也引得到（原先就在这个文件）。
@@ -24,8 +24,12 @@ use super::newdir::{self, DirPicker};
 use super::reader::{Outcome, Reader};
 use super::rows::{self, Folds, Group, GroupKey, Row};
 use super::text::{project_label, tilde};
+pub use backup::{BACKUP_ONLY, BACKUP_ONLY_OPEN};
 
+mod autocontinue;
+mod backup;
 mod board;
+mod cli_upgrade;
 mod input;
 mod menu;
 mod mouse;
@@ -33,15 +37,20 @@ mod nav;
 mod search;
 mod settings;
 
+pub use cli_upgrade::{CliReport, CliResult, CliUpgrade};
+
 /// 双击判定间隔。
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// 滚轮一格移动几行。
 const WHEEL_STEP: usize = 3;
-/// 设置页里可以改的项数（首选终端、回收站天数、开机自动打开、闲置收回、等你闪烁、自动切英文）。
-const SETTINGS_ITEMS: usize = 7;
+/// 设置页里可以改的项数（首选终端、回收站天数、开机自动打开、闲置收回、等你闪烁、自动切英文、备份对话、检查新版本、自动升级各家 CLI）。
+const SETTINGS_ITEMS: usize = 9;
 /// 首选终端可选值：跟随当前终端、Ghostty、Kaku。
 pub const TERMINAL_CHOICES: [Option<&str>; 3] = [None, Some("ghostty"), Some("kaku")];
 /// 不归会话台托管的对话，会话文件在这之内写过就算它在别处在用（桌面端、别的终端、后台任务里跑着）：
+/// 上下文占用的读数比会话文件旧过这么多就不显示：对话在会话台外面接着聊了，那个数已经不对。
+/// Claude 每来一条回复就刷新状态栏，托管着的对话不会差这么多。
+pub const CONTEXT_STALE: Duration = Duration::from_secs(10 * 60);
 /// 会话台看不到那边的进程，只能看文件。
 pub const ELSEWHERE_ACTIVE: Duration = Duration::from_secs(120);
 /// 顶栏「◆N 等你」慢闪的半拍：亮 0.8 秒、暗 0.8 秒，1.6 秒一次。只在有没看过的新结果（✓ 刚做完）时闪。
@@ -97,6 +106,8 @@ pub enum Effect {
     },
     Trash(Box<Entry>),
     Untrash(Vendor),
+    /// 把只剩备份的 Claude 对话放回 Claude 目录再接着聊。
+    PutBack(Box<Entry>),
     Kill(SessionId),
     Editor(PathBuf),
     Finder(PathBuf),
@@ -118,6 +129,15 @@ pub enum Effect {
     },
     /// `$` 打开了额度面板：把余额（有 5 分钟缓存）和全部账号的额度都读一遍。
     RefreshBalances,
+    /// 顶栏「更新」：把能一键升的各家 CLI 都升一遍（后台线程跑，进度用 [`App::cli_progress`] 报回来）。
+    UpgradeClis,
+    /// 撞额度的对话到了重置时间：像 R 一样带一句「继续」重开（还托管着就先结束卡在上限上的进程）。
+    /// `hosted` 是守护进程里托管它的 id，`resume_at` 是这次上限的可继续时刻（Unix 秒），做成了记进标注。
+    AutoContinue {
+        entry: Box<Entry>,
+        hosted: SessionId,
+        resume_at: i64,
+    },
 }
 
 /// 底栏上的输入或确认。
@@ -181,6 +201,10 @@ pub enum Overlay {
         x: u16,
         y: u16,
         cursor: usize,
+    },
+    /// 一键升级没升上的那几家：命令和原文；`scroll` 是往下翻了几行。
+    CliFailures {
+        scroll: usize,
     },
 }
 
@@ -338,6 +362,8 @@ pub struct Areas {
     pub status: Rect,
     /// 顶栏「●N 别处」（桌面端、别的终端里开着的），单击跳到下一条。
     pub elsewhere: Rect,
+    /// 顶栏右侧「更新」按钮，单击等同 `U`。
+    pub update: Rect,
     /// 底栏右侧「路径：…」，单击在访达里打开（等同 `f`）。
     pub path: Rect,
     /// 右键菜单各项所在的区域（第一项在最上面一行，一项一行）。
@@ -369,10 +395,14 @@ pub struct App {
     ended: HashMap<SessionId, SystemTime>,
     /// 各账号的额度：（厂商，账号短名）→ 读数。
     pub quota: HashMap<(Vendor, String), QuotaReading>,
+    /// 各条对话的上下文占用（会话台启动的 Claude 的状态栏数据，运行层定时读来），用 [`App::context_of`] 取。
+    pub contexts: HashMap<SessionId, ContextUse>,
     /// API 余额和订阅额度（运行层每 5 分钟读一次，`$` 打开时再读）；还没读到是 `None`。
     pub balance: Option<BalanceReport>,
     /// 本机各家的账号（每家主账号在前），列表里标账号名、顶栏按账号显示额度用。
     pub accounts: Vec<Account>,
+    /// 各 Claude 账号（短名）留对话的天数（`cleanupPeriodDays`），运行层起来时读；没有的按默认 30 天。
+    pub retention: HashMap<String, u32>,
     pub previews: HashMap<SessionId, Preview>,
     /// 各条对话的「此刻」（在跑的工具、停下的一句话、用时、计划、失败），运行层按 [`App::moment_targets`] 读来。
     pub moments: HashMap<SessionId, Moment>,
@@ -410,6 +440,12 @@ pub struct App {
     pub old_host: Option<HashSet<SessionId>>,
     /// GitHub 上有比当前新的版本（版本号）：顶栏右侧暗色提示「有新版 x.y.z · ai update」。
     pub new_version: Option<String>,
+    /// 各家 CLI 查到的比本机新的版本（只放有新版的那几家）：顶栏那家标签后一个小「↑」。
+    pub cli_updates: HashMap<Vendor, String>,
+    /// 其中能一键升的（顶栏「更新」按钮会升的）。
+    pub cli_ready: Vec<Vendor>,
+    /// 「更新」按钮的状态。
+    pub cli_upgrade: CliUpgrade,
     /// 顶栏「◆N 等你」和「刚做完」那几行慢闪的暗半拍（运行层按时间翻转；没有没看过的、或设置里关了闪烁就一直是假）。
     pub blink_dim: bool,
     /// 转圈走到第几帧（有东西在跑时运行层按时间推进，没有就停在 0）。
@@ -424,6 +460,8 @@ pub struct App {
     looking: Option<(SessionId, Duration)>,
     /// 会话台自己的标签页在不在前台（终端报焦点才知道，不报就一直当在）：不在时选着也不算看过。
     pub board_front: bool,
+    /// 这次运行里已经发出过的自动继续（对话 id、那次上限的可继续时刻）：标注写回来之前不重复发。
+    auto_sent: HashSet<(SessionId, i64)>,
     pub areas: Areas,
     last_click: Option<(Position, Instant)>,
     pub quit: bool,
@@ -446,8 +484,10 @@ impl App {
             aliases: HashMap::new(),
             ended: HashMap::new(),
             quota: HashMap::new(),
+            contexts: HashMap::new(),
             balance: None,
             accounts: Vec::new(),
+            retention: HashMap::new(),
             previews: HashMap::new(),
             moments: HashMap::new(),
             pending_preview: None,
@@ -470,6 +510,9 @@ impl App {
             touched: false,
             old_host: None,
             new_version: None,
+            cli_updates: HashMap::new(),
+            cli_ready: Vec::new(),
+            cli_upgrade: CliUpgrade::Idle,
             blink_dim: false,
             spin: 0,
             only_spun: false,
@@ -477,6 +520,7 @@ impl App {
             clock: Duration::ZERO,
             looking: None,
             board_front: true,
+            auto_sent: HashSet::new(),
             areas: Areas::default(),
             last_click: None,
             quit: false,
@@ -485,6 +529,13 @@ impl App {
 
     pub fn set_accounts(&mut self, accounts: Vec<Account>) {
         self.accounts = accounts;
+    }
+
+    /// 这条对话的上下文占用；没有读数，或读数之后对话又在会话台外面接着聊了
+    /// （会话文件比读数新过 [`CONTEXT_STALE`]）就是 `None`，免得显示过时的数。
+    pub fn context_of(&self, e: &Entry) -> Option<ContextUse> {
+        let c = *self.contexts.get(&e.session.id)?;
+        (e.session.last_active <= c.at + CONTEXT_STALE).then_some(c)
     }
 
     /// 列表里这条后面写的账号名：这家只有一个账号时不写（`None`）。
@@ -822,13 +873,14 @@ impl App {
         self.state_of(&e.session.id) != SessionState::Stopped || self.elsewhere_busy(e)
     }
 
-    /// 要读「此刻」的对话：列表里所有 [`App::active`] 的，加上选中的那条（预览标题和计划块用）。
+    /// 要读「此刻」的对话：列表里所有 [`App::active`] 的、开着自动继续的（看最后是不是撞了上限），
+    /// 加上选中的那条（预览标题和计划块用）。
     pub fn moment_targets(&self) -> Vec<Entry> {
         let mut out: Vec<Entry> = self
             .lists
             .iter()
             .flat_map(|l| &l.entries)
-            .filter(|e| self.active(e))
+            .filter(|e| self.active(e) || Self::armed(e))
             .cloned()
             .collect();
         if let Some(e) = self.selected_entry()
@@ -967,7 +1019,10 @@ impl App {
         if self.reader.is_some()
             || matches!(
                 self.overlay,
-                Overlay::Help | Overlay::Settings { .. } | Overlay::Balance { .. }
+                Overlay::Help
+                    | Overlay::Settings { .. }
+                    | Overlay::Balance { .. }
+                    | Overlay::CliFailures { .. }
             )
         {
             return None;

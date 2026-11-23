@@ -13,6 +13,7 @@
 //! - 标注：数据目录的 `annotations.json`（改名、置顶、归档、项目显示名和整组归档、展开着的项目组；0.1.3 之后加的厂商的
 //!   对话标注在 `annotations-more.json`），不写厂商文件。
 
+mod backup;
 mod notes;
 mod snippet;
 mod store;
@@ -32,6 +33,7 @@ use rusqlite::Connection;
 use crate::core::{Account, Config, Session, SessionId, Vendor, VendorDirs};
 use crate::sources::{self, PreviewMessage, Progress, Source, Trash};
 
+pub use backup::{BackupReport, NEAR_DELETION, near_deletion, wants_backup};
 pub use notes::{Edit, Note, ProjectEdit, ProjectNote};
 pub use snippet::{Snippet, marks as term_marks, terms as search_terms};
 pub use watch::{Background, Update};
@@ -559,6 +561,20 @@ impl Index {
             match Stamp::of(path) {
                 Ok(stamp) => changed.push((path.clone(), stamp)),
                 Err(_) => gone.push(path),
+            }
+        }
+        // 没了的会话文件有替身（Claude 的会话台备份）就读替身，这条对话不从列表里消失。
+        // 整家重扫时替身已经在 `files` 里了。
+        if !full {
+            for path in &gone {
+                let Some(f) = src.stand_in(path) else {
+                    continue;
+                };
+                if let Ok(stamp) = Stamp::of(&f)
+                    && !changed.iter().any(|(p, _)| *p == f)
+                {
+                    changed.push((f, stamp));
+                }
             }
         }
         if changed.is_empty() && gone.is_empty() {

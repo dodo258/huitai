@@ -118,6 +118,15 @@ impl Theme {
         self.elsewhere
     }
 
+    /// 顶栏「更新」按钮的底色：能升级时垫一层「刚做完」的青，升级中淡一些，有没升上的垫红。字用标题色。
+    pub fn update_button(&self, kind: UpdateButton) -> Color {
+        match kind {
+            UpdateButton::Ready => mix(self.bar, self.done, 0.45),
+            UpdateButton::Running => mix(self.bar, self.done, 0.25),
+            UpdateButton::Failed => mix(self.bar, self.alert, 0.40),
+        }
+    }
+
     /// 快用完了（额度 95% 起）：比 Claude 的橙红更正的红，只留给真要当心的地方。
     pub fn alert(&self) -> Color {
         self.alert
@@ -140,6 +149,14 @@ impl Theme {
 }
 
 /// 背景色亮度过半算浅色。
+/// 「更新」按钮的三种样子（底色不同）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateButton {
+    Ready,
+    Running,
+    Failed,
+}
+
 pub fn is_light((r, g, b): (u8, u8, u8)) -> bool {
     let lum = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
     lum > 128.0

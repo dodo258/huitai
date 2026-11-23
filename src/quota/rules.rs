@@ -48,6 +48,10 @@ pub enum Channel {
         cache_file: String,
         /// 缓存比这更旧就换下一个渠道。
         max_age_minutes: u64,
+        /// 每条对话一份的状态栏数据放在数据目录下的这个子目录，文件名 `<session_id>.json`（上下文占用用）。
+        context_dir: String,
+        /// 上下文已用百分比（0–100）在状态栏数据里的位置。
+        context_percent: String,
         windows: Vec<WindowRule>,
     },
     /// Claude 官方用量接口（未公开文档，CLI 内部在用）。

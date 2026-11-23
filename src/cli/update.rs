@@ -1,6 +1,6 @@
 //! 版本提醒和 `ai update`：查 GitHub Releases 最新版、认安装来源、下载校验后原子替换自己。
 //!
-//! 联网只用系统自带的 `curl`（`-q` 不读 `~/.curlrc`，不带任何用户信息），超时由 curl 的 `--max-time` 管。
+//! 联网走 `core::http`（系统自带的 `curl`，不读 `~/.curlrc`，不带任何用户信息）。
 //! 发布信息和版本比较在 `core::release`；没有仓库（`release::REPO` 为 `None`）时这里什么都不做。
 
 use std::fs;
@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{exec, release};
+use crate::core::{exec, http, release};
 
 /// 记上次查的时间和查到的最新版本，在数据目录里。
 const CACHE_FILE: &str = "update-check.json";
@@ -163,35 +163,11 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
-/// 用 curl 发一个 GET；`out` 给了就写进文件，否则返回内容。HTTP 错误（4xx/5xx）算失败。
+/// 发一个 GET；`out` 给了就写进文件，否则返回内容。HTTP 错误（4xx/5xx）算失败。
 fn curl(url: &str, timeout: Duration, out: Option<&Path>) -> Result<String, String> {
-    let max = timeout.as_secs().max(1).to_string();
-    // -q 必须第一个：不读 ~/.curlrc，免得带上别的头。
-    let mut args = vec![
-        "-q",
-        "-fsSL",
-        "--proto",
-        "=https,http",
-        "--max-time",
-        &max,
-        "--noproxy",
-        "127.0.0.1,localhost",
-        "-H",
-        "Accept: application/vnd.github+json",
-    ];
-    let out = out.map(|p| p.to_string_lossy().into_owned());
-    if let Some(p) = &out {
-        args.extend(["-o", p]);
-    }
-    args.push(url);
-    // curl 自己按 --max-time 停；外面多留几秒兜底。
-    exec::run(
-        Path::new("/usr/bin/curl"),
-        &args,
-        None,
-        timeout + Duration::from_secs(5),
-    )
-    .map_err(|e| format!("下载 {url} 失败：{e}"))
+    http::get(url, &["Accept: application/vnd.github+json"], out, timeout)
+        .map(|r| r.body)
+        .map_err(|e| format!("下载 {url} 失败：{e}"))
 }
 
 pub fn fetch_release(url: &str, timeout: Duration) -> Result<Release, String> {

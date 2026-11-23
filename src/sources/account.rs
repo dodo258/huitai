@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use super::antigravity;
 use super::{
-    Command, Counted, Delivery, Moment, PreviewMessage, Progress, Scan, Source, Transcript,
+    Command, Counted, Delivery, Moment, PreviewMessage, Progress, Saved, Scan, Source, Transcript,
     TrashEntry,
 };
 use crate::core::{Account, AccountSetting, Session, SessionId, Vendor, VendorDirs};
@@ -261,6 +261,18 @@ impl Source for AccountSource {
             .into_iter()
             .map(|r| r.map(|s| s.map(|s| self.tag(s))))
             .collect()
+    }
+
+    fn stand_in(&self, gone: &Path) -> Option<PathBuf> {
+        self.inner.stand_in(gone)
+    }
+
+    fn back_up(&self, session: &Session, check: bool) -> io::Result<Saved> {
+        self.inner.back_up(&self.native(session), check)
+    }
+
+    fn put_back(&self, session: &Session) -> io::Result<PathBuf> {
+        self.inner.put_back(&self.native(session))
     }
 }
 

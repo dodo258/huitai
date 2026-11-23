@@ -28,8 +28,13 @@ pub struct Config {
     pub blink_waiting: bool,
     /// 会话台在前台时把中文等输入法切成英文键盘布局，离开时切回（终端要支持焦点上报）。
     pub auto_ascii_input: bool,
-    /// 每天最多查一次 GitHub 上有没有新版本，有就在顶栏提示（环境变量 `HUITAI_NO_UPDATE_CHECK=1` 也能关）。
+    /// 查会话台（每天最多一次，GitHub）和各家 CLI（每家 20 小时最多一次）有没有新版本，有就在顶栏提示（环境变量 `HUITAI_NO_UPDATE_CHECK=1` 也能关）。
     pub check_updates: bool,
+    /// 各家 CLI 自动升级：查到新版、那家没有托管对话在跑时，按本机装法跑官方升级命令（不跨大版本、不用 sudo；
+    /// 自带自动更新的几家等它自己装，新版出来 24 小时还没装上才升）。要「检查新版本」开着才有用。
+    pub auto_upgrade_clis: bool,
+    /// 备份全部 Claude 对话（Claude Code 会删掉超过 `cleanupPeriodDays` 天没动的）；关着只备在会话台里置顶、改名、归档过的。
+    pub backup_all_claude: bool,
     /// 手动加的账号（同一家另一个数据目录）。默认位置、环境变量指的目录和 Hermes 的 profile 不用加，自动认。
     /// 全部账号存在 `accounts.json`（0.1.3 不读、不会丢）；`config.json` 里 `accounts` 那一项是用户手动管的，
     /// 读的时候照它同步（见 [`Config::load`]）。
@@ -87,6 +92,8 @@ impl Default for Config {
             blink_waiting: true,
             auto_ascii_input: true,
             check_updates: true,
+            auto_upgrade_clis: true,
+            backup_all_claude: false,
             accounts: Vec::new(),
             accounts_in_config: Vec::new(),
             unknown_accounts: Vec::new(),
@@ -161,7 +168,9 @@ impl Config {
             None => None,
         };
         let before = accounts.clone();
-        let from = match new_from {
+        // 设置快照只在照 `config.json` 同步过账号时推进；0.1.3 丢了 `accounts` 那一项时沿用旧的，
+        // 否则下次读到同样缺这一项、设置又和快照一样，就会当成用户删的把账号清掉。
+        let (from, snapshot) = match new_from {
             Some(new_from) => {
                 accounts.retain(|a| new_from.contains(a) || !prev_from.contains(a));
                 for a in &new_from {
@@ -169,16 +178,15 @@ impl Config {
                         accounts.push(a.clone());
                     }
                 }
-                new_from
+                (new_from, Some(settings))
             }
-            None => prev_from.clone(),
+            None => (prev_from.clone(), file.settings.clone()),
         };
-        let changed =
-            accounts != before || from != prev_from || file.settings.as_ref() != Some(&settings);
+        let changed = accounts != before || from != prev_from || snapshot != file.settings;
         cfg.accounts = accounts;
         cfg.accounts_in_config = from;
         if changed && (existed || !cfg.accounts.is_empty()) {
-            let _ = cfg.save_accounts(&accounts_path);
+            let _ = cfg.save_accounts(&accounts_path, snapshot);
         }
         Ok(cfg)
     }
@@ -195,7 +203,7 @@ impl Config {
             || !self.unknown_accounts.is_empty()
             || accounts_path.exists()
         {
-            self.save_accounts(&accounts_path)?;
+            self.save_accounts(&accounts_path, Some(self.settings_value()?))?;
         }
         let file = ConfigFile {
             settings: self,
@@ -210,7 +218,8 @@ impl Config {
         serde_json::to_value(self).map_err(io::Error::other)
     }
 
-    fn save_accounts(&self, path: &Path) -> io::Result<()> {
+    /// 写 `accounts.json`；`settings` 是记下的设置快照（见 [`AccountsFile::settings`]）。
+    fn save_accounts(&self, path: &Path, settings: Option<serde_json::Value>) -> io::Result<()> {
         let values = |list: &[AccountSetting]| -> io::Result<Vec<serde_json::Value>> {
             list.iter()
                 .map(serde_json::to_value)
@@ -223,7 +232,7 @@ impl Config {
             version: 1,
             accounts,
             from_config: values(&self.accounts_in_config)?,
-            settings: Some(self.settings_value()?),
+            settings,
         };
         let json = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
         // 读设置时也会写它：先写临时文件再改名，别的进程同时读到的总是完整的一份。
@@ -280,6 +289,8 @@ mod tests {
             blink_waiting: false,
             auto_ascii_input: false,
             check_updates: false,
+            auto_upgrade_clis: false,
+            backup_all_claude: true,
             accounts: vec![AccountSetting {
                 vendor: crate::core::Vendor::Codex,
                 name: "工作号".to_owned(),
@@ -306,6 +317,10 @@ mod tests {
         assert_eq!(cfg.idle_reclaim(), Some(Duration::from_secs(30 * 60)));
         assert!(cfg.blink_waiting, "旧配置没有这一项时默认闪");
         assert!(cfg.check_updates, "旧配置没有这一项时默认查新版本");
+        assert!(
+            cfg.auto_upgrade_clis,
+            "旧配置没有这一项时默认自动升级各家 CLI"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

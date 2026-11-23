@@ -1,6 +1,7 @@
 //! 顶栏：印章、全局状态、各家标签、额度。
 
 use super::*;
+use crate::ui::text::resets_in;
 
 /// 顶栏印章后的全局状态写成什么样（窄了一步步缩）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,32 +15,35 @@ enum StatusForm {
     Hidden,
 }
 
-/// 额度留哪些：「额度」两字、第二个窗口、来源和更新时间。
+/// 额度留哪些：「额度」两字、第二个窗口、来源和更新时间、重置倒计时。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QuotaCut {
     label: bool,
     second: bool,
     source: bool,
+    reset: bool,
 }
 
-/// 顶栏的写法，从全到简。窄终端依次去掉：额度来源 → 第二个额度窗口 → 状态数字只留点 → 「额度」两字，
+/// 顶栏的写法，从全到简。窄终端依次去掉：额度来源 → 第二个额度窗口 → 重置倒计时 → 状态数字只留点 → 「额度」两字，
 /// 再放不下额度让位（后台是旧版、有新版的提示比额度优先），再放不下先去掉「别处」、留着「在跑 / 等你」，最后状态也不显示。
 /// 每项是（状态写法，额度留哪些，带不带提示，带不带「别处」）。
 fn top_layouts(hint: bool) -> Vec<(StatusForm, Option<QuotaCut>, bool, bool)> {
-    let cut = |label, second, source| {
+    let cut = |label, second, source, reset| {
         Some(QuotaCut {
             label,
             second,
             source,
+            reset,
         })
     };
     let mut out: Vec<_> = [
-        (StatusForm::Full, cut(true, true, true)),
-        (StatusForm::Full, cut(true, true, false)),
-        (StatusForm::Full, cut(true, false, false)),
-        (StatusForm::Counts, cut(true, false, false)),
-        (StatusForm::Dots, cut(true, false, false)),
-        (StatusForm::Dots, cut(false, false, false)),
+        (StatusForm::Full, cut(true, true, true, true)),
+        (StatusForm::Full, cut(true, true, false, true)),
+        (StatusForm::Full, cut(true, false, false, true)),
+        (StatusForm::Full, cut(true, false, false, false)),
+        (StatusForm::Counts, cut(true, false, false, false)),
+        (StatusForm::Dots, cut(true, false, false, false)),
+        (StatusForm::Dots, cut(false, false, false, false)),
     ]
     .into_iter()
     .map(|(s, q)| (s, q, hint, true))
@@ -145,10 +149,15 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
             })
             .collect()
     };
+    // 那家 CLI 有新版：标签后紧跟一个暗色「↑」（设置里关了检查新版本就不标）。
+    let cli_new = |v: Vendor| app.config.check_updates && app.cli_updates.contains_key(&v);
+    let mark_w = |v: Vendor| usize::from(cli_new(v)) * width(CLI_NEW_MARK);
     // 标签之间隔一道淡竖线（两边各一格空）。
     const TAB_DIVIDER: &str = " │ ";
     let tabs_width = |tabs: &[(Vendor, String)]| {
-        tabs.iter().map(|(_, l)| width(l)).sum::<usize>()
+        tabs.iter()
+            .map(|(v, l)| width(l) + mark_w(*v))
+            .sum::<usize>()
             + width(TAB_DIVIDER) * tabs.len().saturating_sub(1)
     };
     let full_w = tabs_width(&tabs_of(false));
@@ -167,6 +176,21 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
                 .map(|v| format!("有新版 {v} · ai update"))
         });
     let gap = "   ";
+    // 「更新」按钮（有能升级的各家 CLI、升级中、有没升上的才有）：放在右边最前，比提示和额度都优先。
+    let button = app.update_button().map(|label| {
+        let kind = match app.cli_upgrade {
+            CliUpgrade::Running { .. } => UpdateButton::Running,
+            CliUpgrade::Failed(_) => UpdateButton::Failed,
+            CliUpgrade::Idle => UpdateButton::Ready,
+        };
+        sp(
+            format!(" {label} "),
+            Style::default()
+                .bg(t.update_button(kind))
+                .fg(t.title)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
     let total = usize::from(area.width);
     // 两段状态之间隔两格，和段里各项之间一样。
     let status_w = |(own, other): &(Vec<Span>, Vec<Span>)| {
@@ -189,8 +213,9 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
             // pi / Hermes 默认 provider 有余额或订阅额度就显示它，没有再照旧（本机统计）。
             let mut right = match (cut, app.balance_shown()) {
                 (Some(c), Some((row, b))) => {
-                    let mut s =
-                        crate::ui::balance::top_spans(row, b, app.now, app.vendor, t, c.source);
+                    let mut s = crate::ui::balance::top_spans(
+                        row, b, app.now, app.vendor, t, c.source, c.reset,
+                    );
                     if c.label {
                         s.insert(0, sp("额度  ", fg(t.muted)));
                     }
@@ -207,6 +232,10 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
                     0..0,
                     [sp(h.clone(), fg(t.faint)), sp(lead, Style::default())],
                 );
+            }
+            if let Some(b) = &button {
+                let lead = if right.is_empty() { "" } else { "  " };
+                right.splice(0..0, [b.clone(), sp(lead, Style::default())]);
             }
             (status, right, compact)
         })
@@ -252,7 +281,8 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
     for (i, (v, label)) in tabs.into_iter().enumerate() {
         let w = width(&label) as u16;
         let lead = if i == 0 { 0 } else { width(TAB_DIVIDER) as u16 };
-        if x + lead + w > area.right() {
+        let mark = mark_w(v) as u16;
+        if x + lead + w + mark > area.right() {
             break;
         }
         if lead > 0 {
@@ -275,24 +305,44 @@ pub(super) fn top_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme) {
             },
         ));
         x += w;
+        if mark > 0 {
+            buf.set_string(x, area.y, CLI_NEW_MARK, fg(t.faint));
+            x += mark;
+        }
     }
     let w = line_width(&right);
+    app.areas.update = Rect::default();
     if w > 0 {
         let r = Rect {
             x: area.right() - 1 - w as u16,
             width: w as u16,
             ..area
         };
+        if let Some(b) = right.first().filter(|_| button.is_some()) {
+            app.areas.update = Rect {
+                width: width(&b.content) as u16,
+                ..r
+            };
+        }
         Line::from(right).render_into(buf, r);
     }
 }
+
+/// 那家 CLI 有新版时标签后的标记。
+pub const CLI_NEW_MARK: &str = "↑";
 
 /// 额度用到这么多（百分比）变黄。
 pub const QUOTA_WARN: f32 = 80.0;
 /// 用到这么多变红。
 pub const QUOTA_ALERT: f32 = 95.0;
 
-/// 额度：「额度」两字，每个窗口一条细进度条加百分比，后面是来源和更新时间；`cut` 定留哪些。
+/// 额度窗口离重置还有多久（「1 小时 20 分后重置」）；没写重置时间或已经过了（读数过期）就没有。
+pub fn reset_note(w: &crate::core::QuotaWindow, now: SystemTime) -> Option<String> {
+    let left = w.resets_at?.duration_since(now).ok()?;
+    (!left.is_zero()).then(|| resets_in(left))
+}
+
+/// 额度：「额度」两字，每个窗口一条细进度条加百分比和重置倒计时，后面是来源和更新时间；`cut` 定留哪些。
 fn quota_spans(
     reading: Option<&QuotaReading>,
     now: SystemTime,
@@ -323,12 +373,16 @@ fn quota_spans(
                     }
                     _ => (t.accent(vendor), t.text),
                 };
-                vec![
+                let mut out = vec![
                     sp(format!("{} ", w.label), fg(t.muted)),
                     sp("━".repeat(filled), fg(bar_color)),
                     sp("━".repeat(8 - filled), fg(t.select)),
                     sp(format!(" {used:.0}%"), fg(pct_color)),
-                ]
+                ];
+                if let Some(note) = reset_note(w, now).filter(|_| cut.reset) {
+                    out.push(sp(format!(" · {note}"), fg(t.faint)));
+                }
+                out
             };
             let n = if cut.second { 2 } else { 1 };
             let mut out = Vec::new();

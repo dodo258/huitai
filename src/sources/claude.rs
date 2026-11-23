@@ -3,14 +3,20 @@
 //! 以及是不是自动运行：消息行的 `entrypoint` 记着是从哪里起的，`sdk-cli` 是无头的 `claude -p`
 //! （本机核对过的取值：`cli` 终端、`claude-desktop` 桌面端、`sdk-cli`）。取最后一个，
 //! 无头起的对话后来在终端里接着聊过就算自己的。
+//!
+//! Claude Code 自己会删旧对话（`cleanupPeriodDays`，见 [`retention`]）；会话台给要留的对话做备份（[`super::backup`]），
+//! 原文件没了以后照样从备份列出来、能看能搜，主人要接着聊时再放回原处（[`Source::put_back`]）。
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use super::backup::{self, Backups, Saved};
 use super::jsonl::{self, str_field};
+use super::limit;
 use super::moment::Event;
 use super::time::parse_rfc3339;
 use super::window::Window;
@@ -18,7 +24,7 @@ use super::{
     Command, Counted, Moment, Part, PreviewMessage, Progress, Role, Scan, Source, Transcript,
     Trash, TrashEntry, encode_path, moment, transcript,
 };
-use crate::core::{Session, SessionId, Vendor};
+use crate::core::{Account, Session, SessionId, Vendor};
 
 /// 包在用户消息里、但不是用户自己说的话（斜杠命令回显、后台通知等）。
 const WRAPPERS: [&str; 7] = [
@@ -34,6 +40,8 @@ const WRAPPERS: [&str; 7] = [
 pub struct ClaudeSource {
     root: PathBuf,
     trash: Trash,
+    /// 会话台给这个账号留的备份；没有（测试里、取不到数据目录）就不备、不从备份列。
+    backups: Option<Backups>,
 }
 
 impl ClaudeSource {
@@ -42,7 +50,46 @@ impl ClaudeSource {
         Self {
             root: root.into(),
             trash,
+            backups: None,
         }
+    }
+
+    /// 带上这个账号的备份目录：原文件没了的对话从备份列出来，[`Source::back_up`] 往这里备。
+    pub fn with_backups(mut self, backups: Backups) -> Self {
+        self.backups = Some(backups);
+        self
+    }
+
+    /// 这条对话的备份位置（会话文件就是备份时是它自己）。
+    fn backup_of(&self, session: &Session) -> Option<PathBuf> {
+        if backup::is_backup(&session.path) {
+            return Some(session.path.clone());
+        }
+        self.backups.as_ref()?.path_for(&self.root, &session.path)
+    }
+
+    /// 读这条对话用的文件：只剩备份时解出来的临时文件，否则原文件。
+    fn readable(&self, path: &Path) -> io::Result<backup::Plain> {
+        backup::readable(self.backups.as_ref(), path)
+    }
+
+    /// 读一个会话文件或备份：备份按它原来的位置认 id 和项目目录，原文件还在就不从备份列（`None`）。
+    fn read_file(&self, path: &Path) -> io::Result<Option<Session>> {
+        let Some(b) = self.backups.as_ref().filter(|_| backup::is_backup(path)) else {
+            return read_session(path);
+        };
+        let Some(original) = b.original_of(&self.root, path) else {
+            return Ok(None);
+        };
+        if std::fs::symlink_metadata(&original).is_ok() {
+            return Ok(None);
+        }
+        let plain = b.open(path)?;
+        let mut s = read_session_as(plain.path(), &original)?;
+        if let Some(s) = s.as_mut() {
+            s.path = path.to_path_buf();
+        }
+        Ok(s)
     }
 }
 
@@ -56,15 +103,15 @@ impl Source for ClaudeSource {
     }
 
     fn load_preview(&self, session: &Session, n: usize) -> io::Result<Vec<PreviewMessage>> {
-        jsonl::last_messages(&session.path, n, message)
+        jsonl::last_messages(self.readable(&session.path)?.path(), n, message)
     }
 
     fn load_transcript(&self, session: &Session) -> io::Result<Transcript> {
-        transcript::read(&session.path, parts)
+        transcript::read(self.readable(&session.path)?.path(), parts)
     }
 
     fn load_moment(&self, session: &Session) -> io::Result<Moment> {
-        moment::read_jsonl(&session.path, moment_events)
+        moment::read_jsonl(self.readable(&session.path)?.path(), moment_events)
     }
 
     fn count_messages(&self, session: &Session) -> io::Result<usize> {
@@ -73,7 +120,8 @@ impl Source for ClaudeSource {
 
     fn count_since(&self, session: &Session, prev: Option<Progress>) -> io::Result<Counted> {
         let salt = self.parse_version();
-        jsonl::count_since(&session.path, br#""type":"user""#, salt, message, prev)
+        let plain = self.readable(&session.path)?;
+        jsonl::count_since(plain.path(), br#""type":"user""#, salt, message, prev)
     }
 
     fn resume_cmd(&self, session: &Session) -> Command {
@@ -84,9 +132,14 @@ impl Source for ClaudeSource {
         Command::new("claude", &[], cwd)
     }
 
-    /// 会话文件和同名的附属目录（子代理、工具输出）一起移进回收站。
+    /// 会话文件和同名的附属目录（子代理、工具输出）、会话台给它留的备份一起移进回收站。
     fn trash(&self, session: &Session) -> io::Result<TrashEntry> {
-        super::trash_files(&self.trash, session, &[session.path.with_extension("")])
+        let mut extra = Vec::new();
+        if !backup::is_backup(&session.path) {
+            extra.push(session.path.with_extension(""));
+        }
+        extra.extend(self.backup_of(session).filter(|b| *b != session.path));
+        super::trash_files(&self.trash, session, &extra)
     }
 
     fn restore(&self, entry: &TrashEntry) -> io::Result<()> {
@@ -101,17 +154,142 @@ impl Source for ClaudeSource {
         super::affects_subdir_layout(&self.root, path)
     }
 
+    /// 会话文件，加上原文件已经没了的备份。
     fn session_files(&self) -> Option<io::Result<Vec<PathBuf>>> {
-        Some(super::jsonl_in_subdirs(&self.root))
+        Some(super::jsonl_in_subdirs(&self.root).map(|mut files| {
+            if let Some(b) = &self.backups {
+                files.extend(b.orphans(&self.root));
+            }
+            files
+        }))
     }
 
     fn read_files(&self, paths: &[PathBuf]) -> Vec<io::Result<Option<Session>>> {
-        jsonl::par_map(paths, read_session)
+        jsonl::par_map(paths, |p| self.read_file(p))
     }
+
+    fn stand_in(&self, gone: &Path) -> Option<PathBuf> {
+        self.backups
+            .as_ref()?
+            .path_for(&self.root, gone)
+            .filter(|b| b.is_file())
+    }
+
+    /// 备份或更新这条对话；`check` 为真时备份没变也完整解一遍，坏了重写。
+    fn back_up(&self, session: &Session, check: bool) -> io::Result<Saved> {
+        let unsupported = || {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "这条对话不在 Claude 的项目目录里",
+            )
+        };
+        if backup::is_backup(&session.path) {
+            return Ok(Saved::Fresh);
+        }
+        let b = self.backups.as_ref().ok_or_else(unsupported)?;
+        let to = b
+            .path_for(&self.root, &session.path)
+            .ok_or_else(unsupported)?;
+        let saved = b.save(&session.path, &to)?;
+        if saved == Saved::Fresh && check && backup::verify(&to).is_err() {
+            std::fs::remove_file(&to)?;
+            return b.save(&session.path, &to);
+        }
+        Ok(saved)
+    }
+
+    fn put_back(&self, session: &Session) -> io::Result<PathBuf> {
+        let original = self
+            .backups
+            .as_ref()
+            .filter(|_| backup::is_backup(&session.path))
+            .and_then(|b| b.original_of(&self.root, &session.path))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "这条对话的原文件还在，不用放回",
+                )
+            })?;
+        backup::put_back(&session.path, &original)?;
+        Ok(original)
+    }
+}
+
+/// Claude Code 留对话的天数（`cleanupPeriodDays`）和这个数是怎么来的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retention {
+    pub days: u32,
+    pub from: RetentionFrom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionFrom {
+    /// 没设，用官方默认。
+    Default,
+    /// 设置里写的。
+    Set,
+    /// 设置里写了但不合法（官方要不小于 1 的整数，0 也通不过校验）：原样记下，天数按默认算。
+    Invalid(String),
+}
+
+/// 官方默认留 30 天（settings 文档 `cleanupPeriodDays`）。
+pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+
+/// 读 `<config_dir>/settings.json` 的 `cleanupPeriodDays`（`config_dir` 是 `~/.claude` 或账号的 `CLAUDE_CONFIG_DIR`）。
+/// 只读这一个文件：项目里的 `.claude/settings.json`、企业托管设置也能设，各项目不一样，会话台不猜。
+/// 文件不在、没这一项是默认；不是 JSON、不是不小于 1 的整数记为不合法，天数按默认算（宁可早提醒）。
+pub fn retention(config_dir: &Path) -> Retention {
+    let default = |from| Retention {
+        days: DEFAULT_RETENTION_DAYS,
+        from,
+    };
+    let text = match std::fs::read(config_dir.join("settings.json")) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return default(RetentionFrom::Default),
+        Err(e) => return default(RetentionFrom::Invalid(format!("settings.json 读不了：{e}"))),
+    };
+    let v: Value = match serde_json::from_slice(&text) {
+        Ok(v) => v,
+        Err(_) => return default(RetentionFrom::Invalid("settings.json 不是 JSON".to_owned())),
+    };
+    let Some(raw) = v.get("cleanupPeriodDays") else {
+        return default(RetentionFrom::Default);
+    };
+    let days = raw
+        .as_f64()
+        .filter(|d| d.fract() == 0.0 && *d >= 1.0)
+        .map(|d| d.min(f64::from(u32::MAX)) as u32);
+    match days {
+        Some(days) => Retention {
+            days,
+            from: RetentionFrom::Set,
+        },
+        None => default(RetentionFrom::Invalid(raw.to_string())),
+    }
+}
+
+/// 各 Claude 账号（短名）留对话的天数，见 [`retention`]。
+pub fn retention_by_account(accounts: &[Account]) -> HashMap<String, u32> {
+    accounts
+        .iter()
+        .filter(|a| a.vendor == Vendor::Claude)
+        .map(|a| (a.key.clone(), retention(&a.dir).days))
+        .collect()
+}
+
+/// 最后活动在 `last` 的对话离被 Claude 删还有多久（`days` 是 [`Retention::days`]）；已经过了是 `None`。
+pub fn deleted_in(last: SystemTime, now: SystemTime, days: u32) -> Option<Duration> {
+    let keep = Duration::from_secs(u64::from(days) * 86_400);
+    (last + keep).duration_since(now).ok()
 }
 
 /// 读一个会话文件的头尾。空文件、没有任何对话内容的文件返回 `None`。
 pub(crate) fn read_session(path: &Path) -> io::Result<Option<Session>> {
+    read_session_as(path, path)
+}
+
+/// 读 `path`，当它是放在 `logical` 的会话文件（id、项目目录按 `logical` 认）：读备份解出来的临时文件用。
+fn read_session_as(path: &Path, logical: &Path) -> io::Result<Option<Session>> {
     let w = Window::read(path)?;
     if w.len == 0 {
         return Ok(None);
@@ -159,7 +337,7 @@ pub(crate) fn read_session(path: &Path) -> io::Result<Option<Session>> {
         return Ok(None);
     }
 
-    let cwd = project_cwd(path, &head, tail);
+    let cwd = project_cwd(logical, &head, tail);
     let git_branch = [tail, &head]
         .iter()
         .find_map(|vs| {
@@ -183,7 +361,7 @@ pub(crate) fn read_session(path: &Path) -> io::Result<Option<Session>> {
         })
         .unwrap_or(w.mtime);
 
-    let id = path
+    let id = logical
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -325,6 +503,7 @@ fn moment_events(v: &Value) -> Vec<Event> {
         }),
         _ => {}
     }
+    out.extend(limit::claude(v).map(Event::Limit));
     out
 }
 

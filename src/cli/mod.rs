@@ -1,5 +1,6 @@
 //! 命令入口：`ai`、`ai doctor`、`ai attach <id>`、`ai export <id>`、`ai list`、`ai search <词>`、`ai daemon`、`ai update`。
 
+mod cli_upgrade;
 mod daemon;
 mod doctor;
 mod export;
@@ -63,8 +64,18 @@ pub enum Command {
     },
     /// 启动守护进程（通常由 ai 自动拉起）
     Daemon,
-    /// 升级到最新版（按安装方式：Homebrew、cargo install 或直接下载）
-    Update,
+    /// 升级会话台自己（不带参数，按安装方式：Homebrew、cargo install 或直接下载）；带厂商名或 --all 升级各家 CLI
+    ///
+    /// `ai update claude`：按本机装法跑那家的官方升级命令（不用 sudo，跑完确认 PATH 上第一个就是新版）。
+    /// `ai update --all`：升界面上「更新」按钮会升的那几家。
+    Update {
+        /// 升这一家 CLI（claude、codex、pi、hermes、kimi、gemini、opencode、antigravity）
+        #[arg(value_name = "家", value_parser = query::parse_vendor, conflicts_with = "all")]
+        vendor: Option<Vendor>,
+        /// 升全部能升的各家 CLI
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 pub fn run() -> ExitCode {
@@ -79,7 +90,11 @@ pub fn run() -> ExitCode {
         }
         Some(Command::Daemon) => daemon(),
         Some(Command::Doctor) => doctor(),
-        Some(Command::Update) => update(),
+        Some(Command::Update {
+            vendor: None,
+            all: false,
+        }) => update(),
+        Some(Command::Update { vendor, .. }) => update_clis(*vendor),
         None => board(),
     }
 }
@@ -180,6 +195,26 @@ fn update() -> ExitCode {
     }
 }
 
+fn update_clis(vendor: Option<Vendor>) -> ExitCode {
+    let dir = match data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ai update: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut ok = true;
+    cli_upgrade::run(vendor, &dir, |(text, good)| {
+        ok &= good;
+        println!("{text}");
+    });
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn board() -> ExitCode {
     // 有没有新版在后台线程里查（开关在界面的设置里），取不到数据目录就不查。
     let check: crate::ui::UpdateCheck =
@@ -222,7 +257,29 @@ mod tests {
         assert_eq!(parse(&[]).unwrap().command, None);
         assert_eq!(parse(&["doctor"]).unwrap().command, Some(Command::Doctor));
         assert_eq!(parse(&["daemon"]).unwrap().command, Some(Command::Daemon));
-        assert_eq!(parse(&["update"]).unwrap().command, Some(Command::Update));
+        assert_eq!(
+            parse(&["update"]).unwrap().command,
+            Some(Command::Update {
+                vendor: None,
+                all: false
+            })
+        );
+        assert_eq!(
+            parse(&["update", "Claude"]).unwrap().command,
+            Some(Command::Update {
+                vendor: Some(Vendor::Claude),
+                all: false
+            })
+        );
+        assert_eq!(
+            parse(&["update", "--all"]).unwrap().command,
+            Some(Command::Update {
+                vendor: None,
+                all: true
+            })
+        );
+        assert!(parse(&["update", "claude", "--all"]).is_err());
+        assert!(parse(&["update", "nope"]).is_err());
         assert_eq!(
             parse(&["attach", "abc-123"]).unwrap().command,
             Some(Command::Attach {

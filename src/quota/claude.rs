@@ -36,6 +36,7 @@ pub(super) fn read_statusline(r: &QuotaReader, ch: &Channel) -> Result<QuotaRead
         cache_file,
         max_age_minutes,
         windows,
+        ..
     } = ch
     else {
         unreachable!("只给状态栏渠道调用")
@@ -225,14 +226,19 @@ pub fn usage_command(req: &UsageRequest, token: &str) -> (Vec<String>, String) {
 }
 
 /// 生成 `--settings` 的 JSON：状态栏命令先把标准输入（Claude 给状态栏的数据）存进缓存，
-/// 再把同一份数据交给用户原有的状态栏命令，输出原样显示。原有设置里的 padding 等字段保留。
+/// 再把同一份数据交给用户原有的状态栏命令，输出原样显示；最后按数据里的 `session_id` 另存一份给上下文占用用。
+/// 原有设置里的 padding 等字段保留。
 pub(super) fn settings_arg(r: &QuotaReader, cwd: &Path) -> String {
-    let cache_file = r
+    let (cache_file, context_dir) = r
         .rules
         .channels(Vendor::Claude)
         .iter()
         .find_map(|ch| match ch {
-            Channel::Statusline { cache_file, .. } => Some(cache_file.as_str()),
+            Channel::Statusline {
+                cache_file,
+                context_dir,
+                ..
+            } => Some((cache_file.as_str(), context_dir.as_str())),
             _ => None,
         })
         .expect("rules.json 里 Claude 有状态栏渠道（rules 单测保证）");
@@ -245,7 +251,12 @@ pub(super) fn settings_arg(r: &QuotaReader, cwd: &Path) -> String {
     status.insert("type".to_owned(), json!("command"));
     status.insert(
         "command".to_owned(),
-        json!(wrapper_command(&r.data_dir, cache_file, original_cmd)),
+        json!(wrapper_command(
+            &r.data_dir,
+            cache_file,
+            context_dir,
+            original_cmd
+        )),
     );
     json!({ "statusLine": status }).to_string()
 }
@@ -267,10 +278,23 @@ fn original_statusline(claude_dir: &Path, cwd: &Path) -> Option<Map<String, Valu
     })
 }
 
-fn wrapper_command(data_dir: &Path, cache_file: &str, original: Option<&str>) -> String {
+fn wrapper_command(
+    data_dir: &Path,
+    cache_file: &str,
+    context_dir: &str,
+    original: Option<&str>,
+) -> String {
     let dir = shell_quote(&data_dir.to_string_lossy());
     let cache = shell_quote(cache_file);
-    let save = format!("mv -f \"$t\" \"$d\"/{cache}");
+    let ctx = shell_quote(context_dir);
+    // 每条对话一份：文件名取数据里的 session_id，只认字母、数字、`-`、`_`（换行先去掉，多行 JSON 也认得），
+    // 别的字符一律不存，拼不出别的路径。临时文件 + mv 原子替换。
+    let per_session = format!(
+        "s=$(tr -d '\\n' < \"$t\" | sed -n 's/.*\"session_id\"[[:space:]]*:[[:space:]]*\"\\([A-Za-z0-9_-]\\{{1,128\\}}\\)\".*/\\1/p'); \
+         if [ -n \"$s\" ] && mkdir -p \"$d\"/{ctx} && cp \"$t\" \"$d\"/{ctx}/\".$s.$$\"; \
+         then mv -f \"$d\"/{ctx}/\".$s.$$\" \"$d\"/{ctx}/\"$s.json\"; fi"
+    );
+    let save = format!("{per_session}; mv -f \"$t\" \"$d\"/{cache}");
     let body = match original {
         // 原命令放进子 shell，它自己 exit 也不影响后面存缓存；单独一行，防止它以注释结尾。
         Some(cmd) => format!("(\n{cmd}\n) < \"$t\"; {save}"),

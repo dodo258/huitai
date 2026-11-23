@@ -64,6 +64,23 @@ pub fn request(dir: &Path, req: &Request) -> io::Result<Response> {
     protocol::read_json(&mut stream, KIND_RESPONSE)
 }
 
+/// 此刻有托管对话在跑（CLI 进程已起来）的那几家，升级各家 CLI 前看。守护进程没在跑就是空的；
+/// 连上了却没答好报错（调用方当作不知道，别升 npm 一类原地覆盖的）。
+pub fn hosted_vendors(dir: &Path) -> io::Result<std::collections::HashSet<crate::core::Vendor>> {
+    match request(dir, &Request::List) {
+        Ok(Response::List(h)) => Ok(h
+            .into_iter()
+            .filter(|i| i.pid.is_some())
+            .map(|i| i.vendor)
+            .collect()),
+        Ok(other) => Err(io::Error::other(format!("托管列表应答不对：{other:?}"))),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+            Ok(Default::default())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// 守护进程是哪一版、托管着几条对话。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonInfo {

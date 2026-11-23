@@ -19,14 +19,64 @@ pub fn run<A: AsRef<OsStr>>(
     stdin: Option<&str>,
     timeout: Duration,
 ) -> io::Result<String> {
-    let program = program.as_ref();
-    let name = Path::new(program)
+    let name = name_of(program.as_ref());
+    let out = spawn(Command::new(program).args(args), stdin, timeout, false)?;
+    if out.success() {
+        return Ok(out.stdout);
+    }
+    Err(io::Error::other(
+        match out.stderr.lines().map(str::trim).find(|l| !l.is_empty()) {
+            Some(line) => format!("{name} {}: {line}", out.code_text()),
+            None => format!("{name} {}", out.code_text()),
+        },
+    ))
+}
+
+/// 跑完的子进程：退出码（被信号结束是 `None`）和完整的标准输出、标准错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Output {
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    /// 「退出码 3」「被信号结束」。
+    pub fn code_text(&self) -> String {
+        self.code
+            .map_or_else(|| "被信号结束".to_owned(), |c| format!("退出码 {c}"))
+    }
+}
+
+/// 跑一个准备好的命令（参数、环境、目录由调用方定），不管退出码都交回完整输出；超时杀掉、报 `TimedOut`。
+/// 给要把失败原文整段给用户看的地方用（升级各家 CLI）。子进程放进自己的进程组，超时时连它拉起的
+/// （`sh -c` 里的 npm、curl）一起结束。
+pub fn output(cmd: &mut Command, timeout: Duration) -> io::Result<Output> {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+    spawn(cmd, None, timeout, true)
+}
+
+fn name_of(program: &OsStr) -> String {
+    Path::new(program)
         .file_name()
         .unwrap_or(program)
         .to_string_lossy()
-        .into_owned();
-    let mut child = Command::new(program)
-        .args(args)
+        .into_owned()
+}
+
+fn spawn(
+    cmd: &mut Command,
+    stdin: Option<&str>,
+    timeout: Duration,
+    group: bool,
+) -> io::Result<Output> {
+    let name = name_of(cmd.get_program());
+    let mut child = cmd
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -51,6 +101,10 @@ pub fn run<A: AsRef<OsStr>>(
             break status;
         }
         if Instant::now() >= deadline {
+            if group && let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: 只发信号，不碰内存；进程组号就是子进程号（`process_group(0)`）。
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::new(
@@ -60,20 +114,11 @@ pub fn run<A: AsRef<OsStr>>(
         }
         thread::sleep(POLL);
     };
-    let out = stdout.join().unwrap_or_default();
-    if status.success() {
-        return Ok(out);
-    }
-    let err = stderr.join().unwrap_or_default();
-    let code = status
-        .code()
-        .map_or_else(|| "被信号结束".to_owned(), |c| format!("退出码 {c}"));
-    Err(io::Error::other(
-        match err.lines().map(str::trim).find(|l| !l.is_empty()) {
-            Some(line) => format!("{name} {code}: {line}"),
-            None => format!("{name} {code}"),
-        },
-    ))
+    Ok(Output {
+        code: status.code(),
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 fn read_in_background<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<String> {
@@ -133,6 +178,28 @@ mod tests {
         );
         let missing = run("huitai-no-such-program", NONE, None, T).unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn output_keeps_everything_and_kills_the_group() {
+        let out = output(
+            Command::new("sh").args(["-c", "echo a; echo b >&2; echo c >&2; exit 4"]),
+            T,
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(4));
+        assert_eq!(out.stdout, "a\n");
+        assert_eq!(out.stderr, "b\nc\n");
+        assert_eq!(out.code_text(), "退出码 4");
+        // 超时：sh 拉起的 sleep 也一起结束，不会拿着管道让读线程等它。
+        let started = Instant::now();
+        let err = output(
+            Command::new("sh").args(["-c", "sleep 30 & sleep 30; echo never"]),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

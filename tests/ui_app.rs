@@ -406,20 +406,45 @@ fn settings_change_idle_reclaim_minutes() {
     }
 }
 
-/// 设置最后一项「检查新版本」：←→ 切换，Esc 存进配置。
+/// 设置「检查新版本」（倒数第二项）：←→ 切换，Esc 存进配置。
 #[test]
 fn settings_toggle_update_check() {
     let mut app = demo_app(Vendor::Claude);
     assert!(app.config.check_updates, "默认开");
     press(&mut app, ',');
-    for _ in 0..10 {
+    for _ in 0..7 {
         app.key(key(KeyCode::Down));
     }
-    assert!(dump(&render(&mut app, 120, 30)).contains("每天最多查一次 GitHub"));
+    assert!(dump(&render(&mut app, 120, 30)).contains("会话台和各家 CLI，每天最多查一次"));
     app.key(key(KeyCode::Right));
     assert!(!app.config.check_updates);
     match app.key(key(KeyCode::Esc)).as_slice() {
         [Effect::SaveConfig(cfg)] => assert!(!cfg.check_updates),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 设置最后一项「自动升级」（各家 CLI）：默认开，←→ 切换，Esc 存进配置；关了检查新版本时写明要先开它。
+#[test]
+fn settings_toggle_auto_upgrade() {
+    let mut app = demo_app(Vendor::Claude);
+    assert!(app.config.auto_upgrade_clis, "默认开");
+    press(&mut app, ',');
+    for _ in 0..10 {
+        app.key(key(KeyCode::Down));
+    }
+    assert!(
+        dump(&render(&mut app, 120, 30))
+            .contains("自动升级    ‹ 开 · 各家 CLI 没有对话在跑时升，不跨大版本 ›")
+    );
+    app.key(key(KeyCode::Left));
+    assert!(!app.config.auto_upgrade_clis);
+    assert!(dump(&render(&mut app, 120, 30)).contains("关 · 顶栏「更新」手动升"));
+    app.key(key(KeyCode::Right));
+    app.config.check_updates = false;
+    assert!(dump(&render(&mut app, 120, 30)).contains("开 · 要先开「检查新版本」"));
+    match app.key(key(KeyCode::Esc)).as_slice() {
+        [Effect::SaveConfig(cfg)] => assert!(cfg.auto_upgrade_clis),
         other => panic!("{other:?}"),
     }
 }

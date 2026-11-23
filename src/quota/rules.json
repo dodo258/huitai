@@ -5,6 +5,8 @@
       "kind": "statusline",
       "cache_file": "claude-statusline.json",
       "max_age_minutes": 10,
+      "context_dir": "claude-context",
+      "context_percent": "/context_window/used_percentage",
       "windows": [
         { "percent": "/rate_limits/five_hour/used_percentage", "resets_at": "/rate_limits/five_hour/resets_at", "minutes": 300 },
         { "percent": "/rate_limits/seven_day/used_percentage", "resets_at": "/rate_limits/seven_day/resets_at", "minutes": 10080 }

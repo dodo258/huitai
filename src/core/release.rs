@@ -44,9 +44,14 @@ pub fn disabled_by_env(value: Option<&str>) -> bool {
 
 /// 离上次查已满 24 小时（从没查过、或者上次的时间在将来——改过系统时间——也算到了）。
 pub fn check_due(last_checked: Option<u64>, now: u64) -> bool {
+    due_after(last_checked, now, CHECK_EVERY)
+}
+
+/// 离上次查已满 `every`（规则同 [`check_due`]）。
+pub fn due_after(last_checked: Option<u64>, now: u64, every: Duration) -> bool {
     match last_checked {
         None => true,
-        Some(last) => now < last || now - last >= CHECK_EVERY.as_secs(),
+        Some(last) => now < last || now - last >= every.as_secs(),
     }
 }
 
