@@ -4,13 +4,11 @@
 mod sources_common;
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use huitai::core::{Session, SessionId, Vendor};
 use huitai::sources::{ClaudeSource, CodexSource, Part, PiSource, Role, Source, Transcript, Trash};
-use sources_common::{at, temp_dir};
+use sources_common::{at, build_db, temp_dir};
 
 fn session(vendor: Vendor, id: &str, path: PathBuf) -> Session {
     Session {
@@ -163,19 +161,7 @@ fn codex_history_db_when_rollout_is_gone() {
          ('{id}','t','5',5,1795172004000,'{{\"type\":\"agentMessage\",\"text\":\"好了\"}}','agentMessage'),
          ('other','t','1',1,1795172000000,'{{\"type\":\"agentMessage\",\"text\":\"别的对话\"}}','agentMessage');"
     );
-    let mut child = Command::new("sqlite3")
-        .arg(root.join("thread_history_1.sqlite"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("测试需要 sqlite3（macOS 自带）");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
+    build_db(&root.join("thread_history_1.sqlite"), &sql);
     let src = CodexSource::new(&root, Trash::new(base.join("trash")));
     let t = src
         .load_transcript(&session(Vendor::Codex, id, root.join("gone.jsonl")))

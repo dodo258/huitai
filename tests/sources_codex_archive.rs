@@ -5,15 +5,13 @@
 mod sources_common;
 
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
 
 use huitai::core::{Session, Vendor};
 use huitai::export::{self, Meta};
 use huitai::index::{Entry, Index};
 use huitai::sources::{CodexSource, Part, Role, Source, Trash};
-use sources_common::{at, fixture, temp_dir};
+use sources_common::{at, build_db, fixture, temp_dir};
 
 const ID: &str = "aaaaaaaa-0000-4000-8000-00000000000c";
 const NAME: &str = "rollout-2026-11-01T09-00-00-aaaaaaaa-0000-4000-8000-00000000000c.jsonl";
@@ -50,22 +48,6 @@ fn only(src: &CodexSource) -> Session {
     assert!(scan.problems.is_empty(), "{:?}", scan.problems);
     assert_eq!(scan.sessions.len(), 1, "{:?}", scan.sessions);
     scan.sessions.into_iter().next().unwrap()
-}
-
-fn build_db(path: &Path, sql: &str) {
-    let mut child = Command::new("sqlite3")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("测试需要 sqlite3（macOS 自带）");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
 }
 
 #[test]

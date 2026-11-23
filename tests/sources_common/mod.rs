@@ -36,3 +36,10 @@ pub fn copy_tree(src: &Path, dst: &Path) {
 pub fn at(unix_secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(unix_secs)
 }
+
+/// 用会话台自带的 SQLite（rusqlite bundled）按 SQL 建样例库：CI（ubuntu）的系统 `sqlite3` 不带 FTS5。
+pub fn build_db(path: &Path, sql: &str) {
+    rusqlite::Connection::open(path)
+        .and_then(|db| db.execute_batch(sql))
+        .unwrap_or_else(|e| panic!("建样例库 {} 失败：{e}", path.display()));
+}

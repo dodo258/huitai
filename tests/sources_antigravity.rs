@@ -5,9 +5,7 @@
 mod sources_common;
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use huitai::core::{Session, Vendor, VendorDirs};
@@ -15,7 +13,7 @@ use huitai::index::Index;
 use huitai::sources::{
     AntigravitySource, Delivery, Part, Role, Source, Trash, accounts, source_of, sources_for,
 };
-use sources_common::{at, copy_tree, fixture, temp_dir};
+use sources_common::{at, build_db, copy_tree, fixture, temp_dir};
 
 const ACTIVE: &str = "a9e10000-1111-4aaa-8bbb-000000000001";
 const UNTITLED: &str = "a9e10000-2222-4aaa-8bbb-000000000002";
@@ -41,19 +39,7 @@ fn build_root(root: &Path) {
     );
     copy_tree(&fixture("antigravity/brain"), &root.join("brain"));
     let sql = fs::read_to_string(fixture("antigravity/conversation_summaries.sql")).unwrap();
-    let mut child = Command::new("sqlite3")
-        .arg(root.join("conversation_summaries.db"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("测试需要 sqlite3（macOS 自带）");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
+    build_db(&root.join("conversation_summaries.db"), &sql);
 }
 
 fn by_id<'a>(sessions: &'a [Session], id: &str) -> &'a Session {
@@ -164,16 +150,7 @@ fn add_long_history(root: &Path, id: &str) {
          ('{id}',1,2,3,'[[2,0]]','[[3,0]]','新问题\n','新回答。\n');",
         half = old_len / 2 / 3,
     );
-    let out = Command::new("sqlite3")
-        .arg(root.join("conversation_summaries.db"))
-        .arg(sql)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_db(&root.join("conversation_summaries.db"), &sql);
 }
 
 /// 预览、「此刻」只要最后几条：从最新的块往前读，够条数就停，读满 8 MiB 也停，不把整段历史取出来。

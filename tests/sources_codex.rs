@@ -4,13 +4,11 @@
 mod sources_common;
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use huitai::core::{Session, Vendor};
 use huitai::sources::{CodexSource, FoldGroup, Role, Source, Trash, fold_group};
-use sources_common::{at, copy_tree, fixture, temp_dir};
+use sources_common::{at, build_db, copy_tree, fixture, temp_dir};
 
 const DB_THREAD: &str = "cccccccc-0000-4000-8000-000000000003";
 const ROLLOUT_ONLY: &str = "bbbbbbbb-0000-4000-8000-000000000002";
@@ -42,22 +40,6 @@ fn setup(name: &str, with_db: bool) -> (PathBuf, CodexSource) {
     }
     let src = CodexSource::new(&root, Trash::new(base.join("trash")));
     (root, src)
-}
-
-fn build_db(path: &Path, sql: &str) {
-    let mut child = Command::new("sqlite3")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("测试需要 sqlite3（macOS 自带）");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
 }
 
 fn by_id(sessions: &[Session], id: &str) -> Session {

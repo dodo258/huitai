@@ -5,14 +5,12 @@
 mod sources_common;
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use huitai::core::{Session, Vendor};
 use huitai::index::Index;
 use huitai::sources::{HermesSource, Part, Role, Source, Trash};
-use sources_common::{at, fixture, temp_dir};
+use sources_common::{at, build_db, fixture, temp_dir};
 
 const TUI: &str = "20261120_101500_a1b2c3";
 const OLD_CLI: &str = "20261121_080000_b2c3d4";
@@ -39,22 +37,6 @@ fn setup_from(name: &str, sql: &str) -> (PathBuf, HermesSource) {
     );
     let src = HermesSource::new(&root, Trash::new(base.join("trash")));
     (base, src)
-}
-
-fn build_db(path: &Path, sql: &str) {
-    let mut child = Command::new("sqlite3")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("测试需要 sqlite3（macOS 自带）");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
 }
 
 fn by_id<'a>(sessions: &'a [Session], id: &str) -> &'a Session {

@@ -13,18 +13,11 @@ use huitai::sources::{
     AntigravitySource, ClaudeSource, CodexSource, GeminiSource, HermesSource, KimiSource,
     OpenCodeSource, PiSource, Source, Trash,
 };
-use sources_common::{at, copy_tree, fixture, temp_dir};
+use sources_common::{at, build_db, copy_tree, fixture, temp_dir};
 
 /// 快照固定按东八区排时间，不随跑测试的机器变。
 fn east8(_: i64) -> i64 {
     8 * 3600
-}
-
-/// 用会话台自带的 SQLite（rusqlite bundled）建样例库：CI 机器上的系统 `sqlite3` 不带 FTS5。
-fn build_db(path: &Path, sql: &str) {
-    rusqlite::Connection::open(path)
-        .and_then(|db| db.execute_batch(sql))
-        .unwrap_or_else(|e| panic!("建样例库 {} 失败：{e}", path.display()));
 }
 
 /// 一家的样例来源。

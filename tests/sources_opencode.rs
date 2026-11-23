@@ -4,14 +4,12 @@
 mod sources_common;
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use huitai::core::{Session, Vendor};
 use huitai::index::Index;
 use huitai::sources::{OpenCodeSource, Part, PreviewMessage, Role, Source, Trash};
-use sources_common::{at, fixture, temp_dir};
+use sources_common::{at, build_db, fixture, temp_dir};
 
 const V1: &str = "ses_e11a9a1ffffeV1onlyAbCdEfGh";
 const V1_FALLBACK: &str = "ses_e119a5fbfffeV1fallbackAbCd";
@@ -30,22 +28,6 @@ fn setup(name: &str) -> (PathBuf, OpenCodeSource) {
     );
     let src = OpenCodeSource::new(&db, Trash::new(base.join("trash")));
     (base, src)
-}
-
-fn build_db(path: &Path, sql: &str) {
-    let mut child = Command::new("sqlite3")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("测试需要 sqlite3（macOS 自带）");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sql.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
 }
 
 fn by_id<'a>(sessions: &'a [Session], id: &str) -> &'a Session {
