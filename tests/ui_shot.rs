@@ -1555,10 +1555,18 @@ fn real_terminal_screenshots() {
     run.press(b"\x1b");
     run.send(b"b");
     run.wait_for("已隐藏后台对话");
-    // N：目录候选（三家的项目目录 + ~/projects 下还没对话的 landing），打 a 筛、↓ 选第一个。
+    // m：目录候选（三家的项目目录 + ~/projects 下还没对话的 landing），最上面是「＋ 新建项目」；
+    // 输一个没有的名字，那行写要建的路径；打 a 筛、↓ 选第一个。
     run.send(b"m");
     run.wait_for("Tab 补全");
     run.wait_for("~/projects/landing");
+    run.wait_for("＋ 新建项目：输入名字，建在 ~/projects");
+    run.save(&out, "11-newdir-blank");
+    run.send(b"reading-room");
+    run.wait_for("＋ 新建 ~/projects/reading-room");
+    run.wait_for("没有对得上的 · ⏎ 新建");
+    run.save(&out, "11-newdir-new");
+    run.press(b"\x15");
     run.send(b"a");
     run.wait_for("3 个");
     run.press(b"\x1b[B");
@@ -1620,6 +1628,19 @@ fn real_terminal_screenshots() {
     run.wait_for("没有待处理或在跑的对话");
     run.wait_for("待处理 0 · 在跑 0");
     run.save(&out, "16a-board-empty");
+    run.press(b"\x1b");
+    run.quit();
+
+    // 手机竖屏宽（45 列）：m 的新建行和输入的字都看得到。
+    let run = Run::start_sized(&home, false, 45, 24);
+    run.wait_for("购物车结算按钮");
+    run.send(b"m");
+    run.wait_for("＋ 新建项目：输入名字，建在 ~/projects");
+    run.save(&out, "11-newdir-narrow");
+    run.send(b"reading-room");
+    run.wait_for("＋ 新建 ~/projects/reading-room");
+    run.wait_for("新项目名或目录  reading-room");
+    run.save(&out, "11-newdir-narrow-new");
     run.press(b"\x1b");
     run.quit();
 

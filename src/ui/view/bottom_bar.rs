@@ -24,11 +24,10 @@ pub(super) fn bottom_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme,
                 "⏎ 确定 · 留空恢复原名 · Esc 取消",
             ),
             Prompt::NewDir { vendor, picker } => {
+                let (label, hints) =
+                    new_dir_texts(*vendor, width(&picker.text), usize::from(inner.width));
                 let mut left = vec![
-                    sp(
-                        format!("在哪个目录新建 {} 对话  ", vendor.name()),
-                        fg(t.muted),
-                    ),
+                    sp(label, fg(t.muted)),
                     sp(picker.text.clone(), fg(t.title)),
                     cursor,
                 ];
@@ -38,7 +37,7 @@ pub(super) fn bottom_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme,
                 {
                     left.push(sp(format!("  → {}", tilde(&dir, &app.home)), fg(t.faint)));
                 }
-                (left, "Tab 补全 · ↑↓ 选 · ⏎ 确定 · Esc 取消")
+                (left, hints)
             }
             Prompt::ConfirmCreate { dir, .. } => (
                 vec![sp(
@@ -174,4 +173,27 @@ pub(super) fn bottom_bar(buf: &mut Buffer, area: Rect, app: &mut App, t: &Theme,
         };
     }
     row(buf, inner, left, right);
+}
+
+/// 目录输入框的提示语和右边的按键：输入的字要看得到，放不下时先去掉开哪家，再减按键，最后去掉提示语。
+/// 按给输入留 [`INPUT_ROOM`] 格挑，打字时提示语不来回换。
+fn new_dir_texts(vendor: Vendor, text: usize, w: usize) -> (String, &'static str) {
+    const INPUT_ROOM: usize = 24;
+    const KEYS: &str = "Tab 补全 · ↑↓ 选 · ⏎ 确定 · Esc 取消";
+    const FEW_KEYS: &str = "⏎ 确定 · Esc 取消";
+    const SHORT: &str = "新项目名或目录  ";
+    let long = format!("新项目名或目录，开 {} 对话  ", vendor.name());
+    // 光标一格，和右边的按键隔两格。
+    let fits = |label: &str, input: usize, hints: &str| {
+        let gap = if hints.is_empty() { 0 } else { 2 };
+        width(label) + input + 1 + gap + width(hints) <= w
+    };
+    let room = text.max(INPUT_ROOM);
+    for (label, hints) in [(long.as_str(), KEYS), (SHORT, KEYS), (SHORT, FEW_KEYS)] {
+        if fits(label, room, hints) {
+            return (label.to_owned(), hints);
+        }
+    }
+    let label = if fits(SHORT, text, "") { SHORT } else { "" };
+    (label.to_owned(), "")
 }

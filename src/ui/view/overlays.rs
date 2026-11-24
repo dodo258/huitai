@@ -3,16 +3,19 @@
 use super::list::{key_hints, select_bg};
 use super::*;
 
-/// N 的目录候选：贴在底栏上方、和列表一样宽，最多 [`newdir::SHOWN`] 行，↑↓ 选中的那行高亮。
+/// N 的目录候选：贴在底栏上方、和列表一样宽，最上面固定一行「＋ 新建」，下面最多 [`newdir::SHOWN`] 个候选；
+/// ↑↓ 选中的那行高亮，没选就是「＋ 新建」那行。
 pub(super) fn dir_candidates(
     buf: &mut Buffer,
     list: Rect,
+    app: &App,
     picker: &DirPicker,
     t: &Theme,
     accent: Color,
 ) {
     let matches = picker.matches();
-    let rows = matches.len().clamp(1, newdir::SHOWN) as u16;
+    let fixed = usize::from(picker.new_row.is_some());
+    let rows = (fixed + matches.len().min(newdir::SHOWN)).max(1) as u16;
     let h = (rows + 1).min(list.height);
     if h == 0 {
         return;
@@ -29,34 +32,50 @@ pub(super) fn dir_candidates(
         width: area.width.saturating_sub(2),
         height: 1,
     };
-    let count = match matches.len() {
-        0 => {
+    let count = match (matches.len(), &picker.new_row) {
+        (0, Some(NewRow::Blank)) => vec![],
+        (0, new) => {
+            let enter = match new {
+                Some(_) => "⏎ 新建",
+                None => "⏎ 用输入的路径",
+            };
             let mut v = vec![sp("没有对得上的 · ", fg(t.faint))];
-            v.extend(key_hints("⏎ 用输入的路径", t, accent));
+            v.extend(key_hints(enter, t, accent));
             v
         }
-        n => vec![sp(format!("{n} 个"), fg(t.faint))],
+        (n, _) => vec![sp(format!("{n} 个"), fg(t.faint))],
     };
     row(buf, line(0), vec![sp(" 目录", bold(t.muted))], count);
-    // 选中的超出可见行时往下滚。
-    let offset = picker
-        .picked
-        .map_or(0, |p| (p + 1).saturating_sub(newdir::SHOWN));
+    // 选中的那行整行铺底色，返回写字的区域。
+    let pick = |buf: &mut Buffer, i: usize, selected: bool| {
+        let r = line(1 + i as u16);
+        let full = Rect {
+            x: area.x,
+            width: area.width,
+            ..r
+        };
+        select_bg(buf, full, selected, t, accent);
+        r
+    };
     let room = usize::from(h - 1);
-    for (k, &ci) in matches.iter().enumerate().skip(offset).take(room) {
-        let r = line(1 + (k - offset) as u16);
-        let selected = picker.picked == Some(k);
-        select_bg(
+    if let Some(new) = &picker.new_row
+        && room > 0
+    {
+        let selected = picker.picked.is_none();
+        let r = pick(buf, 0, selected);
+        row(
             buf,
-            Rect {
-                x: area.x,
-                width: area.width,
-                ..r
-            },
-            selected,
-            t,
-            accent,
+            r,
+            new_row(app, new, usize::from(r.width), selected, t, accent),
+            vec![],
         );
+    }
+    // 「＋ 新建」不跟着滚；选中的超出可见行时候选往下滚。
+    let room = room.saturating_sub(fixed);
+    let offset = picker.picked.map_or(0, |p| (p + 1).saturating_sub(room));
+    for (k, &ci) in matches.iter().enumerate().skip(offset).take(room) {
+        let selected = picker.picked == Some(k);
+        let r = pick(buf, fixed + k - offset, selected);
         let style = if selected { bold(t.title) } else { fg(t.text) };
         let shown = truncate_middle(
             &picker.candidates[ci].shown,
@@ -64,6 +83,40 @@ pub(super) fn dir_candidates(
         );
         row(buf, r, vec![sp(format!(" {shown}"), style)], vec![]);
     }
+}
+
+/// 「＋ 新建」那行的字：窄了路径截中间，还没输入时连路径也放不下就只留怎么新建。
+fn new_row(
+    app: &App,
+    new: &NewRow,
+    w: usize,
+    selected: bool,
+    t: &Theme,
+    accent: Color,
+) -> Vec<Span<'static>> {
+    /// 路径截中间后至少留这么多格才写。
+    const MIN_ROOT: usize = 8;
+    let text = if selected { bold(t.title) } else { fg(t.text) };
+    let mut spans = vec![sp(" ＋ ", bold(accent))];
+    match new {
+        NewRow::Blank => {
+            spans.push(sp("新建项目", text));
+            spans.push(sp("：输入名字", fg(t.muted)));
+            const AT: &str = "，建在 ";
+            let room = w.saturating_sub(line_width(&spans) + width(AT) + 1);
+            let root = tilde(&app.projects_root(), &app.home);
+            if room >= width(&root).min(MIN_ROOT) {
+                spans.push(sp(AT, fg(t.muted)));
+                spans.push(sp(truncate_middle(&root, room), fg(t.muted)));
+            }
+        }
+        NewRow::Dir(dir) => {
+            spans.push(sp("新建 ", text));
+            let room = w.saturating_sub(line_width(&spans) + 1);
+            spans.push(sp(truncate_middle(&tilde(dir, &app.home), room), text));
+        }
+    }
+    spans
 }
 
 /// 右键菜单：左上角贴着点的位置，放不下就往左、往上挪。返回各项所在的区域（一项一行），给鼠标定位用。

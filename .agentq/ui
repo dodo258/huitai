@@ -16,12 +16,19 @@ trap 'rm -rf "$work"' EXIT
 
 SHOT_DIR="$work" cargo test --test ui_shot -- --ignored --nocapture || exit 1
 
+# Chrome 158 的 --window-size 把约 87px 浏览器工具栏也算进去：视口比截图矮，底部会重复画顶部、盖住底栏。
+# 窗口上下各多开 PAD，内容往下挪 PAD（视口装得下），截完再居中裁回原尺寸。
+PAD=100
 for html in "$work"/*.html; do
 	name=$(basename "$html" .html)
 	size=$(cat "$work/$name.size")
+	w=${size%,*}
+	h=${size#*,}
+	sed "s/<body>/<body style=\"padding-top:${PAD}px\">/" "$html" >"$work/padded.htm"
 	"$CHROME" --headless=new --disable-gpu --hide-scrollbars --no-first-run \
 		--user-data-dir="$work/chrome" --force-device-scale-factor=2 \
-		--window-size="$size" --screenshot="$OUT/$name.png" "file://$html" >/dev/null 2>&1
-	[ -s "$OUT/$name.png" ] || { echo "截图失败：$name"; exit 1; }
+		--window-size="$w,$((h + 2 * PAD))" --screenshot="$OUT/$name.png" "file://$work/padded.htm" >/dev/null 2>&1
+	[ -s "$OUT/$name.png" ] && sips -c $((h * 2)) $((w * 2)) "$OUT/$name.png" >/dev/null ||
+		{ echo "截图失败：$name"; exit 1; }
 	echo "截图：$OUT/$name.png"
 done

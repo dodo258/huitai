@@ -19,7 +19,7 @@ use crate::sources::Role;
 use super::activity;
 use super::app::{App, CliUpgrade, Overlay, Prompt, TERMINAL_CHOICES, VIEW_ONLY};
 use super::keys::{self, HELP, MenuItem};
-use super::newdir::{self, DirPicker};
+use super::newdir::{self, DirPicker, NewRow};
 use super::rows::{Group, GroupKey, Row};
 use super::text::{ago, tilde, truncate, truncate_middle, width, wrap};
 use super::theme::{Theme, UpdateButton, mix};
@@ -136,7 +136,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
     }
     bottom_bar(buf, a.bottom, app, theme, accent);
     if let Some(Prompt::NewDir { picker, .. }) = &app.prompt {
-        dir_candidates(buf, a.list, picker, theme, accent);
+        dir_candidates(buf, a.list, app, picker, theme, accent);
     }
     app.areas.menu = Rect::default();
     match app.overlay {
@@ -229,11 +229,12 @@ fn keep_visible(app: &mut App, height: u16) {
 // ---- 基础 ----
 
 pub(super) fn fill(buf: &mut Buffer, area: Rect, bg: Color) {
-    buf.set_style(area, Style::default().bg(bg));
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_symbol(" ");
+                // 样式也要清：浮层盖住的字是粗体、带下划线的，不清会留在后面写上去的字上。
+                c.reset();
+                c.set_bg(bg);
             }
         }
     }

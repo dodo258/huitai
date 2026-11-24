@@ -1,4 +1,4 @@
-//! 项目管理：N 的目录补全和候选、只输名字建在 projects_root 下、目录不存在先确认再建；
+//! 项目管理：N 的目录补全和候选、最上面的「＋ 新建」行、只输名字建在 projects_root 下、目录不存在先确认再建；
 //! 项目组上 e 起显示名（列表、预览、标签页标题前缀都用它）、a 整组归档。
 
 mod ui_support;
@@ -12,10 +12,11 @@ use huitai::index::{Index, ProjectEdit, ProjectNote};
 use huitai::opener;
 use huitai::ui::App;
 use huitai::ui::app::{Effect, Prompt};
-use huitai::ui::newdir::{self, DirPicker};
+use huitai::ui::newdir::{self, DirPicker, NewRow};
 use huitai::ui::rows::GroupKey;
 use huitai::ui::text::project_label;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Modifier;
 
 use ui_support::*;
 
@@ -334,15 +335,244 @@ fn candidate_list_is_drawn_above_bottom_bar() {
     app.key(key(KeyCode::Down));
     let text = dump(&render(&mut app, 120, 30));
     let lines: Vec<&str> = text.lines().collect();
-    // 底栏是最后一行，上面依次是两个候选，再上面是标题行。
-    assert!(lines[29].contains("在哪个目录新建 Claude 对话"), "{text}");
+    // 底栏是最后一行，上面依次是两个候选、「＋ 新建」、标题行。
+    assert!(
+        lines[29].contains("新项目名或目录，开 Claude 对话"),
+        "{text}"
+    );
     assert!(lines[29].contains("Tab 补全 · ↑↓ 选"), "{text}");
     assert!(lines[28].contains("~/work/api"), "{text}");
     assert!(lines[27].contains("~/projects/api"), "{text}");
+    assert!(lines[26].contains("＋ 新建 ~/projects/api"), "{text}");
     assert!(
-        lines[26].contains("目录") && lines[26].contains("2 个"),
+        lines[25].contains("目录") && lines[25].contains("2 个"),
         "{text}"
     );
+}
+
+// ---- 「＋ 新建」那行 ----
+
+/// 以 `root` 为 `projects_root` 的空列表会话台，按过 m。
+fn app_in(root: &Path) -> App {
+    let mut app = App::new(
+        PathBuf::from(HOME),
+        root.to_path_buf(),
+        Config {
+            projects_root: root.to_string_lossy().into_owned(),
+            ..Config::default()
+        },
+    );
+    press(&mut app, 'm');
+    app
+}
+
+/// 画一帧，写着「＋」的那行（没有是空的）。
+fn new_row(app: &mut App, w: u16, h: u16) -> String {
+    let text = dump(&render(app, w, h));
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains('＋')).collect();
+    assert!(rows.len() <= 1, "只有一行：{text}");
+    rows.first().copied().unwrap_or_default().to_owned()
+}
+
+#[test]
+fn new_row_on_empty_input_says_how_and_enter_keeps_prompt() {
+    let mut app = App::new(
+        PathBuf::from(HOME),
+        PathBuf::from("/Users/demo/projects/shop"),
+        Config {
+            projects_root: "~/code".to_owned(),
+            ..Config::default()
+        },
+    );
+    press(&mut app, 'm');
+    assert_eq!(picker(&app).new_row, Some(NewRow::Blank));
+    let want = "＋ 新建项目：输入名字，建在 ~/code";
+    let row = new_row(&mut app, 120, 30);
+    assert!(row.contains(want), "{row}");
+    // 没有候选时标题行不说「没有对得上的」：还什么都没输。
+    let text = dump(&render(&mut app, 120, 30));
+    assert!(!text.contains("没有对得上的"), "{text}");
+    assert!(app.key(key(KeyCode::Enter)).is_empty());
+    assert!(matches!(app.prompt, Some(Prompt::NewDir { .. })));
+
+    // 在候选最上面；下去选了候选再回来，按 ⏎ 还是不做事、输入框留着。
+    let mut app = demo_app(Vendor::Claude);
+    press(&mut app, 'm');
+    app.key(key(KeyCode::Down));
+    assert_eq!(picker(&app).picked, Some(0));
+    app.key(key(KeyCode::Up));
+    assert_eq!(picker(&app).picked, None);
+    let text = dump(&render(&mut app, 120, 30));
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| l.contains('＋')).expect("新建行");
+    assert!(lines[at - 1].contains("目录"), "{text}");
+    assert!(lines[at].starts_with("▎"), "没选候选就停在这行：{text}");
+    assert!(app.key(key(KeyCode::Enter)).is_empty());
+    assert!(matches!(app.prompt, Some(Prompt::NewDir { .. })));
+    // 只敲了空格也算没输。
+    press(&mut app, ' ');
+    assert_eq!(picker(&app).new_row, Some(NewRow::Blank));
+    // 打了字再删光：回到「怎么新建」。
+    typed(&mut app, "x");
+    assert_ne!(picker(&app).new_row, Some(NewRow::Blank));
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(picker(&app).new_row, Some(NewRow::Blank));
+}
+
+#[test]
+fn new_row_on_new_name_shows_full_path_and_enter_asks() {
+    let root = tmp("newrow");
+    let mut app = app_in(&root);
+    typed(&mut app, "fresh");
+    let want = root.join("fresh");
+    assert_eq!(picker(&app).new_row, Some(NewRow::Dir(want.clone())));
+    // 没有候选对得上：新建行在，标题行说 ⏎ 新建。
+    let text = dump(&render(&mut app, 200, 30));
+    assert!(
+        text.contains(&format!("＋ 新建 {}", want.display())),
+        "{text}"
+    );
+    assert!(text.contains("没有对得上的 · ⏎ 新建"), "{text}");
+    assert!(app.key(key(KeyCode::Enter)).is_empty());
+    assert_eq!(
+        app.prompt,
+        Some(Prompt::ConfirmCreate {
+            vendor: Vendor::Claude,
+            dir: want
+        })
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn new_row_is_gone_when_dir_exists() {
+    let root = tmp("exists");
+    let shop = root.join("shop");
+    fs::create_dir_all(&shop).unwrap();
+    fs::write(root.join("file"), "x").unwrap();
+    let mut app = app_in(&root);
+    app.set_root_dirs(vec![shop.clone()]);
+    typed(&mut app, "sho");
+    assert_eq!(
+        picker(&app).new_row,
+        Some(NewRow::Dir(root.join("sho"))),
+        "只对上一半的还是新名字"
+    );
+    press(&mut app, 'p');
+    assert_eq!(picker(&app).new_row, None);
+    assert_eq!(new_row(&mut app, 120, 30), "");
+    // Tab 补成已有的目录也一样；是文件的也不说能新建。
+    app.key(key(KeyCode::Backspace));
+    app.key(key(KeyCode::Tab));
+    assert_eq!(picker(&app).new_row, None);
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    typed(&mut app, "file");
+    assert_eq!(picker(&app).new_row, None);
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    typed(&mut app, "shop");
+    assert_eq!(
+        app.key(key(KeyCode::Enter)),
+        vec![Effect::New {
+            vendor: Vendor::Claude,
+            cwd: shop
+        }]
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn enter_on_new_row_after_arrows_uses_typed_text() {
+    let root = tmp("backtonew");
+    let shop = root.join("shop");
+    fs::create_dir_all(&shop).unwrap();
+    let mut app = app_in(&root);
+    app.set_root_dirs(vec![shop.clone()]);
+    typed(&mut app, "sho");
+    // ↓ 到候选 shop，↑ 回到新建行：⏎ 和没选一样，用输入的 sho。
+    app.key(key(KeyCode::Down));
+    assert_eq!(picker(&app).picked, Some(0));
+    let row = new_row(&mut app, 120, 30);
+    assert!(
+        row.contains("＋ 新建") && !row.starts_with('▎'),
+        "选了候选，新建行还在但不高亮：{row}"
+    );
+    app.key(key(KeyCode::Up));
+    assert!(new_row(&mut app, 120, 30).starts_with('▎'));
+    assert!(app.key(key(KeyCode::Enter)).is_empty());
+    assert_eq!(
+        app.prompt,
+        Some(Prompt::ConfirmCreate {
+            vendor: Vendor::Claude,
+            dir: root.join("sho")
+        })
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn new_row_stays_on_narrow_and_short_windows() {
+    let mut app = demo_app(Vendor::Antigravity);
+    press(&mut app, 'm');
+    // 窄到手机竖屏：新建行、输入框都在；放不下路径时先去掉路径。
+    for (w, want) in [
+        (80, "＋ 新建项目：输入名字，建在 ~/projects"),
+        (45, "＋ 新建项目：输入名字，建在 ~/projects"),
+        (30, "＋ 新建项目：输入名字"),
+    ] {
+        let row = new_row(&mut app, w, 24);
+        assert!(row.contains(want), "{w} 列：{row}");
+        let text = dump(&render(&mut app, w, 24));
+        let bar = text.lines().last().unwrap_or_default();
+        assert!(bar.contains("新项目名或目录  ▏"), "{w} 列：{bar}");
+    }
+    // 盖住的列表行有粗体（选中的标题、组名），不带到浮层上：只有标题行和「＋ 新建项目」加粗。
+    for h in 8..30 {
+        let buf = render(&mut app, 45, h);
+        let y = (0..h)
+            .find(|&y| buf[(2, y)].symbol() == "＋")
+            .expect("新建行");
+        let hint = (0..45)
+            .find(|&x| buf[(x, y)].symbol() == "：")
+            .expect("说明");
+        for (x, y) in (hint..45)
+            .map(|x| (x, y))
+            .chain((y + 1..h - 1).flat_map(|y| (0..45).map(move |x| (x, y))))
+        {
+            assert!(
+                !buf[(x, y)].modifier.contains(Modifier::BOLD),
+                "{h} 行高，({x}, {y})：{}",
+                buf[(x, y)].symbol()
+            );
+        }
+    }
+    // 打的字看得到，不被右边的按键说明盖掉。
+    typed(&mut app, "reading-room");
+    for w in [120, 80, 60, 45, 30] {
+        let text = dump(&render(&mut app, w, 24));
+        let bar = text.lines().last().unwrap_or_default();
+        assert!(bar.contains("reading-room▏"), "{w} 列：{bar}");
+    }
+    let row = new_row(&mut app, 30, 24);
+    assert!(
+        row.contains("＋ 新建 ~/") && row.contains("room"),
+        "路径截中间：{row}"
+    );
+    // 矮窗口：新建行不跟着滚，选中的候选看得到。
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    let all = shown(&app);
+    for _ in 0..all.len() {
+        app.key(key(KeyCode::Down));
+    }
+    for h in [30, 12, 8, 6] {
+        let text = dump(&render(&mut app, 60, h));
+        assert!(text.contains("＋ 新建项目"), "{h} 行：{text}");
+        let last = all.last().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with('▎') && l.contains(last.as_str())),
+            "{h} 行看不到选中的 {last}：{text}"
+        );
+    }
 }
 
 // ---- e：项目显示名 ----

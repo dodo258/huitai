@@ -1,6 +1,7 @@
 //! N（在别的目录新建）的目录输入：候选是三家出现过的项目目录加 `projects_root` 下的子目录，
 //! 边打边筛、↑↓ 选、Tab 补全；⏎ 时把输入换成目录（只输一个名字就是 `projects_root/<名字>`）。
-//! 不做 IO：`projects_root` 的子目录由运行层读好了交进来。
+//! 候选最上面一行是「＋ 新建」（[`NewRow`]），就是 ↑↓ 的「不选」。
+//! 不做 IO：`projects_root` 的子目录由运行层读好了交进来，目录在不在由调用方查。
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -21,13 +22,24 @@ pub struct Candidate {
     pub shown: String,
 }
 
+/// 候选列表最上面的「＋ 新建」那行写什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewRow {
+    /// 还没输入：写怎么新建。
+    Blank,
+    /// 输入换算成的目录还不存在：⏎ 新建它。
+    Dir(PathBuf),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirPicker {
     pub text: String,
     /// 全部候选：最近用过的项目在前，之后是 `projects_root` 下的子目录。
     pub candidates: Vec<Candidate>,
-    /// ↑↓ 选中的是筛出来的第几个；`None` 是没选，⏎ 用输入的文字。
+    /// ↑↓ 选中的是筛出来的第几个；`None` 是没选（停在「＋ 新建」那行），⏎ 用输入的文字。
     pub picked: Option<usize>,
+    /// 「＋ 新建」那行；输入的目录已经有了就没有这行。
+    pub new_row: Option<NewRow>,
     home: PathBuf,
 }
 
@@ -37,6 +49,7 @@ impl DirPicker {
             text: String::new(),
             candidates: Vec::new(),
             picked: None,
+            new_row: Some(NewRow::Blank),
             home: home.to_path_buf(),
         };
         p.add(dirs);
@@ -81,7 +94,7 @@ impl DirPicker {
         self.picked = Some(self.picked.map_or(0, |i| (i + 1).min(n - 1)));
     }
 
-    /// ↑：回到第一个之上就是不选（⏎ 用输入的文字）。
+    /// ↑：回到第一个之上就是不选（「＋ 新建」那行，⏎ 用输入的文字）。
     pub fn up(&mut self) {
         self.picked = self.picked.and_then(|i| i.checked_sub(1));
     }
@@ -104,6 +117,19 @@ impl DirPicker {
         {
             return Some(self.candidates[c].dir.clone());
         }
+        self.typed(root, base)
+    }
+
+    /// 输入变了：重算「＋ 新建」那行，`exists` 查目录在不在。
+    pub fn refresh_new_row(&mut self, root: &Path, base: &Path, exists: impl Fn(&Path) -> bool) {
+        self.new_row = match self.typed(root, base) {
+            None => Some(NewRow::Blank),
+            Some(dir) if exists(&dir) => None,
+            Some(dir) => Some(NewRow::Dir(dir)),
+        };
+    }
+
+    fn typed(&self, root: &Path, base: &Path) -> Option<PathBuf> {
         resolve(&self.text, &self.home, root, base)
     }
 }

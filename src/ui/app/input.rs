@@ -338,6 +338,8 @@ impl App {
                 KeyCode::Char(c) if !ctrl => picker.edit(|t| t.push(c)),
                 _ => {}
             }
+            let root = self.projects_root();
+            picker.refresh_new_row(&root, &self.launch_dir, Path::exists);
             self.prompt = Some(prompt);
             return Vec::new();
         }

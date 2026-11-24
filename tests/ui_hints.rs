@@ -71,6 +71,13 @@ fn new_project_key_is_offered_on_project_groups() {
         text.contains("m  新建项目，或在别的目录开对话"),
         "预览里要有 m"
     );
+    // 80 列（底栏还有「后台 N 在跑」）也放得下；再窄照旧给路径让位。
+    let narrow = dump(&render(&mut app, 80, 24));
+    let narrow = narrow.lines().last().unwrap_or_default();
+    assert!(
+        narrow.contains("m 新项目") && narrow.contains("路径："),
+        "{narrow}"
+    );
     let item = huitai::ui::keys::menu(app.selected_kind())
         .into_iter()
         .position(|m| m.keys == "m")
@@ -84,4 +91,18 @@ fn new_project_key_is_offered_on_project_groups() {
         matches!(app.prompt, Some(huitai::ui::app::Prompt::NewDir { .. })),
         "按 m 弹出选目录"
     );
+}
+
+#[test]
+fn new_project_key_is_offered_on_empty_list() {
+    let mut app = huitai::ui::App::new(
+        HOME.into(),
+        "/Users/demo/projects/shop".into(),
+        huitai::core::Config::default(),
+    );
+    for w in [W, 60, 45] {
+        let text = dump(&render(&mut app, w, 24));
+        let bar = text.lines().last().unwrap_or_default();
+        assert!(bar.contains("m 新项目"), "{w} 列：{bar}");
+    }
 }
