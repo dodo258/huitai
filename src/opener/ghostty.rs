@@ -4,12 +4,8 @@
 
 use std::io;
 
-use super::CLI_TIMEOUT;
-use super::{Opened, Opener, TabHandle};
-use crate::core::exec;
+use super::{Opened, Opener, TabHandle, osascript};
 use crate::sources::Command;
-
-const OSASCRIPT: &str = "/usr/bin/osascript";
 
 /// 开新标签页，返回新终端的 id（UUID，Ghostty 进程内不复用）。没有窗口时开新窗口。
 ///
@@ -78,14 +74,11 @@ impl GhosttyOpener {
     }
 }
 
-fn osascript(args: &[String]) -> io::Result<String> {
-    exec::run(OSASCRIPT, args, None, CLI_TIMEOUT)
-        .map_err(|e| io::Error::new(e.kind(), format!("Ghostty AppleScript 失败: {e}")))
-}
-
 impl Opener for GhosttyOpener {
     fn open(&self, cmd: &Command, title: &str) -> io::Result<Opened> {
-        let id = osascript(&Self::open_args(cmd, title))?.trim().to_owned();
+        let id = osascript("Ghostty", &Self::open_args(cmd, title))?
+            .trim()
+            .to_owned();
         if id.is_empty() {
             return Err(io::Error::other("Ghostty 开了标签页但没返回终端 id"));
         }
@@ -96,7 +89,7 @@ impl Opener for GhosttyOpener {
         let TabHandle::Ghostty { terminal_id } = handle else {
             return Ok(false);
         };
-        match osascript(&Self::focus_args(terminal_id))?.trim() {
+        match osascript("Ghostty", &Self::focus_args(terminal_id))?.trim() {
             "ok" => Ok(true),
             "missing" => Ok(false),
             other => Err(io::Error::other(format!(

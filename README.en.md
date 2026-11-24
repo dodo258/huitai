@@ -21,7 +21,7 @@ Type `ai` in your terminal to see every Claude Code, Codex, pi, Hermes, Kimi Cod
 
 ## What it is
 
-A command-line tool that lives in your terminal. It is not a terminal and it does not use tmux. You keep your own terminal (Ghostty, Kaku, cmux or anything else); huitai does three things:
+A command-line tool that lives in your terminal. It is not a terminal and it does not use tmux. You keep your own terminal (Ghostty, Kaku, cmux, iTerm2 or anything else); huitai does three things:
 
 - **Find**: conversations from every tool in one place, grouped by project, newest first, with search over titles and message text.
 - **Resume**: Enter opens the conversation in a new tab in its project directory; if it is already open, that tab comes to the front.
@@ -45,7 +45,7 @@ Or build from source (needs a recent stable Rust, `rustup update stable`):
 cargo install --locked --git https://github.com/dodo258/huitai
 ```
 
-**Requirements**: macOS (developed and tested on macOS 27 with Apple silicon; the Intel build is compiled but not tested on real hardware). Opening conversations in a new tab needs [Ghostty](https://ghostty.org) 1.3 or later, [Kaku](https://github.com/tw93/Kaku) or [cmux](https://cmux.com); other terminals open them in the current window (cmux does not support opening at login or ⌥Space opening a new board, because it refuses control from outside). Whichever of Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI and OpenCode you have installed shows up. The CLIs can live anywhere on your PATH, and if you moved their data with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, huitai looks there too.
+**Requirements**: macOS (developed and tested on macOS 27 with Apple silicon; the Intel build is compiled but not tested on real hardware). Opening conversations in a new tab needs [Ghostty](https://ghostty.org) 1.3 or later, [Kaku](https://github.com/tw93/Kaku), [cmux](https://cmux.com) or [iTerm2](https://iterm2.com); other terminals open them in the current window (opening at login and ⌥Space opening a new board work with Ghostty and Kaku only: cmux refuses control from outside, iTerm2 is not done yet; iTerm2 support follows its source code and AppleScript dictionary and has not been tested on a real install). Whichever of Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI and OpenCode you have installed shows up. The CLIs can live anywhere on your PATH, and if you moved their data with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR`, huitai looks there too.
 
 **Footprint**: about 27 MB of memory while the list is open and about 22 MB for the idle background daemon (measured on an Apple M4 Max); when nothing is running it does not redraw and uses almost no CPU.
 
@@ -153,12 +153,12 @@ There are eight commands: `ai` (the list), `ai doctor` (self-check), `ai list` a
 
 ## Command-line queries
 
-Print results without opening the UI, for pipes and scripts. Read-only: they read the index from the last time the list scanned, do not scan, change no files and do not start the daemon; a conversation you just started shows up after you open `ai` once. If `ai` has never been opened (no index yet) they say so ("还没有索引……先运行一次 ai") and exit non-zero.
+Print results without opening the UI, for pipes and scripts. Read-only: they read the index from the last time the list scanned, do not scan, change no files and do not start the daemon; a conversation you just started shows up after you open `ai` once (`state` and `activity` are asked from the daemon live, and everything counts as not hosted when it isn't running; `last_active` and the rest stay as last scanned while the list is closed). If `ai` has never been opened (no index yet) they say so ("还没有索引……先运行一次 ai") and exit non-zero.
 
 - `ai list [--vendor name] [--json]`: every conversation, newest first. `--vendor` keeps one vendor: `claude`, `codex`, `pi`, `hermes`, `kimi`, `gemini`, `opencode`, `antigravity` or the name shown in the top bar (case-insensitive).
 - `ai search <words…> [--json]`: search titles and bodies with the same results and order as `/` in the UI: vendor by vendor (top-bar order), title hits first within each, then body hits by relevance. Separate words with spaces; every word must match.
 
-Without `--json`, one aligned line per conversation: time, vendor, account, state (`托管中` or `-`), project, title, id. The id is last, so `ai list | awk '{print $NF}'` gets it; long projects and titles are truncated. For body hits, `ai search` adds the matching passage on the next line, indented four spaces. With no results nothing is printed to standard output and a note goes to standard error.
+Without `--json`, one aligned line per conversation: time, vendor, account, state (`托管中·在跑` running, `托管中·等你` waiting for you, plain `托管中` when hosted but unknown, `-` when not hosted), project, title, id. The id is last, so `ai list | awk '{print $NF}'` gets it; long projects and titles are truncated. For body hits, `ai search` adds the matching passage on the next line, indented four spaces. With no results nothing is printed to standard output and a note goes to standard error.
 
 With `--json` it prints a JSON array, `[]` when empty. The fields are a stable interface; new ones may be added, existing ones won't change:
 
@@ -170,6 +170,7 @@ With `--json` it prints a JSON array, `[]` when empty. The fields are a stable i
 | `project` | string | Project directory (absolute path) |
 | `title` | string | Title: the name you gave it in huitai, else the vendor's title, else the id |
 | `state` | string | `hosted`: huitai is hosting it and the CLI process is running; `stopped`: not |
+| `activity` | string or `null` | What a hosted conversation is doing right now: `running`; `waiting` for you (including just finished and not seen yet, same as「待处理」in the top bar). `null` when it is not hosted, and also when the background daemon is an older version without this field or the CLI has only just started |
 | `last_active` | string | Last activity, RFC 3339 in local time, e.g. `2026-11-23T10:59:02+08:00` |
 | `archived` | bool | Archived in huitai |
 | `automatic` | bool | Started by a script or background job (`claude -p`, `codex exec` and the like) |
@@ -177,6 +178,10 @@ With `--json` it prints a JSON array, `[]` when empty. The fields are a stable i
 
 ```sh
 ai list --vendor codex --json | jq -r '.[] | select(.state == "hosted") | .title'
+# How many are waiting for you (not counting script-started ones), for a status bar
+ai list --json | jq '[.[] | select(.activity == "waiting" and (.automatic | not))] | length'
+# The waiting ones, longest wait first
+ai list --json | jq -r 'map(select(.activity == "waiting")) | sort_by(.last_active)[] | .title'
 ai search deploy script | head
 ```
 
@@ -186,7 +191,7 @@ ai search deploy script | head
 
 | | huitai | Rex |
 |---|---|---|
-| What it is | One command, `ai`, inside the terminal you already use (Ghostty, Kaku, cmux, others) | A standalone terminal app that replaces your current terminal |
+| What it is | One command, `ai`, inside the terminal you already use (Ghostty, Kaku, cmux, iTerm2, others) | A standalone terminal app that replaces your current terminal |
 | Which conversations | Every past Claude Code, Codex, pi, Hermes, Kimi Code, Gemini CLI, OpenCode and Antigravity (`agy` and the Antigravity app) conversation on this Mac, grouped by project, full-text searchable, resumed with Enter | Sessions opened in Rex; shows which Claude Code, Codex, OpenCode or pi session is working or waiting for you |
 | Quota | Top bar shows Claude and Codex limit windows and pi's tokens today | Not mentioned in the official material |
 | Several machines | This Mac only | Its strength: connect to Rex servers on other machines; iOS and other clients are on the way |

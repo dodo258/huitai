@@ -18,9 +18,9 @@
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::core::{SessionId, Vendor};
+use crate::core::{SessionId, SessionState, Vendor};
 
 /// 协议版本。
 pub const PROTOCOL: u32 = 1;
@@ -256,6 +256,16 @@ pub struct HostedInfo {
     pub attached: bool,
     /// CLI 最后设的标题（未加前缀）。
     pub title: Option<String>,
+    /// 此刻的状态灯（守护进程的 Notifier 算的，和标签页标题前面的是同一份）。刚启动还没算出来、
+    /// 旧版守护进程（没有这个字段）、比自己新的守护进程报了不认识的状态，都是 `None`。
+    #[serde(default, deserialize_with = "known_state")]
+    pub status: Option<SessionState>,
+}
+
+/// 不认识的状态当不知道：只为一个状态灯，不让整份 `List` 解码失败（以后加状态时旧客户端照常用）。
+fn known_state<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SessionState>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
 }
 
 /// 一条有进程在跑的对话，记在 `running.json`；守护进程没收尾就没了时原样转成「被中断」。
@@ -491,6 +501,26 @@ mod tests {
             serde_json::from_str::<Response>(&json).unwrap(),
             Response::Snapshot(snap)
         );
+    }
+
+    #[test]
+    fn hosted_status_is_optional_and_unknown_values_are_ignored() {
+        let decode = |status: &str| {
+            let json = format!(
+                r#"{{"list":[{{"id":"a","vendor":"claude","project":"p","cwd":"/p","pid":1,"attached":false,"title":null{status}}}]}}"#
+            );
+            match serde_json::from_str::<Response>(&json).unwrap() {
+                Response::List(l) => l[0].status,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(decode(""), None, "旧版守护进程没有这个字段");
+        assert_eq!(decode(r#","status":null"#), None);
+        assert_eq!(
+            decode(r#","status":"waiting""#),
+            Some(SessionState::Waiting)
+        );
+        assert_eq!(decode(r#","status":"以后才有的""#), None, "整份照样解得开");
     }
 
     #[test]

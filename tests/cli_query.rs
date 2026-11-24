@@ -1,13 +1,18 @@
 //! `ai list`、`ai search` 端到端：假家目录里手写两条 Claude 对话、复制 pi 的 fixtures，用库建好索引，
 //! 再跑真二进制。样例都是手写的。
 
+mod host_support;
 mod sources_common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use huitai::core::{SessionId, Vendor};
+use host_support::{Home, WAIT, contains, fake_env};
+use huitai::core::{SessionId, SessionState, Vendor};
+use huitai::host::{self, AttachMsg, Attachment, HostedInfo, Request, Response, SpawnSpec};
 use huitai::index::{Edit, Index};
 use huitai::sources::{self, Trash};
 use serde_json::Value;
@@ -32,6 +37,11 @@ fn claude(at: &str, user: &str, reply: &str) -> String {
 /// 假家目录：Claude 两条（LOGIN 较新），pi 的 fixtures。还没建索引。
 fn home(name: &str) -> PathBuf {
     let home = temp_dir(name);
+    fill(&home);
+    home
+}
+
+fn fill(home: &Path) {
     let dir = home.join(".claude/projects/-Users-demo-projects-shop");
     fs::create_dir_all(&dir).unwrap();
     let sessions = [
@@ -52,7 +62,6 @@ fn home(name: &str) -> PathBuf {
         fs::write(dir.join(format!("{id}.jsonl")), claude(at, user, reply)).unwrap();
     }
     copy_tree(&fixture("pi/sessions"), &home.join(".pi/agent/sessions"));
-    home
 }
 
 fn data_dir(home: &Path) -> PathBuf {
@@ -163,6 +172,7 @@ fn list_json_has_every_field_newest_first_and_filters_by_vendor() {
         "project",
         "title",
         "state",
+        "activity",
         "last_active",
         "archived",
         "automatic",
@@ -175,6 +185,7 @@ fn list_json_has_every_field_newest_first_and_filters_by_vendor() {
     assert_eq!(login["project"], "/Users/demo/projects/shop");
     assert_eq!(login["title"], "修一下登录页的样式");
     assert_eq!(login["state"], "stopped", "守护进程没在跑");
+    assert!(login["activity"].is_null(), "没托管就没有");
     assert_eq!(login["archived"], false);
     assert_eq!(login["automatic"], false);
     let deploy = claude.iter().find(|r| r["id"] == DEPLOY).unwrap();
@@ -390,6 +401,148 @@ fn queries_see_notes_of_vendors_added_after_v013() {
     );
     let hits = json(&ai(&home, &["search", "收银台改版", "--json"]));
     assert!(hits.iter().any(|h| h["id"] == AGY), "{hits:?}");
+}
+
+/// 假 CLI：读到什么发什么（响铃、普通输出由测试决定）。
+const ECHO: &str = "stty raw -echo; printf ready; exec cat";
+
+/// 登记并起一条假 CLI，等它起来。标签页不报焦点（不在前台）。
+fn start(home: &Home, vendor: Vendor, id: &str) -> Attachment {
+    let id = SessionId::from(id);
+    let spec = SpawnSpec {
+        id: id.clone(),
+        vendor,
+        project: "shop".to_owned(),
+        cwd: home.home.clone(),
+        command: ECHO.to_owned(),
+    };
+    assert_eq!(
+        host::request(&home.data, &Request::Spawn(spec)).unwrap(),
+        Response::Ok
+    );
+    let mut att = host::attach(&home.data, &id, fake_env(&home.home), 60, 12).expect("attach 失败");
+    let mut seen = Vec::new();
+    while !contains(&seen, b"ready") {
+        match att.recv(Some(WAIT)).expect("等不到假 CLI 起来") {
+            AttachMsg::Output(bytes) => seen.extend_from_slice(&bytes),
+            other => panic!("假 CLI 没起来：{other:?}"),
+        }
+    }
+    att
+}
+
+/// 守护进程托管着的那一条。
+fn only_hosted(home: &Home) -> HostedInfo {
+    match host::request(&home.data, &Request::List).unwrap() {
+        Response::List(mut l) if l.len() == 1 => l.remove(0),
+        other => panic!("应当只托管一条：{other:?}"),
+    }
+}
+
+/// `ai list --json` 里这条对话的（state, activity）。
+fn lamp(home: &Home, id: &str) -> (Value, Value) {
+    let rows = json(&ai(&home.home, &["list", "--json"]));
+    let row = rows.iter().find(|r| r["id"] == id).unwrap();
+    (row["state"].clone(), row["activity"].clone())
+}
+
+/// 等到它是托管中、`activity` 是 `want`。
+fn wait_lamp(home: &Home, id: &str, want: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let got = lamp(home, id);
+        if got == (Value::from("hosted"), Value::from(want)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} 等不到 {want}，现在是 {got:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 真起 `ai daemon`：在跑、响铃后等你（没看过、看过都是）、又有输出回到在跑、结束后没有；认领到临时 id 下的记在
+/// 真实 id 上；纯文本跟着写。
+#[test]
+fn activity_follows_the_hosted_conversation() {
+    let mut home = Home::new("lamp");
+    fill(&home.home);
+    build_index(&home.home);
+    home.ensure_daemon();
+
+    let login = start(&home, Vendor::Claude, LOGIN);
+    wait_lamp(&home, LOGIN, "running");
+    assert_eq!(
+        lamp(&home, DEPLOY),
+        (Value::from("stopped"), Value::Null),
+        "没托管的不受影响"
+    );
+    let line = |home: &Home| {
+        let out = ai(&home.home, &["list", "--vendor", "claude"]);
+        let s = text(&out.stdout);
+        s.lines().find(|l| l.ends_with(LOGIN)).unwrap().to_owned()
+    };
+    assert!(line(&home).contains("托管中·在跑"), "{}", line(&home));
+
+    // 没看过的（刚做完）也是等你。
+    login.writer().input(b"\x07").unwrap();
+    wait_lamp(&home, LOGIN, "waiting");
+    assert!(line(&home).contains("托管中·等你"), "{}", line(&home));
+    let hits = json(&ai(&home.home, &["search", "蓝色", "--json"]));
+    assert_eq!(hits[0]["activity"], "waiting", "搜索结果也带");
+
+    // 看过了还在等你。
+    let id = SessionId::from(LOGIN);
+    let seen = Request::Seen { id: id.clone() };
+    assert_eq!(host::request(&home.data, &seen).unwrap(), Response::Ok);
+    let deadline = Instant::now() + WAIT;
+    while only_hosted(&home).status != Some(SessionState::Waiting) {
+        assert!(Instant::now() < deadline, "等不到看过");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        lamp(&home, LOGIN),
+        (Value::from("hosted"), Value::from("waiting"))
+    );
+
+    // 收尾重画的 2 秒过了再有输出：新一轮。
+    thread::sleep(Duration::from_millis(2200));
+    login.writer().input(b"working").unwrap();
+    wait_lamp(&home, LOGIN, "running");
+
+    assert_eq!(
+        host::request(&home.data, &Request::Kill { id }).unwrap(),
+        Response::Ok
+    );
+    let deadline = Instant::now() + WAIT;
+    while lamp(&home, LOGIN) != (Value::from("stopped"), Value::Null) {
+        assert!(
+            Instant::now() < deadline,
+            "结束后还有：{:?}",
+            lamp(&home, LOGIN)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 会话台新建、托管在临时 id 下的：认领了才知道是哪条，状态记在真实 id 上。
+#[test]
+fn activity_of_a_claimed_temporary_id_goes_to_the_real_conversation() {
+    let mut home = Home::new("lampt");
+    fill(&home.home);
+    build_index(&home.home);
+    home.ensure_daemon();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let temp = format!("new-codex-{}", now.as_millis());
+    let att = start(&home, Vendor::Codex, &temp);
+    let pid = only_hosted(&home).pid.unwrap();
+    assert_eq!(lamp(&home, DEPLOY).0, "stopped", "还没认领");
+    let claims = serde_json::json!({ &temp: { "real": DEPLOY, "pid": pid } });
+    fs::write(home.data.join("claims.json"), claims.to_string()).unwrap();
+    wait_lamp(&home, DEPLOY, "running");
+    att.writer().input(b"\x07").unwrap();
+    wait_lamp(&home, DEPLOY, "waiting");
 }
 
 #[test]

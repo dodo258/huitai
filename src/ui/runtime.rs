@@ -677,24 +677,25 @@ fn attach_existing(
     }
 }
 
-/// 守护进程此刻托管着、CLI 进程在跑的对话（`ai list`、`ai search` 的状态列）：认领到临时 id 下的换回那条对话的 id
-/// （进程号对得上才算）。守护进程没在跑就是空的；不拉起守护进程、不改认领记录。
-pub fn hosted_now(dir: &Path) -> HashSet<SessionId> {
+/// 守护进程此刻托管着、CLI 进程在跑的对话和它的状态灯（`None` 是守护进程没报），给 `ai list`、`ai search`：
+/// 认领到临时 id 下的换回那条对话的 id（进程号对得上才算）。守护进程没在跑就是空的；不拉起守护进程、不改认领记录。
+pub fn hosted_now(dir: &Path) -> HashMap<SessionId, Option<SessionState>> {
     let hosted = match host::client::request(dir, &Request::List) {
         Ok(Response::List(h)) => h,
-        _ => return HashSet::new(),
+        _ => return HashMap::new(),
     };
     let claims = load_claims(dir, SystemTime::now()).unwrap_or_default();
     hosted
         .into_iter()
         .filter_map(|h| {
             let pid = h.pid?;
-            match claims.get(&h.id) {
-                Some(b) if b.pid == pid => Some(b.real.clone()),
+            let id = match claims.get(&h.id) {
+                Some(b) if b.pid == pid => b.real.clone(),
                 // 没认领到的临时 id 还不知道是哪条对话。
-                _ if temp_started(&h.id).is_some() => None,
-                _ => Some(h.id),
-            }
+                _ if temp_started(&h.id).is_some() => return None,
+                _ => h.id,
+            };
+            Some((id, h.status))
         })
         .collect()
 }
@@ -1109,6 +1110,7 @@ impl Loop {
                     pid: Some(pid),
                     attached: false,
                     title: None,
+                    status: None,
                 })
             })
             .collect();
@@ -2123,6 +2125,7 @@ mod tests {
             pid: running.then_some(42),
             attached: true,
             title: None,
+            status: None,
         }
     }
 

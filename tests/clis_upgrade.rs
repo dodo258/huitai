@@ -1,5 +1,6 @@
 //! 各家 CLI 升级执行：假的包管理器脚本放进临时 PATH，测会跑哪条命令、成功后复查 PATH、失败原文、超时、
-//! 被别的同名程序遮住、各种挡住的情况（自带更新器的锁、会话台自己的锁、只能手动的），轮到每家时现查有没有在跑的
+//! 被别的同名程序遮住、各种挡住的情况（自带更新器的锁、会话台自己的锁、只能手动的），会话台装到一半没了、
+//! 安装器还在跑时锁还在，安装命令留下的后台进程不拖住升级，轮到每家时现查有没有在跑的
 //! （批中途开的托管对话、别处的进程、查不了都跳过），
 //! 装的是查过的那一版（npm 写死版本，Homebrew 升之前重查），以及哪些能一键升、自动升（自带更新的等 24 小时、
 //! 同一版自动只试一次、跨大版本不升）。不真跑任何安装。
@@ -9,11 +10,14 @@ mod clis_support;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::process::{Command, Stdio};
+use std::sync::{Barrier, mpsc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use clis_support::Fake;
 use huitai::clis::{
@@ -133,6 +137,23 @@ impl Tree {
         }
     }
 
+    /// 会话台自己的升级锁文件（没有就建）。
+    fn open_lock(&self, vendor: &str) -> fs::File {
+        fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.p(&format!("data/cli-upgrade-{vendor}.lock")))
+            .unwrap()
+    }
+
+    /// 这家的升级锁此刻没人拿着。
+    fn lock_free(&self, vendor: &str) -> bool {
+        let lock = self.open_lock(vendor);
+        // 明着放：别的测试线程这时 fork 出来的子进程在 exec 之前也带着这个描述符。
+        lock.try_lock().is_ok() && lock.unlock().is_ok()
+    }
+
     fn install(&self, vendor: Vendor, link: &Path, login: &LoginEnv) -> Install {
         probe_one(vendor, link, login, &self.p("home"))
     }
@@ -196,7 +217,7 @@ fn runs_the_official_command_and_checks_path_afterwards() {
     let last = last_results(&t.p("data"));
     assert_eq!(last.get(&Vendor::Codex), Some(&r));
     assert!(t.p("data").join(RESULTS_FILE).exists());
-    assert!(!t.p("data/cli-upgrade-codex.lock").exists());
+    assert!(t.lock_free("codex"));
 }
 
 #[test]
@@ -224,7 +245,7 @@ fn failure_keeps_the_raw_output() {
 fn times_out_and_says_so() {
     let (t, login, install) = codex_tree("timeout");
     t.fake_npm("sleep 30");
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let r = upgrade(
         &install,
         "0.172.0",
@@ -297,19 +318,152 @@ fn blocked_cases_do_not_run_anything() {
     let b = upgrade(&install, "1.0.0", false, &runner).unwrap_err();
     assert!(b.reason.contains("跨大版本"), "{b:?}");
 
-    // 别的会话台拿着锁（进程还在）。
-    let lock = t.p("data/cli-upgrade-codex.lock");
-    fs::write(&lock, std::process::id().to_string()).unwrap();
+    // 别的会话台拿着锁：不升，也不让人自己跑那条。
+    let held = t.open_lock("codex");
+    held.try_lock().unwrap();
     let b = upgrade(&install, "0.172.0", false, &runner).unwrap_err();
     assert!(b.reason.contains("正在升级"), "{b:?}");
-    assert!(lock.exists(), "别人的锁不动");
+    assert_eq!(b.command, None);
     assert_eq!(t.npm_args(), "", "挡住的都没跑 npm");
+    held.unlock().unwrap();
 
-    // 拿锁的进程已经不在了：当残留拿过来。
-    fs::write(&lock, "999999").unwrap();
     let r = upgrade(&install, "0.172.0", false, &runner).unwrap();
     assert!(r.ok, "{r:?}");
-    assert!(!lock.exists());
+    assert!(t.lock_free("codex"));
+}
+
+/// 旧版会话台留下的锁文件写着进程号（不管那个号此刻有没有进程）：没人拿着 flock 就照常升。
+#[test]
+fn lock_file_left_by_an_old_version_does_not_block() {
+    for pid in ["999999".to_owned(), std::process::id().to_string()] {
+        let (t, login, install) = codex_tree(&format!("old-lock-{pid}"));
+        fs::write(t.p("data/cli-upgrade-codex.lock"), &pid).unwrap();
+        let r = upgrade(&install, "0.172.0", false, &t.runner(&login, T)).unwrap();
+        assert!(r.ok, "{r:?}");
+    }
+}
+
+/// 装到一半停下：留下 `started`（写着进程号），等 `release` 出现（或整个目录被删）才把版本改成要装的那一版。
+fn slow_npm(t: &Tree) {
+    t.fake_npm(&format!(
+        "echo $$ > '{started}.tmp' && mv '{started}.tmp' '{started}'\n\
+         while [ ! -e '{release}' ] && [ -e '{started}' ]; do sleep 0.05; done\n\
+         printf '{{\"version\":\"%s\"}}' \"${{3##*@}}\" > '{package}'",
+        started = t.p("started").display(),
+        release = t.p("release").display(),
+        package = t
+            .p("npm/lib/node_modules/@openai/codex/package.json")
+            .display()
+    ));
+}
+
+/// 最多等 20 秒。
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + T;
+    while !ready() {
+        assert!(Instant::now() < deadline, "等了 20 秒：{what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 两边同时升同一家：一个在装，另一个拿不到锁。
+#[test]
+fn only_one_of_two_concurrent_upgrades_runs() {
+    let (t, login, install) = codex_tree("concurrent");
+    slow_npm(&t);
+    let (tx, rx) = mpsc::channel();
+    let both = Barrier::new(2);
+    thread::scope(|s| {
+        for _ in 0..2 {
+            let tx = tx.clone();
+            let (t, login, install, both) = (&t, &login, &install, &both);
+            s.spawn(move || {
+                both.wait();
+                let r = upgrade(install, "0.172.0", true, &t.runner(login, T));
+                tx.send(r).unwrap();
+            });
+        }
+        // 装的那个停在 npm 里，先回来的只能是没拿到锁的。
+        let first = rx.recv().unwrap();
+        fs::write(t.p("release"), "").unwrap();
+        let b = first.unwrap_err();
+        assert!(b.reason.contains("正在升级"), "{b:?}");
+        assert!(rx.recv().unwrap().unwrap().ok);
+    });
+    assert_eq!(t.npm_args().lines().count(), 1, "{}", t.npm_args());
+}
+
+const ROOT_ENV: &str = "HUITAI_TEST_UPGRADE_ROOT";
+
+/// 给下一条测试当另一个会话台：它另起本测试程序只跑这一条；没给目录（平时）什么也不做。
+#[test]
+fn upgrade_in_another_process() {
+    let Some(root) = std::env::var_os(ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    // 目录归起它的那条测试，这边不删。
+    let t = ManuallyDrop::new(Tree {
+        home: root.join("home"),
+        data: root.join("data"),
+        root,
+    });
+    let login = t.login(&[]);
+    let install = t.install(Vendor::Codex, &t.p("npm/bin/codex"), &login);
+    let _ = upgrade(&install, "0.172.0", true, &t.runner(&login, T));
+}
+
+/// 会话台装到一半没了（退出、被杀），安装器还在跑：锁还在，重开的会话台不起第二个；安装器跑完锁就放了。
+#[test]
+fn installer_keeps_the_lock_after_its_board_is_gone() {
+    let (t, login, install) = codex_tree("orphan");
+    slow_npm(&t);
+    let mut board = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "upgrade_in_another_process"])
+        .env(ROOT_ENV, &t.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("npm 跑起来", || t.p("started").exists());
+    board.kill().unwrap();
+    board.wait().unwrap();
+    let npm: i32 = fs::read_to_string(t.p("started"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: 信号 0 只看进程在不在。
+    assert_eq!(unsafe { libc::kill(npm, 0) }, 0, "npm 还在跑");
+
+    let runner = t.runner(&login, T);
+    let b = upgrade(&install, "0.172.0", true, &runner).unwrap_err();
+    assert!(b.reason.contains("正在升级"), "{b:?}");
+    assert_eq!(t.npm_args().lines().count(), 1, "{}", t.npm_args());
+
+    fs::write(t.p("release"), "").unwrap();
+    wait_until("安装器跑完、锁放掉", || t.lock_free("codex"));
+    let r = upgrade(&install, "0.173.0", true, &runner).unwrap();
+    assert!(r.ok, "{r:?}");
+    assert_eq!(r.from.as_deref(), Some("0.172.0"), "孤儿安装器装好的");
+}
+
+/// 安装命令退了、它留在后台的进程还占着输出管道和锁的描述符：到点就复查、放锁，不一直等。
+#[test]
+fn background_helper_does_not_hold_up_the_upgrade() {
+    let (t, login, install) = codex_tree("helper");
+    let npm = fs::read_to_string(t.p("tools/npm")).unwrap();
+    fs::write(t.p("tools/npm"), format!("{npm}sleep 30 &\n")).unwrap();
+    let started = Instant::now();
+    let r = upgrade(
+        &install,
+        "0.172.0",
+        false,
+        &t.runner(&login, Duration::from_secs(3)),
+    )
+    .unwrap();
+    assert!(r.ok, "{r:?}");
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(t.lock_free("codex"));
 }
 
 #[test]
@@ -496,7 +650,7 @@ fn does_not_downgrade_one_that_updated_itself_meanwhile() {
     assert!(b.reason.contains("本机已是 0.173.0"), "{b:?}");
     assert_eq!(b.command, None);
     assert_eq!(t.npm_args(), "");
-    assert!(!t.p("data/cli-upgrade-codex.lock").exists());
+    assert!(t.lock_free("codex"));
 }
 
 /// Homebrew 不能指定版本：升之前重查。仓库出了新大版本就只提示，并写回缓存（按钮和自动升级跟着没有）；
@@ -601,7 +755,7 @@ fn conversation_opened_mid_batch_skips_that_vendor() {
             Some("npm install -g @moonshot-ai/kimi-code@0.71.0")
         );
         assert_eq!(t.npm_args().trim(), "install -g @openai/codex@0.172.0");
-        assert!(!t.p("data/cli-upgrade-kimi.lock").exists(), "锁放掉了");
+        assert!(t.lock_free("kimi"), "锁放掉了");
         assert!(!last_results(&t.data).contains_key(&Vendor::Kimi));
     }
 }

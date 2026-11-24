@@ -1,6 +1,6 @@
-//! 本机实测：在当前终端（Ghostty、Kaku 或 cmux）里开两个新标签页，再打开第一条，确认是聚焦而不是开第三个；
+//! 本机实测：在当前终端（Ghostty、Kaku、cmux 或 iTerm2）里开两个新标签页，再打开第一条，确认是聚焦而不是开第三个；
 //! 关掉它再打开，确认会重开。会在真终端里开标签页，结束时关掉自己开的。
-//! 必须在 Ghostty / Kaku / cmux 的标签页里、终端窗口在前台时手动跑：
+//! 必须在 Ghostty / Kaku / cmux / iTerm2 的标签页里、终端窗口在前台时手动跑：
 //! `cargo test --test opener_live -- --ignored --nocapture`
 //!
 //! `ai attach` 还没接上托管层，标签页里跑一个替身：打开终端的焦点上报（`ESC[?1004h`），
@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use huitai::core::SessionId;
-use huitai::opener::{Opener, Outcome, TabHandle, Tabs, Terminal, opener_for};
+use huitai::opener::{Iterm2Opener, Opener, Outcome, TabHandle, Tabs, Terminal, opener_for};
 use huitai::sources::Command;
 
 const FOCUS_IN: &[u8] = b"\x1b[I";
@@ -75,6 +75,27 @@ fn kaku_cli() -> String {
         .unwrap_or_else(|_| "/Applications/Kaku.app/Contents/MacOS/kaku".to_owned())
 }
 
+fn osascript(args: &[String]) -> String {
+    let out = Proc::new("/usr/bin/osascript").args(args).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// iTerm2 所有窗口里的会话数。
+fn iterm2_sessions() -> usize {
+    let script = r#"set n to 0
+tell application id "com.googlecode.iterm2"
+	repeat with w in (get windows)
+		repeat with t in (get tabs of w)
+			set n to n + (count of sessions of t)
+		end repeat
+	end repeat
+end tell
+return n"#;
+    osascript(&["-e".to_owned(), script.to_owned()])
+        .parse()
+        .unwrap()
+}
+
 fn tab_count(terminal: &Terminal) -> usize {
     match terminal {
         Terminal::Ghostty => {
@@ -85,6 +106,7 @@ fn tab_count(terminal: &Terminal) -> usize {
             String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
         }
         Terminal::Cmux => cmux_panels(),
+        Terminal::Iterm2 => iterm2_sessions(),
         _ => {
             let out = Proc::new(kaku_cli())
                 .args(["cli", "--no-auto-start", "list", "--format", "json"])
@@ -120,6 +142,15 @@ fn close(handle: &TabHandle) {
                 ])
                 .output();
         }
+        TabHandle::Iterm2 { session_id, .. } => {
+            // 结束里面的替身，会话跟着关；AppleScript 的 close 会弹确认框。
+            let tty = osascript(&Iterm2Opener::find_args(session_id));
+            if let Some(tty) = tty.strip_prefix("/dev/") {
+                let _ = Proc::new("/usr/bin/pkill")
+                    .args(["-HUP", "-t", tty])
+                    .output();
+            }
+        }
         TabHandle::Kaku { pane_id, .. } => {
             let _ = Proc::new(kaku_cli())
                 .args([
@@ -154,12 +185,12 @@ fn settle() {
 }
 
 #[test]
-#[ignore = "在真终端里开标签页，手动在 Ghostty / Kaku / cmux 里跑"]
+#[ignore = "在真终端里开标签页，手动在 Ghostty / Kaku / cmux / iTerm2 里跑"]
 fn open_then_focus_existing_tab() {
     let terminal = Terminal::current();
     assert!(
         terminal.has_tabs(),
-        "要在 Ghostty、Kaku 或 cmux 里跑，当前是 {terminal}"
+        "要在 Ghostty、Kaku、cmux 或 iTerm2 里跑，当前是 {terminal}"
     );
     println!("终端：{terminal}");
     let opener: Box<dyn Opener> = opener_for(&terminal, |k| std::env::var(k).ok());
@@ -256,6 +287,17 @@ fn open_then_focus_existing_tab() {
             TabHandle::Cmux {
                 surface_id: "00000000-0000-0000-0000-000000000000".to_owned(),
                 workspace_id,
+            }
+        }
+        // 会话还在，跑的不是这条命令（窗口恢复后沿用 id 的新 shell）。
+        Terminal::Iterm2 => {
+            let TabHandle::Iterm2 { session_id, .. } = tabs.records()[&b].handle.clone() else {
+                unreachable!()
+            };
+            TabHandle::Iterm2 {
+                session_id,
+                command: "/usr/local/bin/ai attach someone-else".to_owned(),
+                opened_at: 0,
             }
         }
         _ => {

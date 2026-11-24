@@ -59,9 +59,14 @@ fn kaku_starts_login_shell_running_ai() {
 
 #[test]
 fn other_terminals_are_refused() {
-    let err = args(&Terminal::Other(Some("Apple_Terminal".to_owned()))).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("Ghostty"));
+    for t in [
+        Terminal::Other(Some("Apple_Terminal".to_owned())),
+        Terminal::Iterm2,
+    ] {
+        let err = args(&t).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("Ghostty"));
+    }
 }
 
 #[test]

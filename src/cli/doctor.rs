@@ -617,15 +617,26 @@ fn terminal_item(
                 ),
             }
         }
+        Terminal::Iterm2 => {
+            let v = env("TERM_PROGRAM_VERSION").unwrap_or_default();
+            item(
+                Mark::Ok,
+                name,
+                format!(
+                    "{} 能开新标签页（AppleScript；第一次会弹「想要控制 iTerm2」的系统授权，点允许）；开机打开、⌥空格新开会话台不支持 iTerm2",
+                    if v.is_empty() { "版本未知，" } else { &v }
+                ),
+            )
+        }
         Terminal::Other(Some(p)) if p.eq_ignore_ascii_case("tmux") => item(
             Mark::Warn,
             name,
-            "在 tmux 里：⏎ 在当前窗口打开，不开新标签页（新标签页只支持 Ghostty、Kaku）",
+            "在 tmux 里：⏎ 在当前窗口打开，不开新标签页（新标签页只支持 Ghostty、Kaku、cmux、iTerm2）",
         ),
         Terminal::Other(_) => item(
             Mark::Warn,
             name,
-            "不支持开新标签页：⏎ 在当前窗口打开，对话结束回到会话台（新标签页只支持 Ghostty、Kaku）",
+            "不支持开新标签页：⏎ 在当前窗口打开，对话结束回到会话台（新标签页只支持 Ghostty、Kaku、cmux、iTerm2）",
         ),
     }
 }
@@ -961,6 +972,11 @@ mod tests {
         assert!(
             cmux_down.mark == Mark::Fail && cmux_down.detail.contains("w 在当前窗口"),
             "{cmux_down:?}"
+        );
+        let iterm = first(&Terminal::Iterm2, &env("3.7.9"), no_kaku);
+        assert!(
+            iterm.mark == Mark::Ok && iterm.detail.starts_with("3.7.9 能开新标签页"),
+            "{iterm:?}"
         );
         let down = first(&Terminal::Kaku, &env(""), no_kaku);
         assert!(

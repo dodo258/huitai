@@ -78,8 +78,8 @@ fn focus_board(board: &BoardInfo) -> io::Result<bool> {
             Some(h) => h,
             None => return Ok(false),
         },
-        // cmux 不接受守护进程控制它；认不出就新开（落到首选终端）。
-        Terminal::Cmux | Terminal::Other(_) => return Ok(false),
+        // cmux 不接受守护进程控制它，iTerm2 还没做；认不出就新开（落到首选终端）。
+        Terminal::Cmux | Terminal::Iterm2 | Terminal::Other(_) => return Ok(false),
     };
     opener::opener_for(&term, |k| std::env::var(k).ok()).focus(&handle)
 }

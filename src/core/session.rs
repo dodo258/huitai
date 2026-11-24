@@ -101,6 +101,11 @@ impl SessionState {
             SessionState::Stopped => '○',
         }
     }
+
+    /// 等你回复（「刚做完」是还没看过的等你回复）。
+    pub fn waits(self) -> bool {
+        matches!(self, SessionState::Waiting | SessionState::Done)
+    }
 }
 
 /// 一条对话的元数据（由 sources 从厂商文件读出，只读）。

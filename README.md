@@ -21,7 +21,7 @@
 
 ## 它是什么
 
-一个装在终端里的命令行工具，不是终端，也不用 tmux。你照样用自己的终端（Ghostty、Kaku、cmux 或别的），会话台只负责三件事：
+一个装在终端里的命令行工具，不是终端，也不用 tmux。你照样用自己的终端（Ghostty、Kaku、cmux、iTerm2 或别的），会话台只负责三件事：
 
 - **找得到**：各家的对话放在一起，按项目分组、按时间排，标题和正文都能搜。
 - **接得上**：回车在新标签页里进到项目目录接着聊；已经开着的直接切过去，不开第二个。
@@ -43,7 +43,7 @@ curl -fsSL https://github.com/dodo258/huitai/releases/latest/download/install.sh
 cargo install --locked --git https://github.com/dodo258/huitai
 ```
 
-**要求**：macOS（在 macOS 27、Apple 芯片上开发和测试；Intel 版只做了构建，没有真机测过）。在新标签页打开对话需要 [Ghostty](https://ghostty.org) 1.3 以上、[Kaku](https://github.com/tw93/Kaku) 或 [cmux](https://cmux.com)，别的终端在当前窗口打开（cmux 不支持开机自动打开和 ⌥空格新开会话台，它不接受从外面控制）。Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode 装了哪家就列哪家：CLI 装在哪都行，你的终端里敲得出来就行；用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`PI_CODING_AGENT_DIR` 把数据放在别处的，会话台跟着去那里找。界面是简体中文。
+**要求**：macOS（在 macOS 27、Apple 芯片上开发和测试；Intel 版只做了构建，没有真机测过）。在新标签页打开对话需要 [Ghostty](https://ghostty.org) 1.3 以上、[Kaku](https://github.com/tw93/Kaku)、[cmux](https://cmux.com) 或 [iTerm2](https://iterm2.com)，别的终端在当前窗口打开（开机自动打开和 ⌥空格新开会话台只支持 Ghostty、Kaku：cmux 不接受从外面控制，iTerm2 还没做；iTerm2 按官方源码和 AppleScript 字典做的，还没在真机上测过）。Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode 装了哪家就列哪家：CLI 装在哪都行，你的终端里敲得出来就行；用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`PI_CODING_AGENT_DIR` 把数据放在别处的，会话台跟着去那里找。界面是简体中文。
 
 **占用**：会话台开着时约 27 MB 内存，后台守护进程空闲时约 22 MB（Apple M4 Max 实测）；没东西在跑时不重画，几乎不占 CPU。
 
@@ -153,12 +153,12 @@ cargo install --locked --git https://github.com/dodo258/huitai
 
 ## 命令行查询
 
-不进界面、直接把结果打出来，可以接管道、给脚本用。只读：读的是会话台上次扫到的索引，不扫描、不改任何文件，也不拉起后台；刚聊的新对话要开一次 `ai` 才查得到。从没开过 `ai`（还没有索引）时会说「还没有索引……先运行一次 ai」并以非 0 退出。
+不进界面、直接把结果打出来，可以接管道、给脚本用。只读：读的是会话台上次扫到的索引，不扫描、不改任何文件，也不拉起后台；刚聊的新对话要开一次 `ai` 才查得到（`state`、`activity` 是现问后台的，后台没在跑就当都没托管；`last_active` 等别的字段在会话台关着时停在上次扫到的样子）。从没开过 `ai`（还没有索引）时会说「还没有索引……先运行一次 ai」并以非 0 退出。
 
 - `ai list [--vendor 名] [--json]`：列出全部对话，最近的在前。`--vendor` 只要一家，写 `claude`、`codex`、`pi`、`hermes`、`kimi`、`gemini`、`opencode`、`antigravity` 或顶栏上的名字（不分大小写）。
 - `ai search <词…> [--json]`：搜标题和正文，结果和顺序同界面里按 `/` 搜：一家一家排（顺序同顶栏），每家里标题命中的在前、之后正文按相关度。几个词用空格分开，每个都要命中。
 
-不加 `--json` 时一条一行、各列对齐：时间、厂商、账号、状态（`托管中` 或 `-`）、项目、标题、id。id 在最后，`ai list | awk '{print $NF}'` 就能拿到；项目、标题太长会截断。`ai search` 正文命中的结果，下一行缩进四格写命中的那段正文。没有结果时什么都不打，在标准错误说一句。
+不加 `--json` 时一条一行、各列对齐：时间、厂商、账号、状态（`托管中·在跑`、`托管中·等你`，不知道在干什么时只有 `托管中`，没托管是 `-`）、项目、标题、id。id 在最后，`ai list | awk '{print $NF}'` 就能拿到；项目、标题太长会截断。`ai search` 正文命中的结果，下一行缩进四格写命中的那段正文。没有结果时什么都不打，在标准错误说一句。
 
 加 `--json` 打一个 JSON 数组，没有结果是 `[]`。每条的字段是稳定接口，以后只加不改：
 
@@ -170,6 +170,7 @@ cargo install --locked --git https://github.com/dodo258/huitai
 | `project` | 字符串 | 项目目录（绝对路径） |
 | `title` | 字符串 | 标题：会话台里改的名字优先，其次厂商的标题，都没有是 id |
 | `state` | 字符串 | `hosted`：会话台托管着、CLI 进程在跑；`stopped`：没有 |
+| `activity` | 字符串或 `null` | 托管着的此刻在干什么：`running` 在跑；`waiting` 等你回复（刚做完、你还没看过的也算，和顶栏的「待处理」一样）。没托管的是 `null`；后台还是没有这个字段的旧版、或 CLI 刚启动时也是 `null` |
 | `last_active` | 字符串 | 最近时间，本地时区的 RFC 3339，如 `2026-11-23T10:59:02+08:00` |
 | `archived` | 布尔 | 在会话台里归档了 |
 | `automatic` | 布尔 | 自动运行的对话（`claude -p`、`codex exec` 这类脚本、后台任务起的） |
@@ -177,6 +178,10 @@ cargo install --locked --git https://github.com/dodo258/huitai
 
 ```sh
 ai list --vendor codex --json | jq -r '.[] | select(.state == "hosted") | .title'
+# 几条在等你（不算脚本起的），给状态栏用
+ai list --json | jq '[.[] | select(.activity == "waiting" and (.automatic | not))] | length'
+# 在等你的，等得最久的在前
+ai list --json | jq -r 'map(select(.activity == "waiting")) | sort_by(.last_active)[] | .title'
 ai search 部署 脚本 | head
 ```
 
@@ -186,7 +191,7 @@ ai search 部署 脚本 | head
 
 | | 会话台 | Rex |
 |---|---|---|
-| 是什么 | 装在你现有终端里的一条命令 `ai`，Ghostty、Kaku、cmux 照用 | 一个独立的终端 App，用来替换你现在的终端 |
+| 是什么 | 装在你现有终端里的一条命令 `ai`，Ghostty、Kaku、cmux、iTerm2 照用 | 一个独立的终端 App，用来替换你现在的终端 |
 | 管哪些对话 | 本机 Claude Code、Codex、pi、Hermes、Kimi Code、Gemini CLI、OpenCode、Antigravity（`agy` 和 Antigravity App）的全部历史对话，按项目分组、全文搜索，回车接着聊 | 在 Rex 里开的会话；给 Claude Code、Codex、OpenCode、pi 标出谁在干活、谁在等你 |
 | 额度 | 顶栏显示 Claude、Codex 的限额窗口和 pi 的今日 token | 官方资料里没提到 |
 | 多台机器 | 只管本机 | 强项：连接别的机器上的 Rex 服务，iOS 等客户端在路上 |

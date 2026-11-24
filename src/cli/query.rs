@@ -11,7 +11,7 @@ use std::thread;
 
 use serde::Serialize;
 
-use crate::core::{Account, Config, Vendor};
+use crate::core::{Account, Config, SessionState, Vendor};
 use crate::export;
 use crate::index::{Entry, Hit, Index};
 use crate::sources::{self, DEFAULT_NAME, Trash};
@@ -38,6 +38,9 @@ pub struct Row {
     pub title: String,
     /// `hosted`：会话台托管着、CLI 进程在跑；`stopped`：没有。
     pub state: &'static str,
+    /// 托管着的此刻在干什么：`running` 在跑、`waiting` 等你回复（刚做完没看过的也算，同顶栏的「待处理」）；
+    /// 没托管、或守护进程没报（旧版守护进程、刚启动）是 `null`。
+    pub activity: Option<&'static str>,
     /// 最近时间，本地时区的 RFC 3339。
     pub last_active: String,
     pub archived: bool,
@@ -99,7 +102,7 @@ pub fn list(vendor: Option<Vendor>) -> io::Result<Vec<Row>> {
         .filter(|v| vendor.is_none_or(|w| w == *v))
     {
         for e in ctx.index.list(v)? {
-            rows.push(row(&e, &ctx.accounts, hosted.contains(&e.session.id), None));
+            rows.push(row(&e, &ctx.accounts, hosted.get(&e.session.id), None));
         }
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.last_secs));
@@ -121,7 +124,7 @@ pub fn search(query: &str) -> io::Result<Vec<Row>> {
         .zip(snippets)
         .map(|(h, snip)| {
             let e = &h.entry;
-            row(e, &ctx.accounts, hosted.contains(&e.session.id), Some(snip))
+            row(e, &ctx.accounts, hosted.get(&e.session.id), Some(snip))
         })
         .collect())
 }
@@ -157,7 +160,13 @@ fn snippets(index: &Index, hits: &[Hit], query: &str) -> Vec<Option<String>> {
     })
 }
 
-fn row(e: &Entry, accounts: &[Account], hosted: bool, snippet: Option<Option<String>>) -> Row {
+/// `hosted` 见 [`ui::hosted_now`]，没托管的是 `None`。
+fn row(
+    e: &Entry,
+    accounts: &[Account],
+    hosted: Option<&Option<SessionState>>,
+    snippet: Option<Option<String>>,
+) -> Row {
     let s = &e.session;
     let account = if s.account.is_empty() {
         DEFAULT_NAME.to_owned()
@@ -174,12 +183,26 @@ fn row(e: &Entry, accounts: &[Account], hosted: bool, snippet: Option<Option<Str
         account,
         project: s.cwd.clone(),
         title: e.title().to_owned(),
-        state: if hosted { "hosted" } else { "stopped" },
+        state: if hosted.is_some() {
+            "hosted"
+        } else {
+            "stopped"
+        },
+        activity: hosted.copied().flatten().and_then(activity),
         last_active: export::local_rfc3339(secs, export::local_offset(secs)),
         archived: e.note.archived,
         automatic: s.automatic,
         snippet,
         last_secs: secs,
+    }
+}
+
+/// 状态灯 → `activity` 字段。
+fn activity(state: SessionState) -> Option<&'static str> {
+    match state {
+        SessionState::Running => Some("running"),
+        s if s.waits() => Some("waiting"),
+        _ => None,
     }
 }
 
@@ -201,10 +224,11 @@ pub fn text(rows: &[Row], home: &Path) -> String {
                 export::local_minute(secs, export::local_offset(secs)),
                 vendor_name(r.vendor).to_owned(),
                 truncate(&r.account, 20),
-                if r.state == "hosted" {
-                    "托管中"
-                } else {
-                    "-"
+                match (r.state, r.activity) {
+                    ("hosted", Some("running")) => "托管中·在跑",
+                    ("hosted", Some("waiting")) => "托管中·等你",
+                    ("hosted", _) => "托管中",
+                    _ => "-",
                 }
                 .to_owned(),
                 truncate_middle(&tilde(&r.project, home), PROJECT_COLS),

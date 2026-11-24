@@ -6,7 +6,8 @@ use std::process::Command as Proc;
 
 use huitai::core::{SessionId, Vendor};
 use huitai::opener::{
-    CmuxOpener, GhosttyOpener, KakuOpener, Terminal, attach_command, ps_command_line, tab_title,
+    CmuxOpener, GhosttyOpener, Iterm2Opener, KakuOpener, Terminal, attach_command, ps_command_line,
+    tab_title,
 };
 
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -129,8 +130,149 @@ fn parses_cmux_new_surface_json() {
 }
 
 #[test]
+fn detects_iterm2() {
+    // iTerm2 3.7.9 源码 PTYSession.m：TERM_PROGRAM=iTerm.app，另设 ITERM_SESSION_ID。
+    let iterm = env(&[
+        ("TERM_PROGRAM", "iTerm.app"),
+        ("ITERM_SESSION_ID", "w0t0p0:U"),
+    ]);
+    assert_eq!(Terminal::detect(iterm), Terminal::Iterm2);
+    assert_eq!(Terminal::Iterm2.to_string(), "iTerm2");
+    // 登记给守护进程的名字和旧版一样，认得回来。
+    assert_eq!(Terminal::Iterm2.name().as_deref(), Some("iTerm.app"));
+    assert_eq!(Terminal::from_name("iTerm.app"), Terminal::Iterm2);
+    assert!(Terminal::Iterm2.has_tabs());
+    // 开机打开、呼出键还没做。
+    assert!(!Terminal::Iterm2.drivable_from_outside());
+    // iTerm2 里再开 tmux：新标签页会落到 tmux 外面，仍在当前窗口打开。
+    let tmux = env(&[
+        ("TERM_PROGRAM", "tmux"),
+        ("ITERM_SESSION_ID", "w0t0p0:U"),
+        ("LC_TERMINAL", "iTerm2"),
+    ]);
+    assert!(!Terminal::detect(tmux).has_tabs());
+}
+
+#[test]
+fn iterm2_types_cd_and_exec_into_a_new_tab() {
+    let cmd = attach_command(
+        Path::new("/Users/me/My Tools/ai"),
+        &SessionId::from("s4"),
+        Path::new("/Users/me/项目 \"x\"/it's here"),
+    );
+    let args = Iterm2Opener::open_args(&cmd);
+    assert_eq!(args.len(), 3);
+    assert_eq!(args[0], "-e");
+    let script = &args[1];
+    // 值只作为 argv 传；命令是打进去的，不用 command 参数（不经 shell、会被 iTerm2 当插值字符串求值）。
+    for v in ["My Tools", "项目", "it's", "s4"] {
+        assert!(!script.contains(v), "{v} 不该出现在脚本里");
+    }
+    assert!(!script.contains(" command "));
+    // 打字之前先拿到 id、切到前面：之后没有会失败的步骤，出错就是没打进去。
+    let id = script.find("set sid to id of s").unwrap();
+    let write = script.find("tell s to write text cmdLine").unwrap();
+    assert!(id < write);
+    assert!(script[write..].contains("return sid"));
+    assert_eq!(
+        args[2],
+        r#" cd '/Users/me/项目 "x"/it'\''s here'; exec '/Users/me/My Tools/ai' attach s4"#
+    );
+
+    for args in [
+        Iterm2Opener::find_args("U-1"),
+        Iterm2Opener::focus_args("U-1"),
+    ] {
+        assert_eq!(args[0], "-e");
+        assert!(args[1].contains("id of s is (item 1 of argv)"));
+        assert_eq!(args[2], "U-1");
+    }
+}
+
+/// 打进 shell 的那一行：进到工作目录、参数原样到达；目录没了也照样接上。
+#[test]
+fn iterm2_typed_line_round_trips_through_shells() {
+    let dir = std::env::temp_dir().join(format!(
+        "huitai-iterm2-{} it's \"项目\"",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let real = std::fs::canonicalize(&dir).unwrap();
+    let cmd = |cwd: &Path| huitai::sources::Command {
+        program: "/bin/sh".to_owned(),
+        args: [
+            "-c",
+            "pwd -P; printf '[%s]' \"$@\"",
+            "sh",
+            "a b",
+            "it's $HOME",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        cwd: cwd.to_path_buf(),
+    };
+    for shell in [
+        "/bin/sh",
+        "/bin/zsh",
+        "/bin/bash",
+        "/opt/homebrew/bin/fish",
+        "/usr/local/bin/fish",
+    ] {
+        if !Path::new(shell).exists() {
+            continue;
+        }
+        let run = |cwd: &Path| {
+            let line = Iterm2Opener::typed_line(&cmd(cwd));
+            assert!(line.starts_with(' '), "{line}");
+            let out = Proc::new(shell)
+                .args(["-c", &line])
+                .current_dir("/")
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(
+            run(&real),
+            format!("{}\n[a b][it's $HOME]", real.display()),
+            "{shell}"
+        );
+        assert_eq!(run(&dir.join("没了")), "/\n[a b][it's $HOME]", "{shell}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn iterm2_only_switches_to_a_session_still_running_our_attach() {
+    let cmd = "/bin/ai attach s4";
+    let ours = |tty: &str, opened_at: u64, now: u64, running: &str| {
+        Iterm2Opener::still_ours(tty, cmd, opened_at, now, |t, c| {
+            assert_eq!((t, c), (tty, cmd));
+            Ok(c == running)
+        })
+        .unwrap()
+    };
+    assert!(ours("/dev/ttys003", 100, 9_000, cmd));
+    // 会话关了。
+    assert!(!ours("", 100, 101, cmd));
+    // 退出 iTerm2 再恢复窗口：id 沿用，里面是新 shell。
+    assert!(!ours("/dev/ttys003", 100, 9_000, "-zsh"));
+    // 刚开、shell 还没换成 attach：算我们的，连按两次回车不开第二个。
+    assert!(ours("/dev/ttys003", 100, 105, "-zsh"));
+    assert!(!ours("/dev/ttys003", 100, 110, "-zsh"));
+    // 时钟往回拨过：不当作刚开。
+    assert!(!ours("/dev/ttys003", 100, 50, "-zsh"));
+    // 查不了就报错，不瞎切。
+    assert!(
+        Iterm2Opener::still_ours("/dev/ttys003", cmd, 0, 9_000, |_, _| {
+            Err(std::io::Error::other("ps 超时"))
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn other_terminals_attach_in_current_window() {
-    for program in ["Apple_Terminal", "iTerm.app", "WezTerm", "tmux"] {
+    for program in ["Apple_Terminal", "WezTerm", "tmux"] {
         let t = Terminal::detect(env(&[("TERM_PROGRAM", program)]));
         assert_eq!(t, Terminal::Other(Some(program.to_owned())));
         assert!(!t.has_tabs());

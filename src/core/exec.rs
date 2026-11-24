@@ -4,6 +4,8 @@ use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,7 +56,8 @@ impl Output {
 
 /// 跑一个准备好的命令（参数、环境、目录由调用方定），不管退出码都交回完整输出；超时杀掉、报 `TimedOut`。
 /// 给要把失败原文整段给用户看的地方用（升级各家 CLI）。子进程放进自己的进程组，超时时连它拉起的
-/// （`sh -c` 里的 npm、curl）一起结束。
+/// （`sh -c` 里的 npm、curl）一起结束。命令自己退了、它留在后台的进程还占着输出管道时，读输出也只等到
+/// 同一个截止时间：到点交回退出码和已经读到的，那个后台进程不动（可能是装好后起的服务）。
 pub fn output(cmd: &mut Command, timeout: Duration) -> io::Result<Output> {
     use std::os::unix::process::CommandExt;
     cmd.process_group(0);
@@ -114,21 +117,68 @@ fn spawn(
         }
         thread::sleep(POLL);
     };
+    let until = group.then_some(deadline);
     Ok(Output {
         code: status.code(),
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: stdout.finish(until),
+        stderr: stderr.finish(until),
     })
 }
 
-fn read_in_background<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+/// 后台读着的一个管道。
+struct Reading {
+    /// 读到的；取走后是 `None`，线程接着把管道读空但不再存（不读了对方会写不进去或被 SIGPIPE 结束）。
+    buf: Arc<Mutex<Option<Vec<u8>>>>,
+    /// 读到结尾时断开。
+    done: Receiver<()>,
+}
+
+impl Reading {
+    /// 等读到结尾（给了 `until` 最多等到那时），交回读到的。
+    fn finish(self, until: Option<Instant>) -> String {
+        match until {
+            Some(at) => {
+                let _ = self
+                    .done
+                    .recv_timeout(at.saturating_duration_since(Instant::now()));
+            }
+            None => {
+                let _ = self.done.recv();
+            }
         }
-        String::from_utf8_lossy(&buf).into_owned()
-    })
+        let bytes = self
+            .buf
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+fn read_in_background<R: Read + Send + 'static>(pipe: Option<R>) -> Reading {
+    let buf = Arc::new(Mutex::new(Some(Vec::new())));
+    let (tx, done) = mpsc::channel();
+    let shared = Arc::clone(&buf);
+    thread::spawn(move || {
+        let _tx = tx;
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    let mut buf = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(buf) = buf.as_mut() {
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
+    });
+    Reading { buf, done }
 }
 
 /// `15 秒`、`0.1 秒`。
@@ -200,6 +250,20 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_returns_on_time_when_a_grandchild_keeps_the_pipes() {
+        let started = Instant::now();
+        let out = output(
+            Command::new("sh").args(["-c", "sleep 30 & echo a; echo b >&2; exit 3"]),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        // 命令退了、sleep 还拿着管道：到点交回退出码和读到的。
+        assert_eq!(out.code, Some(3));
+        assert_eq!((out.stdout.as_str(), out.stderr.as_str()), ("a\n", "b\n"));
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[test]

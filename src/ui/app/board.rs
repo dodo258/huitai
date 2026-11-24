@@ -13,7 +13,7 @@ impl App {
             let n = entries.len();
             let next = (1..=n)
                 .map(|k| (at + k) % n)
-                .find(|&i| waits(self.state_of(&entries[i].session.id)));
+                .find(|&i| self.state_of(&entries[i].session.id).waits());
             match next {
                 Some(i) => self.select(i),
                 None => self.status = Some("没有待处理的对话".to_owned()),
@@ -21,7 +21,7 @@ impl App {
             return Vec::new();
         }
         self.next_where(
-            |app, e| !e.session.automatic && waits(app.state_of(&e.session.id)),
+            |app, e| !e.session.automatic && app.state_of(&e.session.id).waits(),
             "没有待处理的对话",
         )
     }

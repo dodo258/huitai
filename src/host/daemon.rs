@@ -205,7 +205,7 @@ struct State {
     run: Option<Running>,
     client: Option<Client>,
     title: Option<String>,
-    /// 标签页标题前面的状态（Notifier 算的）。
+    /// 此刻的状态（Notifier 算的）：写在标签页标题前面，`List` 里也报。
     status: Option<SessionState>,
     /// 状态变了、新标题还没发给接着的标签页：等输出停在完整的地方再插（见 [`Scanner::at_boundary`]）。
     title_pending: bool,
@@ -316,7 +316,7 @@ impl DaemonHandle {
         self.0.list()
     }
 
-    /// 标签页标题前面的状态变了（守护进程的 Notifier 算的）：改前缀，接着的标签页马上重发一次标题。
+    /// 这条对话的状态变了（守护进程的 Notifier 算的）：记下（`List` 报它），改标题前缀，接着的标签页马上重发一次标题。
     /// 输出正停在序列或字符中间时不插，等下一段输出停在完整的地方再补（CLI 的字节一个不改）。
     /// 状态没变或不是托管的对话什么也不做。
     pub fn set_status(&self, id: &SessionId, status: SessionState) {
@@ -894,6 +894,7 @@ impl Shared {
                     pid: st.run.as_ref().map(|r| r.pid),
                     attached: st.client.is_some(),
                     title: st.title.clone(),
+                    status: st.status,
                 }
             })
             .collect();

@@ -236,6 +236,43 @@ fn panel_shows_reset_countdown() {
     assert!(!kimi.contains("31% ·"), "{kimi}");
 }
 
+/// 面板打开时，顶栏和底栏之间只有面板：背后列表的行号、箭头和预览的字不从旁边、上下漏出来；关掉就回来。
+#[test]
+fn panel_hides_list_and_preview_behind_it() {
+    for (theme, w, h) in [
+        (Theme::DARK, W, H),
+        (Theme::DARK, 132, H),
+        (Theme::LIGHT, 132, H),
+        (Theme::DARK, 45, 24),
+        (Theme::DARK, 220, 60),
+    ] {
+        let mut app = app_with_balance(Vendor::Claude);
+        let before = dump(&render_with(&mut app, w, h, &theme));
+        app.key(key(KeyCode::Char('$')));
+        let buf = render_with(&mut app, w, h, &theme);
+        let (_, title_y) = find(&buf, "额度和余额");
+        let (_, hint_y) = find(&buf, "Esc 关闭");
+        let (left, rows) = ((w - 124.min(w - 2)) / 2, title_y - 1..hint_y + 2);
+        let cols = left..w - left;
+        for y in 1..h - 1 {
+            for x in 0..w {
+                if rows.contains(&y) && cols.contains(&x) {
+                    continue;
+                }
+                let c = &buf[(x, y)];
+                assert_eq!(
+                    (c.symbol(), c.bg),
+                    (" ", theme.base),
+                    "面板外 ({x},{y})，{w}×{h}\n{}",
+                    dump(&buf)
+                );
+            }
+        }
+        app.key(key(KeyCode::Esc));
+        assert_eq!(dump(&render_with(&mut app, w, h, &theme)), before);
+    }
+}
+
 #[test]
 fn panel_without_keys_says_where_it_looked() {
     let mut app = demo_app(Vendor::Claude);

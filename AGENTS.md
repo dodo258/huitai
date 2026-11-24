@@ -1,7 +1,7 @@
 # 项目地图（保持精简，只写稳定信息）
 
 ## 项目是什么
-会话台（huitai）：装在终端里的命令行工具（不是终端模拟器），命令 `ai`。按厂商（Claude Code / Codex / pi / Hermes / Kimi Code / Gemini CLI / OpenCode / Antigravity）分开、按项目分组列出本机全部 AI 对话，回车在 Ghostty / Kaku 新标签页里接着聊；对话由会话台的透传托管守护进程保活，关窗口不停。只支持 macOS。完整方案：`docs/specs/huitai-v1.md`。
+会话台（huitai）：装在终端里的命令行工具（不是终端模拟器），命令 `ai`。按厂商（Claude Code / Codex / pi / Hermes / Kimi Code / Gemini CLI / OpenCode / Antigravity）分开、按项目分组列出本机全部 AI 对话，回车在 Ghostty / Kaku / cmux / iTerm2 新标签页里接着聊；对话由会话台的透传托管守护进程保活，关窗口不停。只支持 macOS。完整方案：`docs/specs/huitai-v1.md`。
 
 ## 技术栈与目录
 - Rust（单个 crate，单个二进制 `ai`），界面 ratatui。索引缓存和全文搜索用 SQLite FTS5（rusqlite bundled），读厂商的库也用它（只读，`src/sources/sqlite.rs`），监听目录用 notify（FSEvents）。
@@ -44,7 +44,7 @@
 - 守护进程必须从终端里拉起（setsid 脱离），不能用 launchd：否则 CLI 的辅助功能/屏幕录制/浏览器权限归属会变。
 - CLI 子进程用登录 shell（`$SHELL -lc`）在项目目录启动，环境变量继承第一次打开它的终端标签页。
 - 测试和截图不得把本机真实会话内容写进仓库；fixtures 一律手写脱敏样例。
-- 自动跑的任务不做会在屏幕上弹窗或开窗口的真机测试（开 Ghostty/Kaku 标签页、系统通知、全局热键、登录项、AppleScript 自动化）：用单测和假实现覆盖，真机项写进 `docs/TEST-MATRIX.md`，由人在真机上测。
+- 自动跑的任务不做会在屏幕上弹窗或开窗口的真机测试（开 Ghostty/Kaku/iTerm2 标签页、系统通知、全局热键、登录项、AppleScript 自动化）：用单测和假实现覆盖，真机项写进 `docs/TEST-MATRIX.md`，由人在真机上测。
 - 界面颜色、快捷键以方案「界面」一节为准，颜色集中在 `src/ui/theme.rs`。
 - 改了 sources 的解析结果（`Session` 任何字段、预览或正文的取法）就把该家解析版本加一（`src/core/vendor.rs` 的 `VENDORS` 表里的 `parse_version`），否则旧缓存里没变的文件永远是旧结果。
 - socket 协议（`src/host/protocol.rs`）和 `running.json` 里的字段只加不改，新字段带 `#[serde(default)]`；协议有不兼容的改动才把 `PROTOCOL` 加一，新旧客户端和守护进程怎么相处见 DECISIONS.md「版本握手」。

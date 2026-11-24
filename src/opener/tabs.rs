@@ -183,7 +183,7 @@ impl Records {
 fn old_versions_read(handle: &TabHandle) -> bool {
     match handle {
         TabHandle::Ghostty { .. } | TabHandle::Kaku { .. } => true,
-        TabHandle::Cmux { .. } => false,
+        TabHandle::Cmux { .. } | TabHandle::Iterm2 { .. } => false,
     }
 }
 
@@ -402,6 +402,27 @@ mod tests {
             .unwrap();
         assert_eq!(v012::read(&path).keys().collect::<Vec<_>>(), ["g"]);
         assert_eq!(ids(Tabs::load(&path).unwrap().records()), ["c", "g"]);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// iTerm2 记录旧版不认识，放旁边那份，读回来原样。
+    #[test]
+    fn iterm2_records_stay_out_of_the_main_file() {
+        let path = temp("iterm2");
+        let handle = TabHandle::Iterm2 {
+            session_id: "U-1".to_owned(),
+            command: "ai attach".to_owned(),
+            opened_at: 7,
+        };
+        let mut tabs = Tabs::load(&path).unwrap();
+        let term = Handing(RefCell::new(vec![handle.clone(), ghostty("g-1")]));
+        for id in ["i", "g"] {
+            tabs.open_or_focus(&term, &SessionId::from(id), &cmd(), "")
+                .unwrap();
+        }
+        assert_eq!(v012::read(&path).keys().collect::<Vec<_>>(), ["g"]);
+        let back = Tabs::load(&path).unwrap();
+        assert_eq!(back.records()[&SessionId::from("i")].handle, handle);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

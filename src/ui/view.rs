@@ -105,6 +105,15 @@ fn split(area: Rect) -> Areas {
     }
 }
 
+/// 顶栏和底栏之间的整块（表头带、列表、预览）：整段对话和额度面板盖住它。
+pub(super) fn between_bars(area: Rect) -> Rect {
+    Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(2),
+        ..area
+    }
+}
+
 /// 画一帧。顺带记下各区域（鼠标定位用）并把列表滚到选中行可见。
 pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
     let area = frame.area();
@@ -119,12 +128,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, theme: &Theme) {
     let now = app.now;
     if let Some(r) = &mut app.reader {
         // 整段对话盖住列表和预览两栏（表头带当它的标题带）；列表点不到。
-        let body = Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(2),
-            ..area
-        };
-        r.draw(buf, body, now, theme);
+        r.draw(buf, between_bars(area), now, theme);
         app.areas.list = Rect::default();
         app.areas.preview = Rect::default();
     } else {

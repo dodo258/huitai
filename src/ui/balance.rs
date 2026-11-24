@@ -14,7 +14,9 @@ use ratatui::widgets::{LineGauge, Widget};
 use super::app::App;
 use super::text::{ago, truncate, width};
 use super::theme::Theme;
-use super::view::{QUOTA_ALERT, QUOTA_WARN, bold, centered, fg, fill, reset_note, row, sp, tokens};
+use super::view::{
+    QUOTA_ALERT, QUOTA_WARN, between_bars, bold, centered, fg, fill, reset_note, row, sp, tokens,
+};
 use crate::core::{Account, QuotaValue, QuotaWindow, SessionState, Vendor};
 use crate::quota::{self, Balance, BalanceRow, BalanceValue, Money, OriginAccount};
 
@@ -340,13 +342,15 @@ fn draw_line(buf: &mut Buffer, area: Rect, mut line: PanelLine, t: &Theme) {
     }
 }
 
-/// 面板。内容比框高时 ↑↓ 翻，`scroll` 超出范围按最后一屏算。
+/// 面板，盖住列表和预览（顶栏、底栏留着）。内容比框高时 ↑↓ 翻，`scroll` 超出范围按最后一屏算。
 pub fn draw(buf: &mut Buffer, area: Rect, app: &App, scroll: usize, t: &Theme) {
     let lines = panel_lines(app, t);
     let want = lines.len() as u16 + 4;
     // 最宽 124：两个额度窗口各带重置倒计时（最长「6 天 23 小时后重置」），右边的「非公开接口，可能失效」
     // 也放得下（要 117 列）；终端窄了跟着收，放不下时倒计时先让（见 draw_line）。
     let boxr = centered(area, 124, want + 2);
+    // 面板几乎和屏幕一样宽，两边只剩几格：背后的列表和预览留在那里就是半截字，整块清掉。
+    fill(buf, between_bars(area), t.base);
     fill(buf, boxr, t.bar);
     let inner = Rect {
         x: boxr.x + 3,

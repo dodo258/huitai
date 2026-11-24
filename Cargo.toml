@@ -1,6 +1,6 @@
 [package]
 name = "huitai"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "会话台：按厂商、按项目列出本机 AI 对话，在新标签页接着聊"
 publish = false

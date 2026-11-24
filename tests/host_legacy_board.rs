@@ -101,6 +101,7 @@ fn running(id: &str) -> HostedInfo {
         pid: Some(4242),
         attached: false,
         title: None,
+        status: None,
     }
 }
 

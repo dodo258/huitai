@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -151,7 +153,11 @@ pub fn upgrade_from(
             lock.display()
         )));
     }
-    let _guard = OwnLock::take(r.data_dir, install.vendor).map_err(blocked)?;
+    // 有安装在跑时不给命令：主人照着自己跑，就成了两个安装一起改同一份。
+    let lock = OwnLock::take(r.data_dir, install.vendor).map_err(|why| Blocked {
+        command: None,
+        ..blocked(why)
+    })?;
     // 排队升前面几家、等锁的工夫，它可能自己更新了：写死版本的命令会把它装回旧版，所以重新认一遍再定。
     let install = &locate::probe_one(install.vendor, &install.path, r.login, r.home);
     if let Some(why) = in_use(install, r) {
@@ -180,7 +186,7 @@ pub fn upgrade_from(
         });
     }
     let command = runnable(install, &target)?;
-    let (ok, message) = match run(&command, r) {
+    let (ok, message) = match run(&command, r, &lock) {
         Ok(out) => verify(install, &target, r, &out),
         Err(e) => (false, e),
     };
@@ -247,13 +253,14 @@ fn runnable(install: &Install, target: &str) -> Result<String, Blocked> {
 }
 
 /// 用 `sh -c` 跑官方命令（有 `curl … | sh` 这种），PATH 用登录 shell 的，在家目录里跑，标准输入是空的
-/// （要交互的安装器读到结尾会自己退出，不会卡住）。成功交回输出原文；失败、超时交回原因和原文。
-fn run(command: &str, r: &Runner) -> Result<String, String> {
+/// （要交互的安装器读到结尾会自己退出，不会卡住），锁让它一起拿着。成功交回输出原文；失败、超时交回原因和原文。
+fn run(command: &str, r: &Runner, lock: &OwnLock) -> Result<String, String> {
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", command]).current_dir(r.home);
     if let Ok(path) = std::env::join_paths(&r.login.path) {
         cmd.env("PATH", path);
     }
+    lock.share_with(&mut cmd);
     match exec::output(&mut cmd, r.timeout) {
         Ok(out) if out.success() => Ok(both(&out)),
         Ok(out) => Err(format!(
@@ -354,54 +361,51 @@ pub fn self_update_lock(vendor: Vendor, home: &Path) -> Option<PathBuf> {
     (age < LOCK_FRESH).then_some(path)
 }
 
-/// 会话台自己的升级锁（数据目录里 `cli-upgrade-<家>.lock`，写着进程号）：两个会话台、或会话台和
-/// `ai update` 不会同时升同一家。拿锁的进程已经不在了就当残留拿过来；放手时删掉。
-struct OwnLock(PathBuf);
+/// 会话台自己的升级锁：数据目录里 `cli-upgrade-<家>.lock` 上的独占 flock，两个会话台、会话台和 `ai update`
+/// 不会同时升同一家。文件放手后留着，里面写什么都不看（v0.1.8 及更早写进程号）。
+/// 安装命令也拿着同一把锁（[`Self::share_with`]）：会话台装到一半退出，锁等安装器跑完才放。
+struct OwnLock(fs::File);
 
 impl OwnLock {
     fn take(data_dir: &Path, vendor: Vendor) -> Result<Self, String> {
         let path = data_dir.join(format!("cli-upgrade-{}.lock", vendor.key()));
+        let failed = |e: io::Error| format!("升级锁 {} 拿不到：{e}", path.display());
         let _ = fs::create_dir_all(data_dir);
-        for _ in 0..2 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    let _ = write!(f, "{}", std::process::id());
-                    return Ok(Self(path));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let holder = fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i32>().ok());
-                    if holder.is_some_and(alive) {
-                        return Err("另一个会话台或 ai update 正在升级它".to_owned());
-                    }
-                    let _ = fs::remove_file(&path);
-                }
-                Err(e) => return Err(format!("升级锁 {} 建不了：{e}", path.display())),
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(failed)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self(file)),
+            Err(fs::TryLockError::WouldBlock) => {
+                Err("另一个会话台或 ai update 正在升级它（会话台退出前起的安装也算）".to_owned())
             }
+            Err(fs::TryLockError::Error(e)) => Err(failed(e)),
         }
-        Err(format!("升级锁 {} 拿不到", path.display()))
+    }
+
+    /// 让 `cmd` 起的子进程继承锁的描述符（描述符默认 exec 时关掉，只在这个子进程里改成留着，
+    /// 同时起的别的进程不会带走锁）。
+    fn share_with(&self, cmd: &mut Command) {
+        let fd = self.0.as_raw_fd();
+        // SAFETY: fork 之后只调 fcntl（异步信号安全），不碰内存；`fd` 在 `self` 活着时有效，
+        // `cmd` 在 `run` 里起完就丢，`self` 比它活得久。
+        unsafe {
+            cmd.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
+                -1 => Err(io::Error::last_os_error()),
+                _ => Ok(()),
+            });
+        }
     }
 }
 
 impl Drop for OwnLock {
+    /// 明着放：安装命令可能留下了后台进程，它也带着这个描述符，只关自己这份锁还在。
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = self.0.unlock();
     }
-}
-
-/// 进程还在（别人的进程发不了信号也算在）。
-fn alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: 信号 0 只检查进程在不在，不发信号、不碰内存。
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// 每家最后一次升级的结果。读不了是空的。

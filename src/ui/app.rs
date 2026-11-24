@@ -901,7 +901,7 @@ impl App {
 
     /// 失败：停下了（等你回复、刚做完），而且这一轮记着失败或被打断。
     pub fn failed(&self, e: &Entry) -> bool {
-        waits(self.state_of(&e.session.id))
+        self.state_of(&e.session.id).waits()
             && self
                 .moments
                 .get(&e.session.id)
@@ -1057,7 +1057,7 @@ impl App {
             }
             match self.state_of(&e.session.id) {
                 SessionState::Running => running += 1,
-                s if waits(s) => waiting += 1,
+                s if s.waits() => waiting += 1,
                 _ => {}
             }
         }
@@ -1144,7 +1144,7 @@ impl App {
     /// 记下一条托管对话的新状态。从「在跑」停成「刚做完」或「等你回复」的那一刻整行亮一下（见 [`App::flash`]）。
     pub fn set_state(&mut self, id: SessionId, state: SessionState) {
         let was = self.state_of(&id);
-        if was == SessionState::Running && waits(state) {
+        if was == SessionState::Running && state.waits() {
             self.flashes.insert(id.clone(), (self.clock, state));
         }
         self.states.insert(id, state);
@@ -1162,11 +1162,6 @@ impl App {
     pub fn spinner(&self) -> char {
         SPINNER[self.spin % SPINNER.len()]
     }
-}
-
-/// 等你回复（「刚做完」是还没看过的等你回复）。
-fn waits(s: SessionState) -> bool {
-    matches!(s, SessionState::Waiting | SessionState::Done)
 }
 
 #[cfg(test)]
